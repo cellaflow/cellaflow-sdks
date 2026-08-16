@@ -30,6 +30,7 @@ class CellaflowClient:
         if session_id:
             req.session_id = session_id
         import typing
+
         return typing.cast(
             service_pb2.StartSessionResponse, self.stub.StartSession(req)
         )
@@ -67,6 +68,7 @@ class CellaflowClient:
             req.idempotency_fencing_token = idempotency_fencing_token
 
         import typing
+
         return typing.cast(service_pb2.CommitStepResponse, self.stub.CommitStep(req))
 
     def get_graph(

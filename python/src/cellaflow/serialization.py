@@ -11,9 +11,8 @@ def serialize(data: Dict[str, Any]) -> bytes:
         raise TypeError(f"Expected a dictionary for serialization, got {type(data)}")
     # We use strict_types=True for tighter encoding and use_bin_type=True
     import typing
-    return typing.cast(bytes, msgpack.packb(
-        data, use_bin_type=True, strict_types=True
-    ))
+
+    return typing.cast(bytes, msgpack.packb(data, use_bin_type=True, strict_types=True))
 
 
 def deserialize(data: bytes) -> Dict[str, Any]:
