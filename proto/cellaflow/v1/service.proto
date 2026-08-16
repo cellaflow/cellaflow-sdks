@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package cellaflow.v1;
+
+import "cellaflow/v1/common.proto";
+import "cellaflow/v1/idempotency.proto";
+
+service WorkflowEngineService {
+  // Starts a new workflow execution session.
+  // Concurrency Guard: If the client proposes a custom `session_id` inside StartSessionRequest,
+  // the engine MUST perform transactional check-and-insert to prevent concurrent race conditions
+  // that would result in double-initialization or state overwriting.
+  rpc StartSession(StartSessionRequest) returns (StartSessionResponse);
+  
+  // Commits the result of an execution step (Cognitive Graph event).
+  // Ordering Guard: The engine MUST validate that `step_result.sequence` matches the expected
+  // next sequence number (i.e. expected = current_sequence + 1).
+  // Concurrency Guard: The write transaction MUST perform an optimistic concurrency check
+  // comparing expected vs actual current sequence to fail gracefully in case of race conditions.
+  rpc CommitStep(CommitStepRequest) returns (CommitStepResponse);
+  
+  // Retrieves the Cognitive Graph history (sequence of steps) for a session.
+  // Pagination Guard: GetGraphResponse is paginated. The implementation must enforce a default
+  // pagination limit (e.g. 100) and a maximum pagination limit (e.g. 1000) to prevent OOM errors
+  // on large graph histories.
+  rpc GetGraph(GetGraphRequest) returns (GetGraphResponse);
+
+  // Idempotency cache RPCs (CEL-30)
+  rpc CheckIdempotencyCache(CheckCacheRequest) returns (CheckCacheResponse);
+  rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+  rpc ReleaseLease(ReleaseLeaseRequest) returns (ReleaseLeaseResponse);
+}
+
+message StartSessionRequest {
+  string workflow_id = 1;
+  string version = 2;
+  // Optional client-proposed session identifier.
+  optional string session_id = 3;
+}
+
+message StartSessionResponse {
+  string session_id = 1;
+  string version = 2;
+  bool is_recovered = 3;
+}
+
+message CommitStepRequest {
+  string session_id = 1;
+  StepResult step_result = 2;
+
+  // Idempotency lease validation fields (CEL-30)
+  optional string idempotency_key = 10;
+  optional uint64 idempotency_fencing_token = 11; // Required whenever idempotency_key is set
+}
+
+message CommitStepResponse {
+  string session_id = 1;
+  uint64 next_sequence = 2;
+  optional IdempotencyCommitStatus idempotency_status = 5;
+}
+
+message GetGraphRequest {
+  string session_id = 1;
+  // Maximum number of items to retrieve in a single page.
+  // Enforced limits: Default = 100, Max = 1000.
+  optional uint32 limit = 2;
+  // Cursor for pagination token.
+  optional string cursor = 3;
+}
+
+message GetGraphResponse {
+  string session_id = 1;
+  repeated StepResult steps = 2;
+  // Token for fetching the next page, or empty if there are no more pages.
+  optional string next_cursor = 3;
+}
+

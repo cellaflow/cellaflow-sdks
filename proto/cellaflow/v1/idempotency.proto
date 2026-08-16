@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package cellaflow.v1;
+
+import "cellaflow/v1/common.proto";
+
+// ============================================================================
+// Enums & Shared Types
+// ============================================================================
+
+// Key construction scope used by SDKs during key auto-derivation.
+// The SDK uses this to prefix the opaque idempotency_key before sending it
+// to the engine. The engine never parses this — it is purely an SDK concern.
+enum IdempotencyScope {
+  SCOPE_UNSPECIFIED = 0;
+  SCOPE_SESSION_WIDE = 1;  // Shared across all agents in the session (Default)
+  SCOPE_AGENT_PRIVATE = 2; // Isolated to the executing agent
+  SCOPE_STEP_LOCAL = 3;    // Isolated to the specific superstep / node
+}
+
+enum CacheStatus {
+  CACHE_STATUS_UNSPECIFIED = 0;
+  CACHE_STATUS_HIT = 1;         // Found in cache (or completed by in-flight worker)
+  CACHE_STATUS_ACQUIRED = 2;    // Miss & lease granted: caller should execute tool
+  CACHE_STATUS_IN_PROGRESS = 3; // Miss & currently running by another worker
+}
+
+enum RenewFailureReason {
+  RENEW_FAILURE_REASON_UNSPECIFIED = 0;
+  RENEW_FAILURE_REASON_EXPIRED = 1;     // Lease timed out before renewal arrived
+  RENEW_FAILURE_REASON_SUPERSEDED = 2;  // A newer worker acquired a higher fencing token
+  RENEW_FAILURE_REASON_NOT_FOUND = 3;   // Key does not exist or was deleted
+  RENEW_FAILURE_REASON_COMPLETED = 4;   // Step was already committed by another worker
+}
+
+enum IdempotencyCommitStatus {
+  IDEMPOTENCY_COMMIT_UNSPECIFIED = 0;
+  IDEMPOTENCY_COMMIT_COMMITTED = 1;
+  IDEMPOTENCY_COMMIT_ALREADY_COMMITTED = 2;    // Idempotent retry of the commit call itself
+  IDEMPOTENCY_COMMIT_STALE_LEASE_REJECTED = 3; // Fencing token invalid — caller was fenced out
+}
+
+// ============================================================================
+// RPC Messages
+// ============================================================================
+
+message CheckCacheRequest {
+  string agent_id = 1;              // Validated against caller principal; NOT parsed into key
+  string idempotency_key = 2;       // Fully formed, opaque composite key
+  optional uint64 wait_timeout_ms = 3;
+  optional uint64 lease_ttl_ms = 4; // Crash-detection window; defaults to engine config
+}
+
+message CheckCacheResponse {
+  CacheStatus status = 1;
+  optional StepResult cached_result = 2;
+  optional uint64 fencing_token = 3;         // Present iff ACQUIRED
+  optional uint64 lease_expires_at_ms = 4;   // Present iff ACQUIRED or IN_PROGRESS
+  optional uint64 heartbeat_interval_ms = 5; // Present iff ACQUIRED — caller MUST renew
+  optional uint64 retry_after_ms = 6;        // Present iff IN_PROGRESS and wait exhausted
+  optional string current_holder_id = 7;     // Present iff IN_PROGRESS (for distributed tracing)
+}
+
+message RenewLeaseRequest {
+  string agent_id = 1;
+  string idempotency_key = 2;
+  uint64 fencing_token = 3;
+  uint64 extend_ms = 4;
+}
+
+message RenewLeaseResponse {
+  bool renewed = 1;                              // False => lease was reclaimed/completed; stop execution
+  optional uint64 new_expires_at_ms = 2;         // Present iff renewed = true
+  optional RenewFailureReason failure_reason = 3;// Present iff renewed = false
+}
+
+message ReleaseLeaseRequest {
+  string agent_id = 1;
+  string idempotency_key = 2;
+  uint64 fencing_token = 3;
+  optional string reason = 4;                    // e.g. "RATE_LIMITED_429", "CANCELLED", "TOOL_ERROR"
+}
+
+message ReleaseLeaseResponse {
+  bool released = 1;
+}

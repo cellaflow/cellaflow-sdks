@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package cellaflow.v1.internal;
+
+import "cellaflow/v1/common.proto";
+
+// Internal storage record persisted in RocksDB's idempotency_cache Column Family.
+// Not exposed via gRPC — used only for serialization/deserialization within the engine.
+message CacheRecord {
+  oneof record {
+    LeaseRecord leased = 1;
+    CompletedRecord completed = 2;
+  }
+}
+
+// Represents an active lease held by a worker executing a tool.
+message LeaseRecord {
+  uint64 fencing_token = 1;   // Global monotonic microsecond epoch timestamp
+  string holder_id = 2;       // Opaque per-attempt identifier for observability
+  uint64 acquired_at_ms = 3;  // When the lease was acquired (epoch ms)
+  uint64 expires_at_ms = 4;   // When the lease expires if not renewed (epoch ms)
+}
+
+// Represents a completed tool execution result cached for idempotency.
+message CompletedRecord {
+  cellaflow.v1.StepResult result = 1;
+  uint64 completed_at_ms = 2; // When the result was committed (epoch ms)
+}
