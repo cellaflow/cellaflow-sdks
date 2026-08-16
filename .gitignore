@@ -308,3 +308,15 @@ Cargo.lock
 *.pdb
 
 .DS_Store
+
+# BMAD and Agent folders
+.agent/
+.agents/
+_bmad/
+_bmad-output/
+agents/
+bmad/
+.claude/
+
+_docs/
+docs/
