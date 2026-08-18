@@ -38,7 +38,7 @@ def test_workflow_and_step_sync(mock_stub: MagicMock, mock_client: None) -> None
 
     @workflow(version="1.0.0")
     def my_workflow(val: int) -> int:
-        return my_step(val)
+        return my_step(val)  # type: ignore[no-any-return]
 
     # Execute workflow
     result = my_workflow(10)
@@ -76,7 +76,7 @@ async def test_workflow_and_step_async(mock_stub: MagicMock, mock_client: None) 
 
     @workflow(version="1.0.0")
     async def my_workflow(val: int) -> int:
-        return await my_step(val)
+        return await my_step(val)  # type: ignore[no-any-return]
 
     # Execute workflow
     result = await my_workflow(10)
@@ -119,7 +119,7 @@ def test_workflow_recovery_sync(mock_stub: MagicMock, mock_client: None) -> None
 
     @workflow(version="1.0.0")
     def my_workflow(val: int) -> int:
-        return my_step(val)
+        return my_step(val)  # type: ignore[no-any-return]
 
     # We pass the _session_id to trigger recovery on the same session
     result = my_workflow(10, _session_id="test-session")  # type: ignore[call-arg]
@@ -131,3 +131,30 @@ def test_workflow_recovery_sync(mock_stub: MagicMock, mock_client: None) -> None
 
     # Verify CommitStep was NOT called because it was replayed
     mock_stub.CommitStep.assert_not_called()
+
+
+def test_custom_idempotency_key(mock_stub: MagicMock, mock_client: None) -> None:
+    mock_start = service_pb2.StartSessionResponse(
+        session_id="test-session", version="1.0.0", is_recovered=False
+    )
+    mock_stub.StartSession.return_value = mock_start
+
+    mock_commit = service_pb2.CommitStepResponse(
+        session_id="test-session", next_sequence=2
+    )
+    mock_stub.CommitStep.return_value = mock_commit
+
+    @step(idempotency_key="my-custom-key")  # type: ignore[untyped-decorator]
+    def my_step(x: int) -> int:
+        return x * 2
+
+    @workflow(version="1.0.0")
+    def my_workflow(val: int) -> int:
+        return my_step(val)  # type: ignore[no-any-return]
+
+    my_workflow(10)
+
+    # Verify CommitStep was called with the custom idempotency key
+    mock_stub.CommitStep.assert_called_once()
+    commit_req = mock_stub.CommitStep.call_args[0][0]
+    assert commit_req.idempotency_key == "my-custom-key"

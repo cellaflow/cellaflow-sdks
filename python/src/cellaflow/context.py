@@ -9,6 +9,7 @@ from cellaflow.client import CellaflowClient
 class WorkflowContext:
     client: CellaflowClient
     session_id: str
+    workflow_version: str
     sequence: int = 0
     # Map sequence number to a deserialized step payload for fast replay lookups
     replayed_steps: Dict[int, Dict[str, Any]] = field(default_factory=dict)

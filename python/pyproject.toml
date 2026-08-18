@@ -12,6 +12,7 @@ dependencies = [
     "grpcio>=1.60.0",
     "protobuf>=4.25.0",
     "msgpack>=1.0.7",
+    "rfc8785>=0.1.4",
 ]
 
 [project.optional-dependencies]
