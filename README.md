@@ -28,7 +28,7 @@ cellaflow-sdks/
 │   ├── src/cellaflow/  # Decorators, contextvars isolation, gRPC client, MessagePack
 │   ├── tests/          # Comprehensive test suite (pytest)
 │   └── README.md       # Python SDK documentation & quickstarts
-├── docs/               # Architecture decision records & SDK product specs
+├── LICENSE             # Project license (Apache 2.0 or MIT)
 └── buf.gen.yaml        # Buf code generation configuration
 ```
 
