@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cellaflow"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python SDK for Cellaflow"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,11 +14,26 @@ dependencies = [
     "msgpack>=1.0.7",
     "rfc8785>=0.1.4",
 ]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://www.cellaflow.com"
+Documentation = "https://www.cellaflow.com"
+Repository = "https://github.com/theblueskies/cellaflow-sdks"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.0.0",
     "black>=24.0.0",
     "flake8>=7.0.0",
     "mypy>=1.8.0",
@@ -30,9 +45,27 @@ dev = [
 where = ["src"]
 
 [tool.pytest.ini_options]
-addopts = "-ra -q"
+addopts = "-ra -q --cov=cellaflow --cov-report=term-missing"
 testpaths = [
     "tests",
+]
+
+[tool.coverage.run]
+source = ["src/cellaflow"]
+omit = [
+    "src/cellaflow/v1/*",
+    "*_pb2.py",
+    "*_pb2_grpc.py",
+    "*.pyi",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
 ]
 
 [tool.black]

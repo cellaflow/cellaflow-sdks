@@ -53,3 +53,63 @@ async def test_lease_heartbeat_async() -> None:
     assert mock_client.renew_lease.call_count >= 1
     call_args = mock_client.renew_lease.call_args[1]
     assert call_args["agent_id"] == "agent1"
+
+
+def test_lease_heartbeat_sync_renewal_failure() -> None:
+    mock_client = MagicMock()
+    mock_resp = idempotency_pb2.RenewLeaseResponse(
+        renewed=False,
+        failure_reason=idempotency_pb2.RENEW_FAILURE_REASON_EXPIRED,
+    )
+    mock_client.renew_lease.return_value = mock_resp
+
+    hb = LeaseHeartbeat(
+        client=mock_client,
+        agent_id="agent1",
+        idempotency_key="key1",
+        fencing_token=123,
+        heartbeat_interval_ms=150,
+    )
+    hb.start_sync()
+    time.sleep(0.2)
+    hb.stop_sync()
+    assert mock_client.renew_lease.call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_lease_heartbeat_async_renewal_failure() -> None:
+    mock_client = MagicMock()
+    mock_resp = idempotency_pb2.RenewLeaseResponse(
+        renewed=False,
+        failure_reason=idempotency_pb2.RENEW_FAILURE_REASON_EXPIRED,
+    )
+    mock_client.renew_lease.return_value = mock_resp
+
+    hb = LeaseHeartbeat(
+        client=mock_client,
+        agent_id="agent1",
+        idempotency_key="key1",
+        fencing_token=123,
+        heartbeat_interval_ms=150,
+    )
+    hb.start_async()
+    await asyncio.sleep(0.2)
+    await hb.stop_async()
+    assert mock_client.renew_lease.call_count >= 1
+
+
+def test_lease_heartbeat_exception_logged() -> None:
+    mock_client = MagicMock()
+    mock_client.renew_lease.side_effect = RuntimeError("Network partition")
+
+    hb = LeaseHeartbeat(
+        client=mock_client,
+        agent_id="agent1",
+        idempotency_key="key1",
+        fencing_token=123,
+        heartbeat_interval_ms=150,
+    )
+    hb.start_sync()
+    time.sleep(0.2)
+    hb.stop_sync()
+    assert mock_client.renew_lease.call_count >= 1

@@ -1,6 +1,10 @@
 # Cellaflow Python SDK
 
-The official Python SDK for the [CellaFlow Engine](https://github.com/theblueskies/cellaflow) — providing durable execution, deterministic replay recovery, and swarm-safe concurrency primitives for AI workflows and agent graphs.
+The official Python SDK for the [CellaFlow Engine](https://www.cellaflow.com) — providing durable execution, deterministic replay recovery, and swarm-safe concurrency primitives for AI workflows and multi-agent systems.
+
+[![PyPI version](https://img.shields.io/pypi/v/cellaflow.svg?color=blue)](https://pypi.org/project/cellaflow/)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://pypi.org/project/cellaflow/)
+[![License](https://img.shields.io/badge/license-Apache%202.0%20%2F%20MIT-blue.svg)](https://github.com/theblueskies/cellaflow-sdks/blob/main/LICENSE)
 
 ---
 
@@ -10,7 +14,7 @@ The official Python SDK for the [CellaFlow Engine](https://github.com/theblueski
 - ⚡ **Zero-Friction Decorators**: Annotate standard Python functions with `@workflow`, `@step`, and `@tool` (supporting both `def` and `async def`).
 - 🛡️ **Deterministic Idempotency**: Automatic input hashing via RFC 8785 Canonical JSON and SHA-256 guarantees cross-language determinism across multi-agent swarms.
 - 🔒 **Background Lease Management**: Non-blocking heartbeat management keeps engine locks alive and eliminates split-brain execution using fencing tokens.
-- 📦 **Secure Serialization**: Strictly uses MessagePack for all state payloads to optimize throughput and mitigate remote code execution (RCE) attack vectors.
+- 📦 **Secure Serialization**: Strictly uses MessagePack for all state payloads to optimize throughput over gRPC and eliminate Remote Code Execution (RCE) deserialization vectors.
 
 ---
 
@@ -23,6 +27,8 @@ pip install cellaflow
 ---
 
 ## Quickstart
+
+### 1. Synchronous Workflow
 
 ```python
 from cellaflow import workflow, step, tool, IdempotencyScope
@@ -40,8 +46,7 @@ def summarize_results(data: dict) -> str:
     return f"Processed {len(data['results'])} items for '{data['query']}'"
 
 # 3. Define the orchestrating workflow
-# By default connects to localhost:50051. You can pass a custom endpoint:
-# @workflow(version="1.0.0", target="engine.mycompany.com:50051", secure=True)
+# By default connects to localhost:50051 (or pass custom target="engine:50051", secure=True)
 @workflow(version="1.0.0")
 def research_workflow(topic: str) -> str:
     search_data = search_web(topic)
@@ -51,6 +56,52 @@ def research_workflow(topic: str) -> str:
 if __name__ == "__main__":
     result = research_workflow("autonomous agent architectures")
     print("Result:", result)
+```
+
+---
+
+### 2. Asynchronous Workflow & Multi-Agent Swarms
+
+The SDK natively supports `async def` coroutines, asynchronous I/O, and agent isolation:
+
+```python
+import asyncio
+from cellaflow import workflow, step, tool, IdempotencyScope
+
+@tool(agent_id="researcher_agent", scope=IdempotencyScope.SCOPE_AGENT_PRIVATE)
+async def fetch_market_data(ticker: str) -> dict:
+    print(f"Fetching live ticker data: {ticker}")
+    await asyncio.sleep(0.5)  # Simulate non-blocking async network I/O
+    return {"ticker": ticker, "price": 142.50}
+
+@step(agent_id="analyst_agent")
+async def analyze_trends(market_data: dict) -> str:
+    return f"Signal for {market_data['ticker']}: BUY at ${market_data['price']}"
+
+@workflow(version="1.0.0")
+async def swarm_analysis_workflow(ticker: str) -> str:
+    data = await fetch_market_data(ticker)
+    analysis = await analyze_trends(data)
+    return analysis
+
+if __name__ == "__main__":
+    result = asyncio.run(swarm_analysis_workflow("CELL"))
+    print("Analysis Result:", result)
+```
+
+---
+
+### 3. Transparent Replay & Session Recovery
+
+To recover an interrupted execution after a process crash or restart, supply the `_session_id` keyword argument:
+
+```python
+# Resumes the workflow from the exact step where it stopped.
+# Completed steps are loaded from the engine's event graph and returned with 0ms execution time.
+recovered_result = research_workflow(
+    "autonomous agent architectures", 
+    _session_id="3f7491d9-e932-4467-bcda-370fb5c1a7e4"
+)
 ```
 
 ---
@@ -122,21 +173,68 @@ flowchart TD
 ## Core Concepts
 
 ### `@workflow(version="1.0.0", target="localhost:50051", secure=False)`
-Marks the entry point for a durable workflow execution. 
-- Automatically initializes the underlying gRPC client and execution context.
-- Manages replay state when resuming from a crashed or interrupted session.
+Marks the entry point for a durable workflow execution:
+- **Automatic Client Management**: Transparently initializes the underlying gRPC client and session state.
+- **Context Isolation**: Uses Python's `contextvars` to manage session context safely across async event loops and threads.
+- **Replay State Loader**: Loads completed step history from the engine whenever `_session_id` is supplied.
 
 ### `@step` and `@tool`
-Decorators for atomic units of execution within a workflow.
-- **Idempotency**: Generates a deterministic key based on the function name, session, version, sequence, agent ID, and hashed inputs.
-- **Replay Interception**: If a step was already completed in the session history, the SDK returns the cached output immediately without re-running the function body.
-- **Lease Heartbeating**: Spawns a background task/thread to keep the engine lease refreshed until the function returns.
+Decorators for atomic units of execution within a workflow:
+```python
+@step(
+    idempotency_key: Optional[str] = None,
+    agent_id: str = "default",
+    tool_name: Optional[str] = None,
+    scope: IdempotencyScope = IdempotencyScope.SCOPE_SESSION_WIDE,
+)
+```
+- **Idempotency Key Derivation**: Automatically builds a deterministic key using:
+  `[Session_ID]:[Workflow_Version]:[Step_Sequence]:[Agent_ID]:[Tool_Name]:[RFC8785_SHA256_Hash]`
+- **Replay Interception**: If a step was already completed in the session history, immediately returns the cached output without re-running the function body.
+- **Lease Heartbeating**: Automatically runs background heartbeats (`RenewLease`) via daemon threads (sync) or asyncio tasks (async) to keep engine locks refreshed.
+- **Lock Release on Failure**: If an unhandled exception occurs, automatically releases the lease with `reason="TOOL_ERROR"`.
 
 ### `IdempotencyScope`
-Controls how cache hits are shared across the execution graph:
-* `IdempotencyScope.SCOPE_SESSION_WIDE` *(Default)*: Results are cached and shared across all agents in the session.
-* `IdempotencyScope.SCOPE_AGENT_PRIVATE`: Isolates cache hits to the executing agent.
-* `IdempotencyScope.SCOPE_STEP_LOCAL`: Strictly isolates cache hits to the current superstep/turn.
+Controls how cached step and tool results are shared across multi-agent sessions:
+- `IdempotencyScope.SCOPE_SESSION_WIDE` *(Default)*: Cached results are shared across all agents in the session.
+- `IdempotencyScope.SCOPE_AGENT_PRIVATE`: Isolates cache hits to the executing `agent_id`.
+- `IdempotencyScope.SCOPE_STEP_LOCAL`: Strictly isolates cache hits to the current superstep sequence and `agent_id`.
+
+---
+
+## Low-Level `CellaflowClient`
+
+For advanced use cases requiring manual session management, graph inspection, or custom scheduling, use `CellaflowClient` directly:
+
+```python
+from cellaflow import CellaflowClient
+from cellaflow.v1.common_pb2 import STEP_STATUS_SUCCESS
+
+# Initialize client
+client = CellaflowClient(target="localhost:50051", secure=False)
+
+# 1. Start or resume a session
+session_resp = client.start_session(
+    workflow_id="manual_workflow", 
+    version="1.0.0"
+)
+session_id = session_resp.session_id
+
+# 2. Inspect session history graph
+steps, next_cursor = client.get_graph(session_id=session_id)
+
+# 3. Commit a step result
+commit_resp = client.commit_step(
+    session_id=session_id,
+    sequence=1,
+    name="custom_task",
+    status=STEP_STATUS_SUCCESS,
+    output_payload={"result": "data"}
+)
+
+# 4. Clean up channel
+client.close()
+```
 
 ---
 
