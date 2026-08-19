@@ -1,4 +1,4 @@
-from cellaflow.idempotency import derive_idempotency_key
+from cellaflow.idempotency import derive_idempotency_key, IdempotencyScope
 
 
 def test_derive_idempotency_key_deterministic() -> None:
@@ -10,12 +10,30 @@ def test_derive_idempotency_key_deterministic() -> None:
 
     # Derive key with some basic inputs
     key1 = derive_idempotency_key(
-        session, version, seq, agent, tool, "hello", 42, foo="bar", active=True
+        session,
+        version,
+        seq,
+        agent,
+        tool,
+        IdempotencyScope.SCOPE_STEP_LOCAL,
+        "hello",
+        42,
+        foo="bar",
+        active=True,
     )
 
     # Derive exactly the same way
     key2 = derive_idempotency_key(
-        session, version, seq, agent, tool, "hello", 42, foo="bar", active=True
+        session,
+        version,
+        seq,
+        agent,
+        tool,
+        IdempotencyScope.SCOPE_STEP_LOCAL,
+        "hello",
+        42,
+        foo="bar",
+        active=True,
     )
 
     assert key1 == key2
@@ -41,7 +59,23 @@ def test_derive_idempotency_key_dict_ordering() -> None:
     tool = "my-tool"
 
     # RFC 8785 guarantees dictionary key ordering
-    key1 = derive_idempotency_key(session, version, seq, agent, tool, {"z": 1, "a": 2})
-    key2 = derive_idempotency_key(session, version, seq, agent, tool, {"a": 2, "z": 1})
+    key1 = derive_idempotency_key(
+        session,
+        version,
+        seq,
+        agent,
+        tool,
+        IdempotencyScope.SCOPE_STEP_LOCAL,
+        {"z": 1, "a": 2},
+    )
+    key2 = derive_idempotency_key(
+        session,
+        version,
+        seq,
+        agent,
+        tool,
+        IdempotencyScope.SCOPE_STEP_LOCAL,
+        {"a": 2, "z": 1},
+    )
 
     assert key1 == key2

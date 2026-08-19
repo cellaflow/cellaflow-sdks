@@ -1,8 +1,8 @@
 import grpc
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from cellaflow.v1 import service_pb2, service_pb2_grpc
-from cellaflow.v1 import common_pb2
+from cellaflow.v1 import common_pb2, idempotency_pb2
 from cellaflow.serialization import serialize, deserialize
 
 
@@ -29,11 +29,8 @@ class CellaflowClient:
         )
         if session_id:
             req.session_id = session_id
-        import typing
 
-        return typing.cast(
-            service_pb2.StartSessionResponse, self.stub.StartSession(req)
-        )
+        return cast(service_pb2.StartSessionResponse, self.stub.StartSession(req))
 
     def commit_step(
         self,
@@ -67,9 +64,7 @@ class CellaflowClient:
                 )
             req.idempotency_fencing_token = idempotency_fencing_token
 
-        import typing
-
-        return typing.cast(service_pb2.CommitStepResponse, self.stub.CommitStep(req))
+        return cast(service_pb2.CommitStepResponse, self.stub.CommitStep(req))
 
     def get_graph(
         self, session_id: str, limit: Optional[int] = None, cursor: Optional[str] = None
@@ -105,6 +100,66 @@ class CellaflowClient:
 
         next_cursor = resp.next_cursor if resp.next_cursor else None
         return results, next_cursor
+
+    def check_idempotency_cache(
+        self,
+        agent_id: str,
+        idempotency_key: str,
+        wait_timeout_ms: Optional[int] = None,
+        lease_ttl_ms: Optional[int] = None,
+    ) -> idempotency_pb2.CheckCacheResponse:
+        req = idempotency_pb2.CheckCacheRequest(
+            agent_id=agent_id,
+            idempotency_key=idempotency_key,
+        )
+        if wait_timeout_ms is not None:
+            req.wait_timeout_ms = wait_timeout_ms
+        if lease_ttl_ms is not None:
+            req.lease_ttl_ms = lease_ttl_ms
+
+        return cast(
+            idempotency_pb2.CheckCacheResponse,
+            self.stub.CheckIdempotencyCache(req),
+        )
+
+    def renew_lease(
+        self,
+        agent_id: str,
+        idempotency_key: str,
+        fencing_token: int,
+        extend_ms: int,
+    ) -> idempotency_pb2.RenewLeaseResponse:
+        req = idempotency_pb2.RenewLeaseRequest(
+            agent_id=agent_id,
+            idempotency_key=idempotency_key,
+            fencing_token=fencing_token,
+            extend_ms=extend_ms,
+        )
+
+        return cast(
+            idempotency_pb2.RenewLeaseResponse,
+            self.stub.RenewLease(req),
+        )
+
+    def release_lease(
+        self,
+        agent_id: str,
+        idempotency_key: str,
+        fencing_token: int,
+        reason: Optional[str] = None,
+    ) -> idempotency_pb2.ReleaseLeaseResponse:
+        req = idempotency_pb2.ReleaseLeaseRequest(
+            agent_id=agent_id,
+            idempotency_key=idempotency_key,
+            fencing_token=fencing_token,
+        )
+        if reason:
+            req.reason = reason
+
+        return cast(
+            idempotency_pb2.ReleaseLeaseResponse,
+            self.stub.ReleaseLease(req),
+        )
 
     def close(self) -> None:
         self.channel.close()

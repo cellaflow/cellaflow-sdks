@@ -7,6 +7,18 @@ from cellaflow.v1 import service_pb2
 from cellaflow.serialization import serialize
 
 
+@pytest.fixture(autouse=True)
+def mock_cache(mock_stub: MagicMock) -> None:
+    from cellaflow.v1 import idempotency_pb2
+
+    mock_resp = idempotency_pb2.CheckCacheResponse(
+        status=idempotency_pb2.CACHE_STATUS_ACQUIRED,
+        fencing_token=456,
+        heartbeat_interval_ms=10000,
+    )
+    mock_stub.CheckIdempotencyCache.return_value = mock_resp
+
+
 @pytest.fixture
 def mock_stub() -> MagicMock:
     return MagicMock()
@@ -158,3 +170,114 @@ def test_custom_idempotency_key(mock_stub: MagicMock, mock_client: None) -> None
     mock_stub.CommitStep.assert_called_once()
     commit_req = mock_stub.CommitStep.call_args[0][0]
     assert commit_req.idempotency_key == "my-custom-key"
+
+
+def test_step_cache_hit(mock_stub: MagicMock, mock_client: None) -> None:
+    from cellaflow.v1 import idempotency_pb2, common_pb2
+
+    mock_start = service_pb2.StartSessionResponse(
+        session_id="test-session", version="1.0.0", is_recovered=False
+    )
+    mock_stub.StartSession.return_value = mock_start
+
+    # Mock cache HIT with serialized result = 777
+    cached_step = common_pb2.StepResult(
+        sequence=1,
+        name="my_step",
+        status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+        output_payload=serialize({"result": 777}),
+    )
+    mock_hit = idempotency_pb2.CheckCacheResponse(
+        status=idempotency_pb2.CACHE_STATUS_HIT,
+        cached_result=cached_step,
+    )
+    mock_stub.CheckIdempotencyCache.return_value = mock_hit
+
+    executed = False
+
+    @step
+    def my_step() -> int:
+        nonlocal executed
+        executed = True
+        return 42
+
+    @workflow(version="1.0.0")
+    def my_workflow() -> int:
+        return my_step()  # type: ignore[no-any-return]
+
+    result = my_workflow()
+    assert result == 777
+    assert not executed
+    mock_stub.CommitStep.assert_not_called()
+
+
+def test_step_release_lease_on_error(mock_stub: MagicMock, mock_client: None) -> None:
+    from cellaflow.v1 import idempotency_pb2
+
+    mock_start = service_pb2.StartSessionResponse(
+        session_id="test-session", version="1.0.0", is_recovered=False
+    )
+    mock_stub.StartSession.return_value = mock_start
+
+    mock_acquired = idempotency_pb2.CheckCacheResponse(
+        status=idempotency_pb2.CACHE_STATUS_ACQUIRED,
+        fencing_token=999,
+        heartbeat_interval_ms=5000,
+    )
+    mock_stub.CheckIdempotencyCache.return_value = mock_acquired
+    mock_stub.ReleaseLease.return_value = idempotency_pb2.ReleaseLeaseResponse(
+        released=True
+    )
+
+    @step
+    def failing_step() -> int:
+        raise ValueError("Simulated tool crash")
+
+    @workflow(version="1.0.0")
+    def my_workflow() -> int:
+        return failing_step()  # type: ignore[no-any-return]
+
+    with pytest.raises(ValueError, match="Simulated tool crash"):
+        my_workflow()
+
+    # Verify ReleaseLease was called with reason="TOOL_ERROR"
+    mock_stub.ReleaseLease.assert_called_once()
+    rel_req = mock_stub.ReleaseLease.call_args[0][0]
+    assert rel_req.fencing_token == 999
+    assert rel_req.reason == "TOOL_ERROR"
+
+
+def test_step_scopes(mock_stub: MagicMock, mock_client: None) -> None:
+    from cellaflow.idempotency import IdempotencyScope
+
+    mock_start = service_pb2.StartSessionResponse(
+        session_id="test-session", version="1.0.0", is_recovered=False
+    )
+    mock_stub.StartSession.return_value = mock_start
+
+    mock_commit = service_pb2.CommitStepResponse(
+        session_id="test-session", next_sequence=2
+    )
+    mock_stub.CommitStep.return_value = mock_commit
+
+    @step(
+        scope=IdempotencyScope.SCOPE_AGENT_PRIVATE,
+        agent_id="agent-007",
+    )  # type: ignore[untyped-decorator]
+    def scoped_step(val: int) -> int:
+        return val * 3
+
+    @workflow(version="1.0.0")
+    def my_workflow(v: int) -> int:
+        return scoped_step(v)  # type: ignore[no-any-return]
+
+    my_workflow(5)
+
+    mock_stub.CommitStep.assert_called_once()
+    commit_req = mock_stub.CommitStep.call_args[0][0]
+    parts = commit_req.idempotency_key.split(":")
+    assert len(parts) == 6
+    assert parts[0] == "test-session"
+    assert parts[2] == "session_wide"  # AGENT_PRIVATE ignores sequence
+    assert parts[3] == "agent-007"  # AGENT_PRIVATE preserves agent_id
+    assert parts[4] == "scoped_step"
