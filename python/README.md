@@ -6,11 +6,11 @@ The official Python SDK for the [CellaFlow Engine](https://github.com/theblueski
 
 ## Features
 
-- **Durable Execution & Transparent Replay**: Run workflows that survive process restarts and infrastructure crashes without re-executing completed external tools or API calls.
-- **Zero-Friction Decorators**: Simply annotate standard Python functions with `@workflow`, `@step`, and `@tool`. Dual support for both sync (`def`) and async (`async def`) functions.
-- **Deterministic Idempotency**: Automatic input hashing via RFC 8785 Canonical JSON and SHA-256 guarantees cross-language determinism across multi-agent swarms.
-- **Background Lease Management**: Non-blocking heartbeat management keeps engine locks alive during long-running tasks and protects against split-brain execution using fencing tokens.
-- **Secure Serialization**: Strictly uses MessagePack for all state payloads to optimize throughput and mitigate remote code execution (RCE) attack vectors.
+- 🔄 **Durable Execution & Transparent Replay**: Workflows survive process restarts and infrastructure crashes without re-executing completed steps.
+- ⚡ **Zero-Friction Decorators**: Annotate standard Python functions with `@workflow`, `@step`, and `@tool` (supporting both `def` and `async def`).
+- 🛡️ **Deterministic Idempotency**: Automatic input hashing via RFC 8785 Canonical JSON and SHA-256 guarantees cross-language determinism across multi-agent swarms.
+- 🔒 **Background Lease Management**: Non-blocking heartbeat management keeps engine locks alive and eliminates split-brain execution using fencing tokens.
+- 📦 **Secure Serialization**: Strictly uses MessagePack for all state payloads to optimize throughput and mitigate remote code execution (RCE) attack vectors.
 
 ---
 
@@ -55,39 +55,37 @@ if __name__ == "__main__":
 
 ---
 
-## How It Works
+## Architecture & How It Works
 
 ### 1. Transparent Replay Recovery
 
-When a workflow runs, every step is committed to the CellaFlow engine's durable event log. If the worker crashes mid-workflow, restarting the workflow with the same session automatically recovers state and skips already executed steps:
+If a worker crashes mid-workflow, restarting the workflow with the same session automatically recovers state from the CellaFlow engine's durable event log:
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant App as Python Application
-    participant SDK as CellaFlow SDK (@workflow / @step)
-    participant Engine as CellaFlow Engine (RocksDB)
+flowchart LR
+    classDef app fill:#e1f5fe,stroke:#0288d1,stroke-width:2px,color:#01579b
+    classDef engine fill:#ede7f6,stroke:#512da8,stroke-width:2px,color:#311b92
+    classDef crash fill:#ffebee,stroke:#c62828,stroke-width:2px,color:#b71c1c
 
-    Note over App, Engine: Initial Run (Crashed at Step 2)
-    App->>SDK: my_workflow()
-    SDK->>Engine: StartSession(workflow_id, version)
-    Engine-->>SDK: session_id, is_recovered=False
-    SDK->>App: Execute step_1()
-    App-->>SDK: step_1 result
-    SDK->>Engine: CommitStep(seq=1, result)
-    Note over App: 💥 Worker process crashes / restarts!
+    subgraph Client[" 🐍 Python Application "]
+        W["@workflow Orchestrator"]:::app
+        S1["@step 1: Query API"]:::app
+        S2["@step 2: Process Data"]:::app
+        Crash["💥 Process Crashes Mid-Run"]:::crash
+    end
 
-    Note over App, Engine: Resumed Run (Replay Recovery)
-    App->>SDK: my_workflow(_session_id="same-session")
-    SDK->>Engine: StartSession(session_id="same-session")
-    Engine-->>SDK: session_id, is_recovered=True
-    SDK->>Engine: GetGraph(session_id)
-    Engine-->>SDK: [Step 1 output payload]
-    SDK-->>App: Return Step 1 result (Instant Cache Replay)
-    Note over SDK: Step 1 function body NOT re-executed
-    SDK->>App: Execute step_2()
-    App-->>SDK: step_2 result
-    SDK->>Engine: CommitStep(seq=2, result)
+    subgraph Storage[" ⚙️ CellaFlow Engine "]
+        Log[("💾 RocksDB Event Graph")]:::engine
+        Replay["🔄 On-Demand Replay Engine"]:::engine
+    end
+
+    W --> S1
+    S1 -->|"1. Commit Result"| Log
+    S1 --> S2
+    S2 -.-> Crash
+    Crash ==>|"Restart Workflow"| Replay
+    Replay -->|"2. Instant Cache Replay (0ms)"| S1
+    Replay -->|"3. Resume Live Execution"| S2
 ```
 
 ---
@@ -97,32 +95,26 @@ sequenceDiagram
 For external tool calls and multi-agent coordination, `@tool` prevents duplicate tool calls, single-flights in-progress work, and maintains active lock heartbeats:
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant Tool as @tool function
-    participant Heartbeat as Background LeaseHeartbeat
-    participant Engine as CellaFlow Engine
+flowchart TD
+    classDef check fill:#e0f7fa,stroke:#00838f,stroke-width:2px,color:#004d40
+    classDef hit fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1b5e20
+    classDef lease fill:#fff3e0,stroke:#ef6c00,stroke-width:2px,color:#e65100
+    classDef commit fill:#ede7f6,stroke:#512da8,stroke-width:2px,color:#311b92
 
-    Tool->>Tool: Hash inputs via RFC 8785 Canonical JSON + SHA-256
-    Tool->>Engine: CheckIdempotencyCache(agent_id, composite_key)
+    In["Function Call: @tool(*args, **kwargs)"] --> Hash["🔑 RFC 8785 Canonical JSON + SHA-256 Hashing"]
+    Hash --> Query{"Check Idempotency Cache"}:::check
+
+    Query -->|"⚡ Cache HIT"| Cached["Return Cached StepResult<br/>(Skip Execution)"]:::hit
     
-    alt Status == CACHE_STATUS_HIT
-        Engine-->>Tool: Return cached StepResult
-        Note over Tool: Skips execution and returns cached result immediately
-    else Status == CACHE_STATUS_ACQUIRED
-        Engine-->>Tool: Acquired (fencing_token, heartbeat_interval_ms)
-        Tool->>Heartbeat: Start background heartbeat task/thread
-        
-        loop Every heartbeat_interval
-            Heartbeat->>Engine: RenewLease(fencing_token, extend_ms)
-            Engine-->>Heartbeat: Renewed = True
-        end
-        
-        Tool->>Tool: Execute user tool logic...
-        Tool->>Heartbeat: Stop heartbeat
-        Tool->>Engine: CommitStep(idempotency_key, fencing_token)
-        Engine-->>Tool: Committed
+    Query -->|"🔒 Cache ACQUIRED"| Lease["Acquire Fencing Token & Lease"]:::lease
+    
+    subgraph Execution[" ⚙️ Active Tool Execution "]
+        Lease --> HB["🔄 Background LeaseHeartbeat<br/>(Periodic RenewLease)"]:::lease
+        Lease --> Run["🛠️ Run User Function Body"]:::lease
     end
+
+    Run --> Done["Stop Heartbeat & CommitStep(fencing_token)"]:::commit
+    Done --> DB[("💾 Persist Result to RocksDB")]:::commit
 ```
 
 ---
