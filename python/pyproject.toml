@@ -27,7 +27,7 @@ classifiers = [
 [project.urls]
 Homepage = "https://www.cellaflow.com"
 Documentation = "https://www.cellaflow.com"
-Repository = "https://github.com/theblueskies/cellaflow-sdks"
+Repository = "https://github.com/cellaflow/cellaflow-sdks"
 
 [project.optional-dependencies]
 dev = [

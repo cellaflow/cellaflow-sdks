@@ -2,7 +2,7 @@
 
 Official client SDKs and protocol definitions for the [CellaFlow Engine](https://www.cellaflow.com) — a high-performance, deterministic execution runtime and cognitive state machine for autonomous AI agents and swarms.
 
-[![License](https://img.shields.io/badge/license-Apache%202.0%20%2F%20MIT-blue.svg)](https://github.com/theblueskies/cellaflow-sdks/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0%20%2F%20MIT-blue.svg)](https://github.com/cellaflow/cellaflow-sdks/blob/main/LICENSE)
 
 ---
 
