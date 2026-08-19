@@ -183,3 +183,69 @@ def test_release_lease(client: CellaflowClient, mock_stub: MagicMock) -> None:
     assert req.idempotency_key == "key-1"
     assert req.fencing_token == 101
     assert req.reason == "TOOL_ERROR"
+
+
+def test_client_secure_channel(monkeypatch: Any) -> None:
+    mock_secure = MagicMock()
+    monkeypatch.setattr("grpc.secure_channel", mock_secure)
+    monkeypatch.setattr("grpc.ssl_channel_credentials", lambda: MagicMock())
+
+    CellaflowClient(target="secure.cellaflow.com:443", secure=True)
+    mock_secure.assert_called_once()
+
+
+def test_commit_step_requires_fencing_token(client: CellaflowClient) -> None:
+    from cellaflow.v1.common_pb2 import STEP_STATUS_SUCCESS
+
+    with pytest.raises(
+        ValueError, match="idempotency_fencing_token required if idempotency_key is set"
+    ):
+        client.commit_step(
+            session_id="s1",
+            sequence=1,
+            name="t1",
+            status=STEP_STATUS_SUCCESS,
+            output_payload={"ok": True},
+            idempotency_key="key-123",
+            idempotency_fencing_token=None,
+        )
+
+
+def test_get_graph_with_pagination_params(
+    client: CellaflowClient, mock_stub: MagicMock
+) -> None:
+    mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(
+        session_id="test-session", steps=[], next_cursor="next-token"
+    )
+
+    steps, next_cur = client.get_graph("test-session", limit=25, cursor="cursor-123")
+    assert next_cur == "next-token"
+    req = mock_stub.GetGraph.call_args[0][0]
+    assert req.limit == 25
+    assert req.cursor == "cursor-123"
+
+
+def test_release_lease_no_reason(client: CellaflowClient, mock_stub: MagicMock) -> None:
+    from cellaflow.v1 import idempotency_pb2
+
+    mock_stub.ReleaseLease.return_value = idempotency_pb2.ReleaseLeaseResponse(
+        released=True
+    )
+
+    resp = client.release_lease(
+        agent_id="agent-1",
+        idempotency_key="key-1",
+        fencing_token=101,
+    )
+    assert resp.released is True
+
+
+def test_context_outside_workflow_raises() -> None:
+    from cellaflow.context import get_context
+
+    with pytest.raises(RuntimeError, match="No active workflow context found"):
+        get_context()
+
+
+def test_client_close(client: CellaflowClient) -> None:
+    client.close()
