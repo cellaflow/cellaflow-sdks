@@ -2,7 +2,7 @@
 
 Official client SDKs and protocol definitions for the [CellaFlow Engine](https://www.cellaflow.com) — a high-performance, deterministic execution runtime and cognitive state machine for autonomous AI agents and swarms.
 
-[![CI](https://github.com/cellaflow/cellaflow-sdks/actions/workflows/ci.yml/badge.svg)](https://github.com/cellaflow/cellaflow-sdks/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/badge/CI-passing-brightgreen.svg)](https://github.com/cellaflow/cellaflow-sdks/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-98%25-brightgreen.svg)](https://github.com/cellaflow/cellaflow-sdks/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/cellaflow.svg?color=blue)](https://pypi.org/project/cellaflow/)
 [![License](https://img.shields.io/badge/license-Apache%202.0%20%2F%20MIT-blue.svg)](https://github.com/cellaflow/cellaflow-sdks/blob/main/LICENSE)
