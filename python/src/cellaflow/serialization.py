@@ -1,5 +1,5 @@
 import msgpack
-from typing import Any, Dict
+from typing import Any, Dict, cast
 
 
 def serialize(data: Dict[str, Any]) -> bytes:
@@ -10,9 +10,7 @@ def serialize(data: Dict[str, Any]) -> bytes:
     if not isinstance(data, dict):
         raise TypeError(f"Expected a dictionary for serialization, got {type(data)}")
     # We use strict_types=True for tighter encoding and use_bin_type=True
-    import typing
-
-    return typing.cast(bytes, msgpack.packb(data, use_bin_type=True, strict_types=True))
+    return cast(bytes, msgpack.packb(data, use_bin_type=True, strict_types=True))
 
 
 def deserialize(data: bytes) -> Dict[str, Any]:

@@ -108,3 +108,78 @@ def test_get_graph(client: CellaflowClient, mock_stub: MagicMock) -> None:
     req = mock_stub.GetGraph.call_args[0][0]
     assert isinstance(req, service_pb2.GetGraphRequest)
     assert req.session_id == "test-session"
+
+
+def test_check_idempotency_cache(client: CellaflowClient, mock_stub: MagicMock) -> None:
+    from cellaflow.v1 import idempotency_pb2
+
+    mock_resp = idempotency_pb2.CheckCacheResponse(
+        status=idempotency_pb2.CACHE_STATUS_ACQUIRED,
+        fencing_token=101,
+        heartbeat_interval_ms=5000,
+    )
+    mock_stub.CheckIdempotencyCache.return_value = mock_resp
+
+    resp = client.check_idempotency_cache(
+        agent_id="agent-1",
+        idempotency_key="key-1",
+        wait_timeout_ms=1000,
+        lease_ttl_ms=20000,
+    )
+
+    assert resp.status == idempotency_pb2.CACHE_STATUS_ACQUIRED
+    assert resp.fencing_token == 101
+    mock_stub.CheckIdempotencyCache.assert_called_once()
+    req = mock_stub.CheckIdempotencyCache.call_args[0][0]
+    assert req.agent_id == "agent-1"
+    assert req.idempotency_key == "key-1"
+    assert req.wait_timeout_ms == 1000
+    assert req.lease_ttl_ms == 20000
+
+
+def test_renew_lease(client: CellaflowClient, mock_stub: MagicMock) -> None:
+    from cellaflow.v1 import idempotency_pb2
+
+    mock_resp = idempotency_pb2.RenewLeaseResponse(
+        renewed=True,
+        new_expires_at_ms=123456,
+    )
+    mock_stub.RenewLease.return_value = mock_resp
+
+    resp = client.renew_lease(
+        agent_id="agent-1",
+        idempotency_key="key-1",
+        fencing_token=101,
+        extend_ms=10000,
+    )
+
+    assert resp.renewed is True
+    assert resp.new_expires_at_ms == 123456
+    mock_stub.RenewLease.assert_called_once()
+    req = mock_stub.RenewLease.call_args[0][0]
+    assert req.agent_id == "agent-1"
+    assert req.idempotency_key == "key-1"
+    assert req.fencing_token == 101
+    assert req.extend_ms == 10000
+
+
+def test_release_lease(client: CellaflowClient, mock_stub: MagicMock) -> None:
+    from cellaflow.v1 import idempotency_pb2
+
+    mock_resp = idempotency_pb2.ReleaseLeaseResponse(released=True)
+    mock_stub.ReleaseLease.return_value = mock_resp
+
+    resp = client.release_lease(
+        agent_id="agent-1",
+        idempotency_key="key-1",
+        fencing_token=101,
+        reason="TOOL_ERROR",
+    )
+
+    assert resp.released is True
+    mock_stub.ReleaseLease.assert_called_once()
+    req = mock_stub.ReleaseLease.call_args[0][0]
+    assert req.agent_id == "agent-1"
+    assert req.idempotency_key == "key-1"
+    assert req.fencing_token == 101
+    assert req.reason == "TOOL_ERROR"
