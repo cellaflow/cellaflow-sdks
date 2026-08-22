@@ -1,6 +1,24 @@
+"""
+LangGraph Checkpointer Integration for CellaFlow.
+
+This module provides `CellaflowSaver`, a drop-in persistence checkpointer
+for LangGraph workflows backed by the CellaFlow Engine gRPC service.
+
+Optional Dependency Semantics:
+    `langgraph-checkpoint` (and `langgraph`) is an optional dependency.
+    This module can be imported safely even when LangGraph is not installed in the
+    runtime environment. However, attempting to instantiate `CellaflowSaver` without
+    `langgraph-checkpoint` installed will raise a descriptive `ImportError`.
+
+To enable LangGraph support:
+    pip install cellaflow[langgraph]
+    # or:
+    pip install langgraph-checkpoint>=2.0.0 langgraph>=0.2.0
+"""
+
 import asyncio
 import logging
-import random
+import secrets
 from collections import defaultdict
 from typing import (
     TYPE_CHECKING,
@@ -34,6 +52,9 @@ if TYPE_CHECKING:
         get_checkpoint_metadata,
     )
     from langgraph.checkpoint.serde.base import SerializerProtocol
+
+    _BaseSaver = BaseCheckpointSaver[str]
+    HAS_LANGGRAPH = True
 else:
     try:
         from langchain_core.runnables import RunnableConfig
@@ -48,15 +69,24 @@ else:
             get_checkpoint_metadata,
         )
         from langgraph.checkpoint.serde.base import SerializerProtocol
+
+        _BaseSaver = BaseCheckpointSaver
+        HAS_LANGGRAPH = True
     except ImportError:  # pragma: no cover
-        BaseCheckpointSaver = object
+        class _BaseSaver:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+        HAS_LANGGRAPH = False
         RunnableConfig = Dict[str, Any]
         ChannelVersions = Dict[str, Any]
         Checkpoint = Dict[str, Any]
         CheckpointMetadata = Dict[str, Any]
-        CheckpointTuple = Any
         SerializerProtocol = Any
         WRITES_IDX_MAP = {}
+
+        def CheckpointTuple(*args: Any, **kwargs: Any) -> Any:
+            return tuple(args)
 
         def get_checkpoint_id(
             config: Optional[RunnableConfig],
@@ -69,11 +99,28 @@ else:
             return metadata
 
 
-class CellaflowSaver(BaseCheckpointSaver[str]):
+class CellaflowSaver(_BaseSaver):
     """
     Drop-in LangGraph checkpointer backed by the CellaFlow Engine gRPC service.
-    Persists checkpoints and intermediate task writes as immutable,
-    sequence-ordered events with native MessagePack serialization.
+
+    Persists workflow checkpoints and intermediate task writes as immutable,
+    sequence-ordered events with native MessagePack serialization. Provides
+    full support for LangGraph multi-turn session persistence, state time travel,
+    human-in-the-loop inspection, and distributed workflow resumption.
+
+    Example:
+        ```python
+        from langgraph.graph import StateGraph, START, END
+        from cellaflow import CellaflowSaver
+
+        checkpointer = CellaflowSaver(target="localhost:50051")
+        builder = StateGraph(state_schema=MyState)
+        # ... add nodes & edges ...
+        app = builder.compile(checkpointer=checkpointer)
+
+        config = {"configurable": {"thread_id": "session-123"}}
+        result = app.invoke({"input": "hello"}, config)
+        ```
     """
 
     def __init__(
@@ -86,7 +133,22 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
         *,
         serde: Optional[SerializerProtocol] = None,
     ) -> None:
-        if BaseCheckpointSaver is object:
+        """
+        Initializes the CellaflowSaver checkpointer.
+
+        Args:
+            client: Optional pre-configured `CellaflowClient` instance. If None,
+                a client is automatically constructed using `target` and `secure`.
+            target: gRPC target endpoint for the CellaFlow Engine.
+            secure: Whether to use TLS encryption for gRPC channel communication.
+            workflow_id: CellaFlow workflow identifier tag.
+            version: Workflow schema version string.
+            serde: Optional custom serializer conforming to `SerializerProtocol`.
+
+        Raises:
+            ImportError: If `langgraph-checkpoint` is not installed in the environment.
+        """
+        if not HAS_LANGGRAPH:
             raise ImportError(
                 "langgraph-checkpoint is required to use CellaflowSaver. "
                 "Install it with: pip install cellaflow[langgraph] or "
@@ -658,5 +720,5 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
         else:
             current_v = int(current.split(".")[0])
         next_v = current_v + 1
-        next_h = random.getrandbits(64)
-        return f"{next_v:032}.{next_h:016x}"
+        next_h = secrets.token_hex(8)
+        return f"{next_v:032}.{next_h}"

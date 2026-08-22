@@ -88,7 +88,7 @@ def test_init_default_client() -> None:
 
 
 def test_missing_dependency_raises() -> None:
-    with patch("cellaflow.langgraph.BaseCheckpointSaver", object):
+    with patch("cellaflow.langgraph.HAS_LANGGRAPH", False):
         with pytest.raises(ImportError, match="langgraph-checkpoint is required"):
             CellaflowSaver()
 
@@ -579,3 +579,55 @@ def test_non_lexicographical_checkpoint_ids() -> None:
     history = list(saver.list(config))
     assert len(history) == 2
     assert [cp.checkpoint["id"] for cp in history] == ["aaa_newer", "zzz_older"]
+
+
+def test_import_without_langgraph_dependency() -> None:
+    """
+    Verifies that cellaflow and cellaflow.langgraph import cleanly without raising
+    TypeError or syntax errors when langgraph packages are missing from sys.modules.
+    """
+    import importlib
+    import sys
+
+    # Save original modules
+    saved_modules = {
+        k: sys.modules.get(k)
+        for k in list(sys.modules.keys())
+        if "langgraph" in k or "cellaflow" in k
+    }
+
+    try:
+        # Mock absence of langgraph packages
+        for k in list(sys.modules.keys()):
+            if "cellaflow.langgraph" in k or "langgraph" in k:
+                del sys.modules[k]
+
+        for blocked_mod in [
+            "langgraph",
+            "langgraph.checkpoint",
+            "langgraph.checkpoint.base",
+            "langgraph.checkpoint.serde",
+            "langgraph.checkpoint.serde.base",
+        ]:
+            sys.modules[blocked_mod] = None  # type: ignore[assignment]
+
+        # Re-import cellaflow.langgraph dynamically
+        import cellaflow.langgraph
+
+        importlib.reload(cellaflow.langgraph)
+
+        # Confirm module imported and HAS_LANGGRAPH is False
+        assert cellaflow.langgraph.HAS_LANGGRAPH is False
+        # Confirm instantiation raises clear ImportError
+        with pytest.raises(ImportError, match="langgraph-checkpoint is required"):
+            cellaflow.langgraph.CellaflowSaver()
+
+    finally:
+        # Restore sys.modules
+        for k, v in saved_modules.items():
+            if v is not None:
+                sys.modules[k] = v
+            elif k in sys.modules:
+                del sys.modules[k]
+        if "cellaflow.langgraph" in sys.modules:
+            importlib.reload(sys.modules["cellaflow.langgraph"])

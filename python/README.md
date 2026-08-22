@@ -14,6 +14,7 @@ The official Python SDK for the [CellaFlow Engine](https://www.cellaflow.com) �
 
 - 🔄 **Durable Execution & Transparent Replay**: Workflows survive process restarts and infrastructure crashes without re-executing completed steps.
 - ⚡ **Zero-Friction Decorators**: Annotate standard Python functions with `@workflow`, `@step`, and `@tool` (supporting both `def` and `async def`).
+- 🧠 **LangGraph Drop-in Checkpointer**: Native `CellaflowSaver` checkpointer for LangGraph workflows with immutable MessagePack state snapshots, time-travel, and crash recovery.
 - 🛡️ **Deterministic Idempotency**: Automatic input hashing via RFC 8785 Canonical JSON and SHA-256 guarantees cross-language determinism across multi-agent swarms.
 - 🔒 **Background Lease Management**: Non-blocking heartbeat management keeps engine locks alive and eliminates split-brain execution using fencing tokens.
 - 📦 **Secure Serialization**: Strictly uses MessagePack for all state payloads to optimize throughput over gRPC and eliminate Remote Code Execution (RCE) deserialization vectors.
@@ -22,9 +23,22 @@ The official Python SDK for the [CellaFlow Engine](https://www.cellaflow.com) �
 
 ## Installation
 
+### Core SDK
+For standard durable execution workflows, decorators, and gRPC client:
 ```bash
 pip install cellaflow
 ```
+
+### With LangGraph Support
+To use `CellaflowSaver` as a drop-in LangGraph checkpointer:
+```bash
+pip install "cellaflow[langgraph]"
+```
+
+> **Note on Optional Dependencies**:
+> - `pip install cellaflow` installs a lightweight package without pulling in LangGraph, Pydantic, or LangChain.
+> - If your environment already contains `langgraph >= 0.2.0` and `langgraph-checkpoint >= 2.0.0`, `from cellaflow import CellaflowSaver` will work immediately out of the box.
+> - Installing `cellaflow[langgraph]` ensures that compatible `langgraph` and `langgraph-checkpoint` versions are installed or upgraded automatically.
 
 ---
 
@@ -104,6 +118,48 @@ recovered_result = research_workflow(
     "autonomous agent architectures", 
     _session_id="3f7491d9-e932-4467-bcda-370fb5c1a7e4"
 )
+```
+
+---
+
+### 4. LangGraph Checkpointer (`CellaflowSaver`)
+
+Use `CellaflowSaver` as a drop-in checkpointer for any LangGraph `StateGraph`:
+
+```python
+from typing import TypedDict, List
+from langgraph.graph import StateGraph, START, END
+from cellaflow import CellaflowSaver
+
+# 1. Initialize checkpointer connected to CellaFlow Engine
+checkpointer = CellaflowSaver(target="localhost:50051", secure=False)
+
+# 2. Define LangGraph state schema
+class WorkflowState(TypedDict):
+    query: str
+    summary: str
+
+def plan_node(state: WorkflowState) -> dict:
+    return {"summary": f"Plan generated for {state['query']}"}
+
+# 3. Build graph
+builder = StateGraph(WorkflowState)
+builder.add_node("plan", plan_node)
+builder.add_edge(START, "plan")
+builder.add_edge("plan", END)
+
+# 4. Compile with CellaFlow persistence
+app = builder.compile(checkpointer=checkpointer)
+
+# 5. Execute with session tracking
+config = {"configurable": {"thread_id": "session-42"}}
+result = app.invoke({"query": "AI Agents"}, config)
+print("Graph output:", result)
+
+# 6. Time travel / inspect state history
+for checkpoint_tuple in checkpointer.list(config):
+    print("Checkpoint ID:", checkpoint_tuple.checkpoint["id"])
+    print("State snapshot:", checkpoint_tuple.checkpoint["channel_values"])
 ```
 
 ---
