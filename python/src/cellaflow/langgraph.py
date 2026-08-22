@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import random
 from collections import defaultdict
 from typing import (
@@ -14,8 +15,11 @@ from typing import (
     cast,
 )
 
+import grpc
 from cellaflow.client import CellaflowClient
 from cellaflow.v1 import common_pb2
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from langchain_core.runnables import RunnableConfig
@@ -106,14 +110,30 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
         """
         if session_id not in self._next_sequence:
             try:
+                logger.debug(
+                    "Querying graph history for session %s to determine sequence",
+                    session_id,
+                )
                 steps, _ = self.client.get_graph(session_id=session_id)
                 if steps:
                     max_seq = max(cast(int, step["sequence"]) for step in steps)
                     self._next_sequence[session_id] = max_seq + 1
                     self._session_started.add(session_id)
+                    logger.info(
+                        "Resuming session %s at next sequence %d "
+                        "from existing %d steps",
+                        session_id,
+                        self._next_sequence[session_id],
+                        len(steps),
+                    )
                 else:
                     self._next_sequence[session_id] = 1
-            except Exception:
+            except Exception as e:
+                logger.debug(
+                    "Unable to query existing graph for session %s: %s",
+                    session_id,
+                    e,
+                )
                 self._next_sequence[session_id] = 1
 
         if session_id not in self._session_started:
@@ -123,9 +143,33 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
                     version=self.version,
                     session_id=session_id,
                 )
-            except Exception:
-                pass
-            self._session_started.add(session_id)
+                self._session_started.add(session_id)
+                logger.info(
+                    "Successfully started session %s on CellaFlow Engine "
+                    "(workflow=%s, version=%s)",
+                    session_id,
+                    self.workflow_id,
+                    self.version,
+                )
+            except grpc.RpcError as rpc_err:
+                if rpc_err.code() == grpc.StatusCode.ALREADY_EXISTS:
+                    self._session_started.add(session_id)
+                    logger.info(
+                        "Session %s already exists on engine, continuing",
+                        session_id,
+                    )
+                else:
+                    logger.warning(
+                        "Failed to start session %s on engine: %s",
+                        session_id,
+                        rpc_err,
+                    )
+            except Exception as err:
+                logger.warning(
+                    "Unexpected error starting session %s: %s",
+                    session_id,
+                    err,
+                )
 
         seq = self._next_sequence[session_id]
         self._next_sequence[session_id] = seq + 1
@@ -138,7 +182,7 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
             str,
             Dict[
                 str,
-                Tuple[Tuple[str, bytes], Tuple[str, bytes], Optional[str]],
+                Tuple[int, Tuple[str, bytes], Tuple[str, bytes], Optional[str]],
             ],
         ],
         Dict[Tuple[str, str, str, str], Tuple[str, bytes]],
@@ -154,7 +198,7 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
             str,
             Dict[
                 str,
-                Tuple[Tuple[str, bytes], Tuple[str, bytes], Optional[str]],
+                Tuple[int, Tuple[str, bytes], Tuple[str, bytes], Optional[str]],
             ],
         ] = defaultdict(dict)
         blobs: Dict[Tuple[str, str, str, str], Tuple[str, bytes]] = {}
@@ -164,8 +208,19 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
         ] = defaultdict(dict)
 
         try:
+            logger.debug("Fetching graph history for thread %s", thread_id)
             steps, _ = self.client.get_graph(session_id=thread_id)
-        except Exception:
+            logger.debug(
+                "Successfully fetched %d steps for thread %s",
+                len(steps),
+                thread_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to fetch graph history for thread %s: %s",
+                thread_id,
+                e,
+            )
             return storage, blobs, writes
 
         for step in steps:
@@ -173,6 +228,7 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
             if not isinstance(payload, dict):
                 continue
             record_type = payload.get("record_type")
+            step_seq = cast(int, step.get("sequence", 0))
             if record_type == "checkpoint":
                 cp_id = cast(str, payload["checkpoint_id"])
                 cp_ns = cast(str, payload.get("checkpoint_ns", ""))
@@ -187,7 +243,7 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
                     cast(str, meta_info.get("type", "msgpack")),
                     cast(bytes, meta_info.get("data", b"")),
                 )
-                storage[cp_ns][cp_id] = (ckpt_tuple, meta_tuple, parent_id)
+                storage[cp_ns][cp_id] = (step_seq, ckpt_tuple, meta_tuple, parent_id)
 
                 for k, blob_info in payload.get("blobs", {}).items():
                     ver = str(blob_info.get("version", ""))
@@ -248,11 +304,16 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
                 return None
             checkpoint_id = requested_id
         else:
-            checkpoint_id = max(ns_storage.keys())
+            checkpoint_id = max(
+                ns_storage.keys(), key=lambda cid: ns_storage[cid][0]
+            )
 
-        checkpoint_tuple, metadata_tuple, parent_checkpoint_id = ns_storage[
-            checkpoint_id
-        ]
+        (
+            _seq,
+            checkpoint_tuple,
+            metadata_tuple,
+            parent_checkpoint_id,
+        ) = ns_storage[checkpoint_id]
         checkpoint_dict: Checkpoint = self.serde.loads_typed(checkpoint_tuple)
         metadata_dict: CheckpointMetadata = self.serde.loads_typed(metadata_tuple)
 
@@ -324,15 +385,31 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
             ):
                 continue
 
-            for checkpoint_id in sorted(ns_storage.keys(), reverse=True):
+            before_seq = (
+                ns_storage[before_checkpoint_id][0]
+                if before_checkpoint_id and before_checkpoint_id in ns_storage
+                else None
+            )
+
+            for checkpoint_id in sorted(
+                ns_storage.keys(),
+                key=lambda cid: ns_storage[cid][0],
+                reverse=True,
+            ):
                 if config_checkpoint_id and checkpoint_id != config_checkpoint_id:
                     continue
-                if before_checkpoint_id and checkpoint_id >= before_checkpoint_id:
+                if (
+                    before_seq is not None
+                    and ns_storage[checkpoint_id][0] >= before_seq
+                ):
                     continue
 
-                checkpoint_tuple, metadata_tuple, parent_checkpoint_id = ns_storage[
-                    checkpoint_id
-                ]
+                (
+                    _seq,
+                    checkpoint_tuple,
+                    metadata_tuple,
+                    parent_checkpoint_id,
+                ) = ns_storage[checkpoint_id]
                 metadata_dict: CheckpointMetadata = self.serde.loads_typed(
                     metadata_tuple
                 )
@@ -424,13 +501,29 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
             "blobs": blobs_dict,
         }
 
-        self.client.commit_step(
-            session_id=thread_id,
-            sequence=seq,
-            name=f"checkpoint:{checkpoint['id']}",
-            status=common_pb2.STEP_STATUS_SUCCESS,
-            output_payload=payload,
-        )
+        try:
+            self.client.commit_step(
+                session_id=thread_id,
+                sequence=seq,
+                name=f"checkpoint:{checkpoint['id']}",
+                status=common_pb2.STEP_STATUS_SUCCESS,
+                output_payload=payload,
+            )
+            logger.debug(
+                "Committed checkpoint %s for thread %s at sequence %d",
+                checkpoint["id"],
+                thread_id,
+                seq,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to commit checkpoint %s for thread %s at sequence %d: %s",
+                checkpoint["id"],
+                thread_id,
+                seq,
+                e,
+            )
+            raise
 
         return {
             "configurable": {
@@ -476,18 +569,40 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
             "writes": writes_list,
         }
 
-        self.client.commit_step(
-            session_id=thread_id,
-            sequence=seq,
-            name=f"writes:{checkpoint_id}:{task_id}",
-            status=common_pb2.STEP_STATUS_SUCCESS,
-            output_payload=payload,
-        )
+        try:
+            self.client.commit_step(
+                session_id=thread_id,
+                sequence=seq,
+                name=f"writes:{checkpoint_id}:{task_id}",
+                status=common_pb2.STEP_STATUS_SUCCESS,
+                output_payload=payload,
+            )
+            logger.debug(
+                "Committed %d writes for task %s (checkpoint %s, thread %s) "
+                "at sequence %d",
+                len(writes),
+                task_id,
+                checkpoint_id,
+                thread_id,
+                seq,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to commit writes for task %s (checkpoint %s, thread %s) "
+                "at sequence %d: %s",
+                task_id,
+                checkpoint_id,
+                thread_id,
+                seq,
+                e,
+            )
+            raise
 
     def delete_thread(self, thread_id: str) -> None:
         """
         Cleans up local session sequence cache.
         """
+        logger.info("Clearing local thread sequence cache for thread %s", thread_id)
         self._next_sequence.pop(thread_id, None)
         self._session_started.discard(thread_id)
 
@@ -533,7 +648,9 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
     async def adelete_thread(self, thread_id: str) -> None:
         await asyncio.to_thread(self.delete_thread, thread_id)
 
-    def get_next_version(self, current: Optional[str], channel: None = None) -> str:
+    def get_next_version(
+        self, current: Optional[str], channel: Optional[str] = None
+    ) -> str:
         if current is None:
             current_v = 0
         elif isinstance(current, int):
@@ -541,5 +658,5 @@ class CellaflowSaver(BaseCheckpointSaver[str]):
         else:
             current_v = int(current.split(".")[0])
         next_v = current_v + 1
-        next_h = random.random()
-        return f"{next_v:032}.{next_h:016}"
+        next_h = random.getrandbits(64)
+        return f"{next_v:032}.{next_h:016x}"

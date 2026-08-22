@@ -1,4 +1,5 @@
-from typing import Any, Dict, List, Optional, Tuple, TypedDict, cast
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, cast
 from unittest.mock import MagicMock, patch
 import pytest
 
@@ -11,6 +12,12 @@ from langgraph.checkpoint.base import (
     Checkpoint,
     CheckpointMetadata,
 )
+
+
+@dataclass
+class WorkflowState:
+    count: int = 0
+    path: List[str] = field(default_factory=list)
 
 
 class MockCellaflowClient:
@@ -464,6 +471,7 @@ def test_recovery_from_existing_graph_and_exception_handling() -> None:
     err_saver = CellaflowSaver(client=cast(CellaflowClient, err_client))
     seq = err_saver._ensure_session_and_sequence("err-thread")
     assert seq == 1
+    assert "err-thread" not in err_saver._session_started
 
 
 def test_stategraph_integration_and_resume() -> None:
@@ -474,17 +482,13 @@ def test_stategraph_integration_and_resume() -> None:
     raw_mock_client = MockCellaflowClient()
     saver = CellaflowSaver(client=cast(CellaflowClient, raw_mock_client))
 
-    class State(TypedDict):
-        count: int
-        path: List[str]
+    def node_a(state: WorkflowState) -> Dict[str, Any]:
+        return {"count": state.count + 1, "path": state.path + ["A"]}
 
-    def node_a(state: State) -> State:
-        return {"count": state["count"] + 1, "path": state["path"] + ["A"]}
+    def node_b(state: WorkflowState) -> Dict[str, Any]:
+        return {"count": state.count * 2, "path": state.path + ["B"]}
 
-    def node_b(state: State) -> State:
-        return {"count": state["count"] * 2, "path": state["path"] + ["B"]}
-
-    builder = StateGraph(State)
+    builder = StateGraph(WorkflowState)
     builder.add_node("node_a", node_a)
     builder.add_node("node_b", node_b)
     builder.add_edge(START, "node_a")
@@ -496,8 +500,7 @@ def test_stategraph_integration_and_resume() -> None:
     config: RunnableConfig = {"configurable": {"thread_id": "integration-session-1"}}
 
     # Initial invocation
-    input_1: State = {"count": 5, "path": ["start"]}
-    out1 = cast(State, app.invoke(input_1, config))
+    out1 = app.invoke({"count": 5, "path": ["start"]}, config)
     assert out1["count"] == 12  # (5 + 1) * 2
     assert out1["path"] == ["start", "A", "B"]
 
@@ -509,8 +512,7 @@ def test_stategraph_integration_and_resume() -> None:
     assert sequences == list(range(1, len(steps) + 1))
 
     # Second invocation on the same thread (resume)
-    input_2: State = {"count": 20, "path": ["resumed"]}
-    out2 = cast(State, app.invoke(input_2, config))
+    out2 = app.invoke({"count": 20, "path": ["resumed"]}, config)
     assert out2["count"] == 42  # (20 + 1) * 2
     assert out2["path"] == ["resumed", "A", "B"]
 
@@ -520,3 +522,54 @@ def test_stategraph_integration_and_resume() -> None:
     latest_state = history[0].checkpoint["channel_values"]
     assert latest_state["count"] == 42
     assert latest_state["path"] == ["resumed", "A", "B"]
+
+
+def test_non_lexicographical_checkpoint_ids() -> None:
+    """
+    Ensures that latest checkpoint selection and list ordering use the CellaFlow
+    sequence number rather than lexicographical string comparison on checkpoint IDs.
+    """
+    mock_client = cast(CellaflowClient, MockCellaflowClient())
+    saver = CellaflowSaver(client=mock_client)
+
+    config: RunnableConfig = {"configurable": {"thread_id": "non-lex-thread"}}
+
+    # First checkpoint with lexicographically larger ID 'zzz_older'
+    cp1: Checkpoint = {
+        "v": 1,
+        "ts": "2026-08-22T00:00:01Z",
+        "id": "zzz_older",
+        "channel_values": {"version_name": "first"},
+        "channel_versions": {"version_name": "1"},
+        "versions_seen": {},
+        "updated_channels": None,
+    }
+    saver.put(config, cp1, {"step": 1, "source": "input"}, {"version_name": "1"})
+
+    # Second checkpoint with lexicographically smaller ID 'aaa_newer'
+    cp2: Checkpoint = {
+        "v": 1,
+        "ts": "2026-08-22T00:00:02Z",
+        "id": "aaa_newer",
+        "channel_values": {"version_name": "second"},
+        "channel_versions": {"version_name": "2"},
+        "versions_seen": {},
+        "updated_channels": None,
+    }
+    saver.put(
+        {"configurable": {"thread_id": "non-lex-thread", "checkpoint_id": "zzz_older"}},
+        cp2,
+        {"step": 2, "source": "loop"},
+        {"version_name": "2"},
+    )
+
+    # get_tuple should return 'aaa_newer' because sequence 2 > sequence 1
+    latest = saver.get_tuple(config)
+    assert latest is not None
+    assert latest.checkpoint["id"] == "aaa_newer"
+    assert latest.checkpoint["channel_values"]["version_name"] == "second"
+
+    # list() should return ['aaa_newer', 'zzz_older'] in sequence order
+    history = list(saver.list(config))
+    assert len(history) == 2
+    assert [cp.checkpoint["id"] for cp in history] == ["aaa_newer", "zzz_older"]
