@@ -39,12 +39,17 @@ cellaflow-sdks/
 To get started with the Python SDK:
 
 ```bash
+# Core SDK for durable workflows and decorators:
 pip install cellaflow
+
+# With drop-in LangGraph checkpointer support:
+pip install "cellaflow[langgraph]"
 ```
 
 Check out the full [Python SDK Quickstart & Architecture Guide](python/README.md) to learn about:
 - Zero-friction `@workflow`, `@step`, and `@tool` decorators.
 - Transparent replay recovery from engine crashes.
+- Drop-in LangGraph checkpointer integration (`CellaflowSaver`).
 - Cross-agent idempotency key derivation with RFC 8785 Canonical JSON and SHA-256.
 - Background lease management with fencing tokens.
 
