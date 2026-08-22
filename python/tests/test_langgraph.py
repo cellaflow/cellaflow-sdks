@@ -1,10 +1,12 @@
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, cast
 from unittest.mock import MagicMock, patch
 import pytest
 
 from cellaflow import CellaflowSaver
+from cellaflow.client import CellaflowClient
 from cellaflow.serialization import serialize, deserialize
 from langgraph.graph import StateGraph, START, END
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
     Checkpoint,
     CheckpointMetadata,
@@ -85,10 +87,10 @@ def test_missing_dependency_raises() -> None:
 
 
 def test_put_and_get_tuple_basic() -> None:
-    mock_client = MockCellaflowClient()
+    mock_client = cast(CellaflowClient, MockCellaflowClient())
     saver = CellaflowSaver(client=mock_client)
 
-    config = {"configurable": {"thread_id": "thread-1"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "thread-1"}}
     checkpoint: Checkpoint = {
         "v": 1,
         "ts": "2026-08-22T00:00:00Z",
@@ -101,7 +103,6 @@ def test_put_and_get_tuple_basic() -> None:
     metadata: CheckpointMetadata = {
         "source": "input",
         "step": 1,
-        "writes": {},
         "parents": {},
     }
 
@@ -120,10 +121,10 @@ def test_put_and_get_tuple_basic() -> None:
 
 
 def test_put_multiple_and_recovery() -> None:
-    mock_client = MockCellaflowClient()
+    mock_client = cast(CellaflowClient, MockCellaflowClient())
     saver = CellaflowSaver(client=mock_client)
 
-    config = {"configurable": {"thread_id": "thread-2"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "thread-2"}}
     cp1: Checkpoint = {
         "v": 1,
         "ts": "2026-08-22T00:00:01Z",
@@ -133,9 +134,9 @@ def test_put_multiple_and_recovery() -> None:
         "versions_seen": {},
         "updated_channels": None,
     }
-    saver.put(config, cp1, {"step": 1}, {"val": "1"})
+    saver.put(config, cp1, {"step": 1, "source": "input"}, {"val": "1"})
 
-    config_with_parent = {
+    config_with_parent: RunnableConfig = {
         "configurable": {
             "thread_id": "thread-2",
             "checkpoint_id": "cp-1",
@@ -150,10 +151,16 @@ def test_put_multiple_and_recovery() -> None:
         "versions_seen": {},
         "updated_channels": None,
     }
-    saver.put(config_with_parent, cp2, {"step": 2}, {"val": "2", "extra": "1"})
+    saver.put(
+        config_with_parent,
+        cp2,
+        {"step": 2, "source": "loop"},
+        {"val": "2", "extra": "1"},
+    )
 
     # Fetch latest without checkpoint_id
-    latest = saver.get_tuple({"configurable": {"thread_id": "thread-2"}})
+    latest_config: RunnableConfig = {"configurable": {"thread_id": "thread-2"}}
+    latest = saver.get_tuple(latest_config)
     assert latest is not None
     assert latest.checkpoint["id"] == "cp-2"
     assert latest.checkpoint["channel_values"]["val"] == 20
@@ -162,9 +169,10 @@ def test_put_multiple_and_recovery() -> None:
     assert latest.parent_config["configurable"]["checkpoint_id"] == "cp-1"
 
     # Fetch historical cp-1 specifically
-    hist = saver.get_tuple(
-        {"configurable": {"thread_id": "thread-2", "checkpoint_id": "cp-1"}}
-    )
+    hist_config: RunnableConfig = {
+        "configurable": {"thread_id": "thread-2", "checkpoint_id": "cp-1"}
+    }
+    hist = saver.get_tuple(hist_config)
     assert hist is not None
     assert hist.checkpoint["id"] == "cp-1"
     assert hist.checkpoint["channel_values"]["val"] == 10
@@ -172,10 +180,10 @@ def test_put_multiple_and_recovery() -> None:
 
 
 def test_put_writes_and_retrieval() -> None:
-    mock_client = MockCellaflowClient()
+    mock_client = cast(CellaflowClient, MockCellaflowClient())
     saver = CellaflowSaver(client=mock_client)
 
-    config = {"configurable": {"thread_id": "thread-3"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "thread-3"}}
     cp1: Checkpoint = {
         "v": 1,
         "ts": "2026-08-22T00:00:00Z",
@@ -185,10 +193,12 @@ def test_put_writes_and_retrieval() -> None:
         "versions_seen": {},
         "updated_channels": None,
     }
-    saver.put(config, cp1, {"step": 1}, {"items": "1"})
+    saver.put(config, cp1, {"step": 1, "source": "input"}, {"items": "1"})
 
     # Put pending writes on cp-1
-    write_config = {"configurable": {"thread_id": "thread-3", "checkpoint_id": "cp-1"}}
+    write_config: RunnableConfig = {
+        "configurable": {"thread_id": "thread-3", "checkpoint_id": "cp-1"}
+    }
     saver.put_writes(
         write_config,
         [("items", "b"), ("items", "c")],
@@ -198,16 +208,17 @@ def test_put_writes_and_retrieval() -> None:
 
     tup = saver.get_tuple(write_config)
     assert tup is not None
+    assert tup.pending_writes is not None
     assert len(tup.pending_writes) == 2
     assert tup.pending_writes[0] == ("task-100", "items", "b")
     assert tup.pending_writes[1] == ("task-100", "items", "c")
 
 
 def test_list_filters_and_pagination() -> None:
-    mock_client = MockCellaflowClient()
+    mock_client = cast(CellaflowClient, MockCellaflowClient())
     saver = CellaflowSaver(client=mock_client)
 
-    config = {"configurable": {"thread_id": "thread-list"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "thread-list"}}
     for i in range(1, 5):
         cp: Checkpoint = {
             "v": 1,
@@ -218,15 +229,16 @@ def test_list_filters_and_pagination() -> None:
             "versions_seen": {},
             "updated_channels": None,
         }
+        step_config: RunnableConfig = {
+            "configurable": {
+                "thread_id": "thread-list",
+                "checkpoint_id": f"cp-{i-1:02d}" if i > 1 else None,
+            }
+        }
         saver.put(
-            {
-                "configurable": {
-                    "thread_id": "thread-list",
-                    "checkpoint_id": f"cp-{i-1:02d}" if i > 1 else None,
-                }
-            },
+            step_config,
             cp,
-            {"step": i, "tag": "even" if i % 2 == 0 else "odd"},
+            {"step": i, "source": "loop" if i % 2 == 0 else "input"},
             {"num": str(i)},
         )
 
@@ -246,49 +258,39 @@ def test_list_filters_and_pagination() -> None:
     assert [item.checkpoint["id"] for item in limited] == ["cp-04", "cp-03"]
 
     # Filter by metadata
-    evens = list(saver.list(config, filter={"tag": "even"}))
-    assert len(evens) == 2
-    assert [item.checkpoint["id"] for item in evens] == ["cp-04", "cp-02"]
+    inputs = list(saver.list(config, filter={"source": "input"}))
+    assert len(inputs) == 2
+    assert [item.checkpoint["id"] for item in inputs] == ["cp-03", "cp-01"]
 
     # Filter before
-    before_cp3 = list(
-        saver.list(
-            config,
-            before={
-                "configurable": {
-                    "thread_id": "thread-list",
-                    "checkpoint_id": "cp-03",
-                }
-            },
-        )
-    )
+    before_config: RunnableConfig = {
+        "configurable": {
+            "thread_id": "thread-list",
+            "checkpoint_id": "cp-03",
+        }
+    }
+    before_cp3 = list(saver.list(config, before=before_config))
     assert [item.checkpoint["id"] for item in before_cp3] == ["cp-02", "cp-01"]
 
     # Specific checkpoint_id in config
-    single = list(
-        saver.list(
-            {
-                "configurable": {
-                    "thread_id": "thread-list",
-                    "checkpoint_id": "cp-02",
-                }
-            }
-        )
-    )
+    single_config: RunnableConfig = {
+        "configurable": {
+            "thread_id": "thread-list",
+            "checkpoint_id": "cp-02",
+        }
+    }
+    single = list(saver.list(single_config))
     assert len(single) == 1
     assert single[0].checkpoint["id"] == "cp-02"
 
     # Filter with different checkpoint_ns
-    diff_ns = list(
-        saver.list(
-            {
-                "configurable": {
-                    "thread_id": "thread-list",
-                    "checkpoint_ns": "other-ns",
-                }
-            }
-        )
-    )
+    diff_ns_config: RunnableConfig = {
+        "configurable": {
+            "thread_id": "thread-list",
+            "checkpoint_ns": "other-ns",
+        }
+    }
+    diff_ns = list(saver.list(diff_ns_config))
     assert diff_ns == []
 
     # None config yields empty
@@ -296,7 +298,7 @@ def test_list_filters_and_pagination() -> None:
 
 
 def test_delete_thread() -> None:
-    mock_client = MockCellaflowClient()
+    mock_client = cast(CellaflowClient, MockCellaflowClient())
     saver = CellaflowSaver(client=mock_client)
 
     saver._next_sequence["thread-del"] = 5
@@ -308,7 +310,8 @@ def test_delete_thread() -> None:
 
 
 def test_get_next_version() -> None:
-    saver = CellaflowSaver(client=MockCellaflowClient())
+    mock_client = cast(CellaflowClient, MockCellaflowClient())
+    saver = CellaflowSaver(client=mock_client)
     v1 = saver.get_next_version(None)
     assert v1.startswith("00000000000000000000000000000001.")
 
@@ -321,10 +324,10 @@ def test_get_next_version() -> None:
 
 @pytest.mark.asyncio
 async def test_async_methods() -> None:
-    mock_client = MockCellaflowClient()
+    mock_client = cast(CellaflowClient, MockCellaflowClient())
     saver = CellaflowSaver(client=mock_client)
 
-    config = {"configurable": {"thread_id": "thread-async"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "thread-async"}}
     cp: Checkpoint = {
         "v": 1,
         "ts": "2026-08-22T00:00:00Z",
@@ -334,7 +337,7 @@ async def test_async_methods() -> None:
         "versions_seen": {},
         "updated_channels": None,
     }
-    metadata: CheckpointMetadata = {"step": 1}
+    metadata: CheckpointMetadata = {"step": 1, "source": "input"}
 
     # aput
     res_config = await saver.aput(config, cp, metadata, {"msg": "1"})
@@ -347,6 +350,7 @@ async def test_async_methods() -> None:
     tup = await saver.aget_tuple(res_config)
     assert tup is not None
     assert tup.checkpoint["channel_values"]["msg"] == "async_hello"
+    assert tup.pending_writes is not None
     assert len(tup.pending_writes) == 1
     assert tup.pending_writes[0] == ("task-async", "msg", "async_write")
 
@@ -360,16 +364,18 @@ async def test_async_methods() -> None:
 
 
 def test_get_tuple_empty_or_error() -> None:
-    mock_client = MockCellaflowClient()
+    mock_client = cast(CellaflowClient, MockCellaflowClient())
     saver = CellaflowSaver(client=mock_client)
 
     # Empty thread
-    res = saver.get_tuple({"configurable": {"thread_id": "empty-thread"}})
+    empty_config: RunnableConfig = {"configurable": {"thread_id": "empty-thread"}}
+    res = saver.get_tuple(empty_config)
     assert res is None
 
     # Unknown checkpoint_id requested
+    valid_config: RunnableConfig = {"configurable": {"thread_id": "valid-thread"}}
     saver.put(
-        {"configurable": {"thread_id": "valid-thread"}},
+        valid_config,
         {
             "v": 1,
             "ts": "2026-08-22T00:00:00Z",
@@ -382,23 +388,25 @@ def test_get_tuple_empty_or_error() -> None:
         {},
         {},
     )
-    res_missing = saver.get_tuple(
-        {"configurable": {"thread_id": "valid-thread", "checkpoint_id": "non-existent"}}
-    )
+    non_existent_config: RunnableConfig = {
+        "configurable": {"thread_id": "valid-thread", "checkpoint_id": "non-existent"}
+    }
+    res_missing = saver.get_tuple(non_existent_config)
     assert res_missing is None
 
     # Error during get_graph
     mock_failing_client = MagicMock()
     mock_failing_client.get_graph.side_effect = RuntimeError("gRPC connection error")
-    failing_saver = CellaflowSaver(client=mock_failing_client)
-    res2 = failing_saver.get_tuple({"configurable": {"thread_id": "failing-thread"}})
+    failing_saver = CellaflowSaver(client=cast(CellaflowClient, mock_failing_client))
+    failing_config: RunnableConfig = {"configurable": {"thread_id": "failing-thread"}}
+    res2 = failing_saver.get_tuple(failing_config)
     assert res2 is None
 
 
 def test_recovery_from_existing_graph_and_exception_handling() -> None:
-    mock_client = MockCellaflowClient()
+    raw_mock_client = MockCellaflowClient()
     # Pre-populate graph in engine
-    mock_client.graphs["pre-existing-thread"] = [
+    raw_mock_client.graphs["pre-existing-thread"] = [
         {
             "sequence": 1,
             "name": "step-1",
@@ -427,10 +435,13 @@ def test_recovery_from_existing_graph_and_exception_handling() -> None:
     ]
 
     # Initialize a new saver instance connecting to existing session
-    new_saver = CellaflowSaver(client=mock_client)
+    new_saver = CellaflowSaver(client=cast(CellaflowClient, raw_mock_client))
     # put should determine seq = 6
+    pre_existing_config: RunnableConfig = {
+        "configurable": {"thread_id": "pre-existing-thread"}
+    }
     res = new_saver.put(
-        {"configurable": {"thread_id": "pre-existing-thread"}},
+        pre_existing_config,
         {
             "v": 1,
             "ts": "2026-08-22T00:00:06Z",
@@ -450,7 +461,7 @@ def test_recovery_from_existing_graph_and_exception_handling() -> None:
     err_client = MagicMock()
     err_client.get_graph.side_effect = RuntimeError("network down")
     err_client.start_session.side_effect = RuntimeError("session start failed")
-    err_saver = CellaflowSaver(client=err_client)
+    err_saver = CellaflowSaver(client=cast(CellaflowClient, err_client))
     seq = err_saver._ensure_session_and_sequence("err-thread")
     assert seq == 1
 
@@ -460,8 +471,8 @@ def test_stategraph_integration_and_resume() -> None:
     End-to-end test with real LangGraph StateGraph, compiling with CellaflowSaver
     and executing multi-node branch cycles and session resumption.
     """
-    mock_client = MockCellaflowClient()
-    saver = CellaflowSaver(client=mock_client)
+    raw_mock_client = MockCellaflowClient()
+    saver = CellaflowSaver(client=cast(CellaflowClient, raw_mock_client))
 
     class State(TypedDict):
         count: int
@@ -482,22 +493,24 @@ def test_stategraph_integration_and_resume() -> None:
 
     app = builder.compile(checkpointer=saver)
 
-    config = {"configurable": {"thread_id": "integration-session-1"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "integration-session-1"}}
 
     # Initial invocation
-    out1 = app.invoke({"count": 5, "path": ["start"]}, config)
+    input_1: State = {"count": 5, "path": ["start"]}
+    out1 = cast(State, app.invoke(input_1, config))
     assert out1["count"] == 12  # (5 + 1) * 2
     assert out1["path"] == ["start", "A", "B"]
 
     # Verify commits were made to the mock engine
-    steps = mock_client.graphs["integration-session-1"]
+    steps = raw_mock_client.graphs["integration-session-1"]
     assert len(steps) > 0
     # Sequences should be strictly consecutive 1, 2, 3...
     sequences = [s["sequence"] for s in steps]
     assert sequences == list(range(1, len(steps) + 1))
 
     # Second invocation on the same thread (resume)
-    out2 = app.invoke({"count": 20, "path": ["resumed"]}, config)
+    input_2: State = {"count": 20, "path": ["resumed"]}
+    out2 = cast(State, app.invoke(input_2, config))
     assert out2["count"] == 42  # (20 + 1) * 2
     assert out2["path"] == ["resumed", "A", "B"]
 
