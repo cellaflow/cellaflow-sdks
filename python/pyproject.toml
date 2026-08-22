@@ -30,6 +30,10 @@ Documentation = "https://www.cellaflow.com"
 Repository = "https://github.com/cellaflow/cellaflow-sdks"
 
 [project.optional-dependencies]
+langgraph = [
+    "langgraph-checkpoint>=2.0.0",
+    "langgraph>=0.2.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
@@ -39,6 +43,8 @@ dev = [
     "mypy>=1.8.0",
     "grpcio-tools>=1.60.0",
     "mypy-protobuf>=3.5.0",
+    "langgraph-checkpoint>=2.0.0",
+    "langgraph>=0.2.0",
 ]
 
 [tool.setuptools.packages.find]
