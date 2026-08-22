@@ -500,7 +500,10 @@ def test_stategraph_integration_and_resume() -> None:
     config: RunnableConfig = {"configurable": {"thread_id": "integration-session-1"}}
 
     # Initial invocation
-    out1 = app.invoke({"count": 5, "path": ["start"]}, config)
+    out1 = cast(
+        Dict[str, Any],
+        app.invoke(WorkflowState(count=5, path=["start"]), config),
+    )
     assert out1["count"] == 12  # (5 + 1) * 2
     assert out1["path"] == ["start", "A", "B"]
 
@@ -512,7 +515,10 @@ def test_stategraph_integration_and_resume() -> None:
     assert sequences == list(range(1, len(steps) + 1))
 
     # Second invocation on the same thread (resume)
-    out2 = app.invoke({"count": 20, "path": ["resumed"]}, config)
+    out2 = cast(
+        Dict[str, Any],
+        app.invoke(WorkflowState(count=20, path=["resumed"]), config),
+    )
     assert out2["count"] == 42  # (20 + 1) * 2
     assert out2["path"] == ["resumed", "A", "B"]
 
