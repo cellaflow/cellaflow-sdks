@@ -25,4 +25,23 @@ message LeaseRecord {
 message CompletedRecord {
   cellaflow.v1.StepResult result = 1;
   uint64 completed_at_ms = 2; // When the result was committed (epoch ms)
+
+  // CEL-73: the fencing token held by the worker that committed this result.
+  //
+  // Without it, once a key transitions to Completed the token that completed it
+  // was discarded, so a later caller's token had nothing to be validated against
+  // and a superseded worker received a success response. Records written before
+  // this field existed decode as 0, which is treated as "unknown, skip
+  // validation" — tokens are monotonic epoch-microsecond values and are never
+  // legitimately 0.
+  uint64 fencing_token = 3;
+
+  // CEL-73: the graph sequence this result was journaled at.
+  //
+  // An AlreadyCommitted outcome only implies a durable event exists at *that*
+  // sequence. A caller committing the same key at a different position has no
+  // event backing it, so letting the actor advance its sequence would leave
+  // in-memory state ahead of the durable log. Same reasoning as the field above:
+  // 0 means a legacy record with no recorded sequence.
+  uint64 committed_sequence = 4;
 }
