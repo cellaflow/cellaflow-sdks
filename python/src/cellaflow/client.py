@@ -101,6 +101,34 @@ class CellaflowClient:
         next_cursor = resp.next_cursor if resp.next_cursor else None
         return results, next_cursor
 
+    def get_latest_sequence(self, session_id: str) -> int:
+        """Returns the highest committed sequence for a session, or 0 if none.
+
+        Deliberately separate from `get_graph`, which deserializes every step's
+        `output_payload` — up to 4 MiB each. Callers that only need the position
+        should not pay to decode the entire history to read one integer.
+        """
+        latest = 0
+        cursor: Optional[str] = None
+
+        while True:
+            req = service_pb2.GetGraphRequest(session_id=session_id)
+            # The engine caps a page at 1000; ask for the maximum so the common
+            # case is a single round trip.
+            req.limit = 1000
+            if cursor is not None:
+                req.cursor = cursor
+
+            resp: service_pb2.GetGraphResponse = self.stub.GetGraph(req)
+
+            for step in resp.steps:
+                if step.sequence > latest:
+                    latest = step.sequence
+
+            if not resp.next_cursor:
+                return latest
+            cursor = resp.next_cursor
+
     def check_idempotency_cache(
         self,
         agent_id: str,

@@ -529,3 +529,195 @@ def test_tool_decorator_direct(mock_stub: MagicMock, mock_client: None) -> None:
     res = workflow_run("test")
     assert res == "result for test"
     mock_stub.CommitStep.assert_called_once()
+
+
+def test_sequence_reconciled_after_cross_session_cache_hit(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """CEL-98: a hit satisfied from another session must not desync the counter.
+
+    The hit returns without committing, so this session's engine-side sequence
+    is still 0. Without reconciliation the next step would ask for 2 and the
+    engine would reject it, one step after the real cause.
+    """
+    from cellaflow.v1 import idempotency_pb2, common_pb2
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-b", version="1.0.0", is_recovered=False
+    )
+
+    cached_step = common_pb2.StepResult(
+        sequence=1,
+        name="shared",
+        status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+        output_payload=serialize({"result": "from-another-session"}),
+    )
+    mock_stub.CheckIdempotencyCache.side_effect = [
+        idempotency_pb2.CheckCacheResponse(
+            status=idempotency_pb2.CACHE_STATUS_HIT, cached_result=cached_step
+        ),
+        idempotency_pb2.CheckCacheResponse(
+            status=idempotency_pb2.CACHE_STATUS_ACQUIRED,
+            fencing_token=456,
+            heartbeat_interval_ms=10000,
+        ),
+    ]
+
+    # This session has committed nothing of its own.
+    mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(
+        steps=[], next_cursor=""
+    )
+    mock_stub.CommitStep.return_value = service_pb2.CommitStepResponse(
+        session_id="sess-b", next_sequence=2
+    )
+
+    @step
+    def shared() -> str:
+        return "executed-locally"
+
+    @step
+    def local_followup() -> str:
+        return "mine"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        shared()
+        return local_followup()  # type: ignore[no-any-return]
+
+    assert wf() == "mine"
+
+    mock_stub.CommitStep.assert_called_once()
+    committed = mock_stub.CommitStep.call_args[0][0]
+    assert committed.step_result.sequence == 1, (
+        "after a cross-session hit the next commit must target sequence 1, "
+        f"got {committed.step_result.sequence}"
+    )
+
+
+def test_sequence_preserved_after_same_session_cache_hit(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """CEL-98 must not break the case that already worked.
+
+    Here a peer in the *same* session committed at sequence 1, so the engine did
+    advance and the next step legitimately targets 2.
+    """
+    from cellaflow.v1 import idempotency_pb2, common_pb2
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-a", version="1.0.0", is_recovered=False
+    )
+
+    peer_step = common_pb2.StepResult(
+        sequence=1,
+        name="shared",
+        status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+        output_payload=serialize({"result": "from-a-peer"}),
+    )
+    mock_stub.CheckIdempotencyCache.side_effect = [
+        idempotency_pb2.CheckCacheResponse(
+            status=idempotency_pb2.CACHE_STATUS_HIT, cached_result=peer_step
+        ),
+        idempotency_pb2.CheckCacheResponse(
+            status=idempotency_pb2.CACHE_STATUS_ACQUIRED,
+            fencing_token=456,
+            heartbeat_interval_ms=10000,
+        ),
+    ]
+
+    # The peer's commit is visible in this session's graph.
+    mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(
+        steps=[peer_step], next_cursor=""
+    )
+    mock_stub.CommitStep.return_value = service_pb2.CommitStepResponse(
+        session_id="sess-a", next_sequence=3
+    )
+
+    @step
+    def shared() -> str:
+        return "executed-locally"
+
+    @step
+    def local_followup() -> str:
+        return "mine"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        shared()
+        return local_followup()  # type: ignore[no-any-return]
+
+    assert wf() == "mine"
+
+    committed = mock_stub.CommitStep.call_args[0][0]
+    assert committed.step_result.sequence == 2, (
+        "a same-session hit means the engine already advanced; the next commit "
+        f"must target sequence 2, got {committed.step_result.sequence}"
+    )
+
+
+def test_reconciliation_does_not_decode_payloads(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """CEL-98: reconciliation reads sequences, never payloads.
+
+    `get_graph` MessagePack-decodes every `output_payload` — up to 4 MiB each —
+    so using it to learn one integer would decode the whole history to throw it
+    away. The guard is that these payloads are not valid MessagePack: if the
+    reconciliation path touched them it would raise.
+    """
+    from cellaflow.v1 import idempotency_pb2, common_pb2
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-x", version="1.0.0", is_recovered=False
+    )
+
+    cached_step = common_pb2.StepResult(
+        sequence=1,
+        name="shared",
+        status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+        output_payload=serialize({"result": "cached"}),
+    )
+    mock_stub.CheckIdempotencyCache.side_effect = [
+        idempotency_pb2.CheckCacheResponse(
+            status=idempotency_pb2.CACHE_STATUS_HIT, cached_result=cached_step
+        ),
+        idempotency_pb2.CheckCacheResponse(
+            status=idempotency_pb2.CACHE_STATUS_ACQUIRED,
+            fencing_token=456,
+            heartbeat_interval_ms=10000,
+        ),
+    ]
+
+    undecodable = common_pb2.StepResult(
+        sequence=4,
+        name="big",
+        status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+        output_payload=b"\xc1\xc1\xc1 not valid messagepack \xc1",
+    )
+    mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(
+        steps=[undecodable], next_cursor=""
+    )
+    mock_stub.CommitStep.return_value = service_pb2.CommitStepResponse(
+        session_id="sess-x", next_sequence=6
+    )
+
+    @step
+    def shared() -> str:
+        return "local"
+
+    @step
+    def local_followup() -> str:
+        return "mine"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        shared()
+        return local_followup()  # type: ignore[no-any-return]
+
+    assert wf() == "mine"
+
+    committed = mock_stub.CommitStep.call_args[0][0]
+    assert committed.step_result.sequence == 5, (
+        "should resume from the highest committed sequence (4) + 1, "
+        f"got {committed.step_result.sequence}"
+    )

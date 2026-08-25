@@ -113,6 +113,12 @@ def step(
     @functools.wraps(func)
     async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
         ctx = get_context()
+        # CEL-98: a previous cache hit may have left this counter ahead of the
+        # engine's. Re-align before claiming the next sequence, or this commit
+        # fails with `Sequence mismatch` pointing at the wrong step.
+        if ctx.pending_reconcile:
+            ctx.reconcile_sequence()
+            ctx.pending_reconcile = False
         ctx.sequence += 1
         seq = ctx.sequence
 
@@ -142,6 +148,11 @@ def step(
                 idempotency_key=ikey,
             )
             if resp.status == CACHE_STATUS_HIT:
+                # CEL-98: this path returns without committing, so the local
+                # counter may now be ahead of the engine's. Flag it rather than
+                # reconciling here — the next step resolves it, and a workflow
+                # that ends on a hit never pays for a round trip it does not need.
+                ctx.pending_reconcile = True
                 if resp.cached_result and resp.cached_result.output_payload:
                     deserialized = deserialize(resp.cached_result.output_payload)
                     return deserialized.get("result")
@@ -197,6 +208,12 @@ def step(
     @functools.wraps(func)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
         ctx = get_context()
+        # CEL-98: a previous cache hit may have left this counter ahead of the
+        # engine's. Re-align before claiming the next sequence, or this commit
+        # fails with `Sequence mismatch` pointing at the wrong step.
+        if ctx.pending_reconcile:
+            ctx.reconcile_sequence()
+            ctx.pending_reconcile = False
         ctx.sequence += 1
         seq = ctx.sequence
 
@@ -226,6 +243,11 @@ def step(
                 idempotency_key=ikey,
             )
             if resp.status == CACHE_STATUS_HIT:
+                # CEL-98: this path returns without committing, so the local
+                # counter may now be ahead of the engine's. Flag it rather than
+                # reconciling here — the next step resolves it, and a workflow
+                # that ends on a hit never pays for a round trip it does not need.
+                ctx.pending_reconcile = True
                 if resp.cached_result and resp.cached_result.output_payload:
                     deserialized = deserialize(resp.cached_result.output_payload)
                     return deserialized.get("result")
