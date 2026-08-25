@@ -113,6 +113,12 @@ def step(
     @functools.wraps(func)
     async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
         ctx = get_context()
+        # CEL-98: a previous cache hit may have left this counter ahead of the
+        # engine's. Adopt the position it reported before claiming the next
+        # sequence, or this commit fails the ordering check and names the wrong
+        # step. Deferred to here rather than done on the hit itself so a workflow
+        # that ends on a hit does no extra work.
+        ctx.reconcile_sequence()
         ctx.sequence += 1
         seq = ctx.sequence
 
@@ -140,8 +146,13 @@ def step(
             resp = ctx.client.check_idempotency_cache(
                 agent_id=agent_id,
                 idempotency_key=ikey,
+                session_id=ctx.session_id,
             )
             if resp.status == CACHE_STATUS_HIT:
+                # CEL-98: this path returns without committing, so record where
+                # the engine says the session sits. The next step adopts it.
+                if resp.HasField("current_sequence"):
+                    ctx.record_engine_sequence(resp.current_sequence)
                 if resp.cached_result and resp.cached_result.output_payload:
                     deserialized = deserialize(resp.cached_result.output_payload)
                     return deserialized.get("result")
@@ -197,6 +208,12 @@ def step(
     @functools.wraps(func)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
         ctx = get_context()
+        # CEL-98: a previous cache hit may have left this counter ahead of the
+        # engine's. Adopt the position it reported before claiming the next
+        # sequence, or this commit fails the ordering check and names the wrong
+        # step. Deferred to here rather than done on the hit itself so a workflow
+        # that ends on a hit does no extra work.
+        ctx.reconcile_sequence()
         ctx.sequence += 1
         seq = ctx.sequence
 
@@ -224,8 +241,13 @@ def step(
             resp = ctx.client.check_idempotency_cache(
                 agent_id=agent_id,
                 idempotency_key=ikey,
+                session_id=ctx.session_id,
             )
             if resp.status == CACHE_STATUS_HIT:
+                # CEL-98: this path returns without committing, so record where
+                # the engine says the session sits. The next step adopts it.
+                if resp.HasField("current_sequence"):
+                    ctx.record_engine_sequence(resp.current_sequence)
                 if resp.cached_result and resp.cached_result.output_payload:
                     deserialized = deserialize(resp.cached_result.output_payload)
                     return deserialized.get("result")

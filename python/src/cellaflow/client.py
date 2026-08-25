@@ -107,7 +107,15 @@ class CellaflowClient:
         idempotency_key: str,
         wait_timeout_ms: Optional[int] = None,
         lease_ttl_ms: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> idempotency_pb2.CheckCacheResponse:
+        """Arbitrates the lease for `idempotency_key`.
+
+        Supplying `session_id` also asks the engine for that session's committed
+        position, returned as `current_sequence` on every status. The idempotency
+        key is opaque to the engine, so the session cannot be inferred from it —
+        without this the engine has nothing to answer from. See CEL-98.
+        """
         req = idempotency_pb2.CheckCacheRequest(
             agent_id=agent_id,
             idempotency_key=idempotency_key,
@@ -116,6 +124,8 @@ class CellaflowClient:
             req.wait_timeout_ms = wait_timeout_ms
         if lease_ttl_ms is not None:
             req.lease_ttl_ms = lease_ttl_ms
+        if session_id is not None:
+            req.session_id = session_id
 
         return cast(
             idempotency_pb2.CheckCacheResponse,
