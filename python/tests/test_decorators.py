@@ -1,10 +1,11 @@
 import pytest
 from unittest.mock import MagicMock
-from typing import Any
+from typing import Any, List, Optional
 
 from cellaflow.decorators import workflow, step
 from cellaflow.v1 import service_pb2
 from cellaflow.serialization import serialize
+from cellaflow.v1 import idempotency_pb2
 
 
 @pytest.fixture(autouse=True)
@@ -529,3 +530,303 @@ def test_tool_decorator_direct(mock_stub: MagicMock, mock_client: None) -> None:
     res = workflow_run("test")
     assert res == "result for test"
     mock_stub.CommitStep.assert_called_once()
+
+
+def _hit_then_acquire(
+    reported_sequence: Optional[int],
+) -> List["idempotency_pb2.CheckCacheResponse"]:
+    """A cache HIT carrying `reported_sequence`, then an ACQUIRED for the next step."""
+    from cellaflow.v1 import common_pb2
+
+    cached = common_pb2.StepResult(
+        sequence=1,
+        name="shared",
+        status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+        output_payload=serialize({"result": "from-elsewhere"}),
+    )
+    hit = idempotency_pb2.CheckCacheResponse(
+        status=idempotency_pb2.CACHE_STATUS_HIT, cached_result=cached
+    )
+    if reported_sequence is not None:
+        hit.current_sequence = reported_sequence
+
+    return [
+        hit,
+        idempotency_pb2.CheckCacheResponse(
+            status=idempotency_pb2.CACHE_STATUS_ACQUIRED,
+            fencing_token=456,
+            heartbeat_interval_ms=10000,
+        ),
+    ]
+
+
+def _two_step_workflow() -> Any:
+    @step
+    def shared() -> str:
+        return "executed-locally"
+
+    @step
+    def local_followup() -> str:
+        return "mine"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        shared()
+        return local_followup()  # type: ignore[no-any-return]
+
+    return wf
+
+
+def test_adopts_engine_sequence_after_cross_session_hit(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """CEL-98: a hit satisfied from another session must not desync the counter.
+
+    The hit returns without committing, so this session's engine-side sequence is
+    still 0. Without adopting the reported position the next step would ask for 2
+    and be rejected — one step after the real cause.
+    """
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-b", version="1.0.0", is_recovered=False
+    )
+    mock_stub.CheckIdempotencyCache.side_effect = _hit_then_acquire(0)
+    mock_stub.CommitStep.return_value = service_pb2.CommitStepResponse(
+        session_id="sess-b", next_sequence=2
+    )
+
+    assert _two_step_workflow()() == "mine"
+
+    committed = mock_stub.CommitStep.call_args[0][0]
+    assert committed.step_result.sequence == 1, (
+        "after a cross-session hit the next commit must target sequence 1, "
+        f"got {committed.step_result.sequence}"
+    )
+    # And the engine must have been told which session was asking.
+    assert (
+        mock_stub.CheckIdempotencyCache.call_args_list[0][0][0].session_id == "sess-b"
+    )
+
+
+def test_preserves_sequence_after_same_session_hit(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """CEL-98 must not break the case that already worked.
+
+    A peer in the *same* session committed at 1, so the engine did advance and
+    the next step legitimately targets 2.
+    """
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-a", version="1.0.0", is_recovered=False
+    )
+    mock_stub.CheckIdempotencyCache.side_effect = _hit_then_acquire(1)
+    mock_stub.CommitStep.return_value = service_pb2.CommitStepResponse(
+        session_id="sess-a", next_sequence=3
+    )
+
+    assert _two_step_workflow()() == "mine"
+
+    committed = mock_stub.CommitStep.call_args[0][0]
+    assert committed.step_result.sequence == 2, (
+        "a same-session hit means the engine already advanced; the next commit "
+        f"must target sequence 2, got {committed.step_result.sequence}"
+    )
+
+
+def test_tolerates_engine_without_current_sequence(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """An engine predating the field must not break the client.
+
+    Behaviour degrades to the original defect — the next commit is off by one —
+    rather than to a crash or a wrong sequence.
+    """
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-old", version="1.0.0", is_recovered=False
+    )
+    mock_stub.CheckIdempotencyCache.side_effect = _hit_then_acquire(None)
+    mock_stub.CommitStep.return_value = service_pb2.CommitStepResponse(
+        session_id="sess-old", next_sequence=3
+    )
+
+    assert _two_step_workflow()() == "mine"
+
+    committed = mock_stub.CommitStep.call_args[0][0]
+    assert committed.step_result.sequence == 2, (
+        "with no reported position the client keeps its own count — the old "
+        f"behaviour, not a new failure; got {committed.step_result.sequence}"
+    )
+
+
+def test_no_reconciliation_when_workflow_ends_on_a_hit(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The hit itself must not fetch anything; only a following step consumes it.
+
+    A workflow whose last act is a shared tool is the common shape, and it should
+    cost nothing extra.
+    """
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-end", version="1.0.0", is_recovered=False
+    )
+    mock_stub.CheckIdempotencyCache.side_effect = _hit_then_acquire(7)
+
+    @step
+    def shared() -> str:
+        return "executed-locally"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        return shared()  # type: ignore[no-any-return]
+
+    assert wf() == "from-elsewhere"
+
+    mock_stub.GetGraph.assert_not_called()
+    mock_stub.CommitStep.assert_not_called()
+
+
+def test_consecutive_cache_hits_reconcile_correctly(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """CEL-98 acceptance criterion: correct when several hits occur in a row.
+
+    Each hit re-reports the same position because the engine has not advanced,
+    so the counter must not creep forward once per hit.
+    """
+    from cellaflow.v1 import idempotency_pb2, common_pb2
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-multi", version="1.0.0", is_recovered=False
+    )
+
+    def hit(payload: str) -> "idempotency_pb2.CheckCacheResponse":
+        r = idempotency_pb2.CheckCacheResponse(
+            status=idempotency_pb2.CACHE_STATUS_HIT,
+            cached_result=common_pb2.StepResult(
+                sequence=1,
+                name="shared",
+                status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+                output_payload=serialize({"result": payload}),
+            ),
+        )
+        # The engine is stuck at 0 throughout: nothing this session did committed.
+        r.current_sequence = 0
+        return r
+
+    mock_stub.CheckIdempotencyCache.side_effect = [
+        hit("one"),
+        hit("two"),
+        hit("three"),
+        idempotency_pb2.CheckCacheResponse(
+            status=idempotency_pb2.CACHE_STATUS_ACQUIRED,
+            fencing_token=456,
+            heartbeat_interval_ms=10000,
+        ),
+    ]
+    mock_stub.CommitStep.return_value = service_pb2.CommitStepResponse(
+        session_id="sess-multi", next_sequence=2
+    )
+
+    @step
+    def a() -> str:
+        return "x"
+
+    @step
+    def b() -> str:
+        return "x"
+
+    @step
+    def c() -> str:
+        return "x"
+
+    @step
+    def mine() -> str:
+        return "mine"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        a()
+        b()
+        c()
+        return mine()  # type: ignore[no-any-return]
+
+    assert wf() == "mine"
+
+    committed = mock_stub.CommitStep.call_args[0][0]
+    assert committed.step_result.sequence == 1, (
+        "three consecutive hits must not advance the counter three times — the "
+        f"first real commit still belongs at sequence 1, got "
+        f"{committed.step_result.sequence}"
+    )
+
+
+def test_reconciliation_does_not_disturb_replayed_steps(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """Reconciling must not rewind into already-replayed history.
+
+    The reported position is always *this* session's own, so it can never be
+    lower than what has been replayed from it. Pinned because the two mechanisms
+    both move `ctx.sequence` and the interaction is not obvious.
+    """
+    from cellaflow.v1 import idempotency_pb2, common_pb2
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-replay", version="1.0.0", is_recovered=True
+    )
+    replayed = common_pb2.StepResult(
+        sequence=1,
+        name="already_done",
+        status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+        output_payload=serialize({"result": "replayed"}),
+    )
+    mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(
+        steps=[replayed], next_cursor=""
+    )
+
+    hit = idempotency_pb2.CheckCacheResponse(
+        status=idempotency_pb2.CACHE_STATUS_HIT,
+        cached_result=common_pb2.StepResult(
+            sequence=1,
+            name="shared",
+            status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+            output_payload=serialize({"result": "cached"}),
+        ),
+    )
+    hit.current_sequence = 1  # this session committed step 1 itself
+    mock_stub.CheckIdempotencyCache.side_effect = [
+        hit,
+        idempotency_pb2.CheckCacheResponse(
+            status=idempotency_pb2.CACHE_STATUS_ACQUIRED,
+            fencing_token=456,
+            heartbeat_interval_ms=10000,
+        ),
+    ]
+    mock_stub.CommitStep.return_value = service_pb2.CommitStepResponse(
+        session_id="sess-replay", next_sequence=3
+    )
+
+    @step
+    def already_done() -> str:
+        raise AssertionError("a replayed step must not execute")
+
+    @step
+    def shared() -> str:
+        raise AssertionError("a cache hit must not execute")
+
+    @step
+    def mine() -> str:
+        return "mine"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        already_done()
+        shared()
+        return mine()  # type: ignore[no-any-return]
+
+    assert wf() == "mine"
+
+    committed = mock_stub.CommitStep.call_args[0][0]
+    assert committed.step_result.sequence == 2, (
+        "reconciling to the session's own position must not rewind into replayed "
+        f"history; expected the next commit at 2, got {committed.step_result.sequence}"
+    )

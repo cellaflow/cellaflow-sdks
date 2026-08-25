@@ -49,6 +49,17 @@ message CheckCacheRequest {
   string idempotency_key = 2;       // Fully formed, opaque composite key
   optional uint64 wait_timeout_ms = 3;
   optional uint64 lease_ttl_ms = 4; // Crash-detection window; defaults to engine config
+
+  // CEL-98: the session this check is being made on behalf of.
+  //
+  // The idempotency key is opaque to the engine and deliberately stays that way,
+  // so the session cannot be recovered from it. Without this field the engine
+  // cannot tell the caller where its session currently sits, which is what a
+  // caller needs after a cache hit — see `current_sequence` on the response.
+  //
+  // Optional for wire compatibility: clients predating this field still work,
+  // they simply receive no `current_sequence` back.
+  optional string session_id = 5;
 }
 
 message CheckCacheResponse {
@@ -59,6 +70,19 @@ message CheckCacheResponse {
   optional uint64 heartbeat_interval_ms = 5; // Present iff ACQUIRED — caller MUST renew
   optional uint64 retry_after_ms = 6;        // Present iff IN_PROGRESS and wait exhausted
   optional string current_holder_id = 7;     // Present iff IN_PROGRESS (for distributed tracing)
+
+  // CEL-98: the requested session's highest committed sequence, or 0 if it has
+  // none. Present whenever `session_id` was supplied — on every status, not only
+  // on HIT.
+  //
+  // A caller that takes a HIT returns without committing, so its local counter
+  // advances while the session's does not, and its next commit fails the
+  // ordering check one step after the real cause. This lets it re-align.
+  //
+  // Returned on ACQUIRED and IN_PROGRESS too because it costs one seek on a call
+  // that already performs a storage transaction, and it lets a caller about to
+  // execute confirm it is where it thinks it is.
+  optional uint64 current_sequence = 8;
 }
 
 message RenewLeaseRequest {
