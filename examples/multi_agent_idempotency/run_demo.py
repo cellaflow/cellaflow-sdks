@@ -140,11 +140,9 @@ def scenario_coordinated(
         )
 
     gateway.reset_ledger()
-    # Every replica gets byte-identical arguments, and that is load-bearing rather
-    # than incidental: the derived idempotency key hashes the step inputs, so
-    # replicas that disagreed here would produce different keys, both acquire
-    # leases, and both charge the customer. See CEL-92 and the README's "What this
-    # covers, and what it doesn't".
+    # Every replica gets byte-identical arguments. That is what makes them
+    # converge: the derived idempotency key hashes the step inputs, so identical
+    # inputs produce one shared key and the engine can pick a single winner.
     args = [
         (f"agent-{i}", session_id, TICKET_ID, AMOUNT_CENTS)
         for i in range(1, n_agents + 1)

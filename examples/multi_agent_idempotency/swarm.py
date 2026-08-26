@@ -70,9 +70,9 @@ def _build_coordinated_workflow(agent_id: str) -> Any:
     """Construct this agent's decorated workflow.
 
     The decorators are applied inside the function rather than at module scope
-    because ``@tool`` takes ``agent_id`` at *decoration* time, and each replica in
-    a swarm has a different identity. See the "Rough edges" section of the README
-    -- this is the main ergonomic gap the exercise turned up.
+    because ``@tool`` takes ``agent_id`` at *decoration* time, and each replica
+    needs its own identity. Building the workflow per process is what lets each
+    one carry a distinct ``agent_id``.
     """
     from cellaflow.decorators import tool, workflow
     from cellaflow.idempotency import IdempotencyScope
