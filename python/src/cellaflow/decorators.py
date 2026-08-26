@@ -128,6 +128,10 @@ def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
     different step at a consumed sequence is rejected rather than answered — but
     the SDK's replay path predated that discipline.
 
+    A record whose name is empty is treated as unverifiable and rejected, not
+    replayed — see the comment on that branch for why no legitimate history
+    reaches it.
+
     Matching is by step name. Two stronger options are unavailable rather than
     rejected:
 
@@ -144,11 +148,30 @@ def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
     recorded = ctx.replayed_steps[seq]
     recorded_name = recorded.get("name")
 
-    # Falsy rather than `is not None`: protobuf strings default to "" when unset,
-    # so history written before names were retained arrives as empty, not absent.
-    # There is nothing to compare then, and failing on data we cannot check would
-    # break resumption of older sessions.
-    if recorded_name and recorded_name != expected_name:
+    # Fail closed on an unverifiable record. An earlier version of this check
+    # skipped the comparison when the name was empty, justified as tolerating
+    # history from before names were retained. That history does not exist:
+    # `commit_step` has set `name` and `get_graph` has returned it since the
+    # first commit of client.py, `@step` falls back to `func.__name__` so the
+    # name can never be empty, the LangGraph saver builds it from an f-string,
+    # and engine-generated TimerFired events carry their own. What CEL-102
+    # describes as discarded was the SDK's in-memory index, not the engine's
+    # record.
+    #
+    # Skipping the check therefore protected nothing, while reverting to exactly
+    # the positional replay this exists to prevent — silently — whenever a name
+    # arrived empty for any *other* reason. That is the failure the ticket calls
+    # the worst of the family, reintroduced through the escape hatch meant to be
+    # harmless.
+    if not recorded_name:
+        raise NondeterministicWorkflowError(
+            f"Cannot verify replay at sequence {seq}: the recorded step has no "
+            f"name, so there is no way to confirm it is {expected_name!r} rather "
+            f"than a different step at the same position. Every step this SDK "
+            f"commits records its name, so this history did not come from it."
+        )
+
+    if recorded_name != expected_name:
         raise NondeterministicWorkflowError(
             f"Workflow diverged from its recorded history at sequence {seq}: "
             f"expected step {expected_name!r}, but {recorded_name!r} was "

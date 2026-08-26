@@ -947,16 +947,19 @@ def test_replay_allows_extending_history_with_new_steps(
     assert committed.step_result.name == "second"
 
 
-def test_replay_tolerates_history_without_names(
+def test_replay_refuses_history_it_cannot_verify(
     mock_stub: MagicMock, mock_client: None
 ) -> None:
-    """History written before names were retained must still replay.
+    """A record with no name is unverifiable, so replay must refuse it.
 
-    Absent a recorded name there is nothing to compare, so the old positional
-    behaviour stands rather than the run failing on data it cannot check.
+    An earlier version replayed positionally here, justified as tolerating
+    history from before names were retained. No such history exists — every
+    writer sets a name — so the exemption protected nothing while silently
+    restoring the exact positional replay CEL-102 exists to prevent.
     """
-    _recovered_session(mock_stub, "sess-legacy", ["recorded"])
-    # Simulate an index built without the name, as the previous SDK produced.
+    from cellaflow import NondeterministicWorkflowError
+
+    _recovered_session(mock_stub, "sess-unnamed", ["recorded"])
     original = mock_stub.GetGraph.return_value
     mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(
         steps=[
@@ -972,10 +975,16 @@ def test_replay_tolerates_history_without_names(
 
     @step
     def anything() -> str:
-        raise AssertionError("must replay, not execute")
+        raise AssertionError("must not execute — the record is unverifiable")
 
     @workflow(version="1.0.0")
     def wf() -> str:
         return anything()  # type: ignore[no-any-return]
 
-    assert wf() == "recorded-result"
+    with pytest.raises(NondeterministicWorkflowError) as excinfo:
+        wf()
+
+    message = str(excinfo.value)
+    assert "sequence 1" in message
+    assert "no name" in message
+    assert "'anything'" in message, "the error must name the step that was expected"
