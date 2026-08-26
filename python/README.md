@@ -120,6 +120,8 @@ recovered_result = research_workflow(
 )
 ```
 
+> **The workflow body must be deterministic.** A resumed run has to call the same steps in the same order as the run it is recovering. Put anything that varies — model output, clocks, random values, network reads — *inside* a step, never in the code that decides which steps to call. See [Replay determinism](#replay-determinism) for why, and for the error you get if you break it.
+
 ---
 
 ### 4. LangGraph Checkpointer (`CellaflowSaver`)
@@ -196,6 +198,53 @@ flowchart LR
     Replay -->|"2. Instant Cache Replay (0ms)"| S1
     Replay -->|"3. Resume Live Execution"| S2
 ```
+
+#### Replay determinism
+
+Replay is **positional**. Each `@step` call increments a per-session counter, and a resumed run answers the step at sequence *N* from whatever was committed at sequence *N*. That is only sound if the resumed run performs the same steps in the same order as the original.
+
+So the rule is: **the workflow body decides *what* to call deterministically; all nondeterminism lives inside step bodies.** A step's result is committed and replayed, so a value produced inside a step is stable across resumption. A value produced in the orchestrating code is not — it is recomputed on every resume, and if it changes, the branch taken changes with it.
+
+```python
+@workflow(version="1.0.0")
+def triage(ticket_id: str) -> dict:
+    # ❌ Nondeterministic branch: `llm.classify` runs afresh on every resume.
+    # If it answers differently the second time, the run takes a different path
+    # and every subsequent step lands on a sequence belonging to another step.
+    if llm.classify(ticket_id) == "urgent":
+        escalate(ticket_id)
+    return resolve(ticket_id)
+
+
+@workflow(version="1.0.0")
+def triage(ticket_id: str) -> dict:
+    # ✅ The classification is a step, so it is committed once and replayed.
+    # Every resume branches on the same value the original run branched on.
+    if classify(ticket_id) == "urgent":
+        escalate(ticket_id)
+    return resolve(ticket_id)
+```
+
+The same applies to any other varying input to a branch: `datetime.now()`, `random`, environment lookups, or a bare HTTP call. Wrap it in a `@step` or `@tool` and branch on the result.
+
+#### `NondeterministicWorkflowError`
+
+When a resumed run reaches a sequence holding a *different* step than the one it is about to call, the SDK raises rather than returning the recorded result:
+
+```
+NondeterministicWorkflowError: Workflow diverged from its recorded history at
+sequence 1: expected step 'shared', but 'warmup' was committed there. A resumed
+run must perform the same steps in the same order — move any branching on model
+output, clocks, or network reads inside a step so its result is replayed too.
+```
+
+**This is a bug in your workflow, not in the engine.** It means the resumed run took a different path than the run it is recovering — most often a branch on a value computed outside a step. Find the branch named in the error, and move whatever it tests into a step.
+
+The check compares step names, which catches a changed *shape* of execution: a skipped branch, a reordering, an extra step. It is a known limitation that it does **not** catch the same step replayed with different arguments — a resumed run calling `search("b")` where `search("a")` was recorded receives the recorded result silently. Deterministic branching, as above, is what keeps you out of that case.
+
+A related error, `Cannot verify replay at sequence N: the recorded step has no name`, means the history was not written by this SDK. Every step it commits records a name, so a nameless record cannot be checked and is refused rather than replayed positionally.
+
+Extending history is fine and is the normal case: a run that matches the recorded prefix and then continues past it executes the new steps and commits them as usual. Only *divergence within* the recorded prefix raises.
 
 ---
 
@@ -333,6 +382,17 @@ black src tests
 flake8 src tests
 mypy src tests
 ```
+
+---
+
+## Examples
+
+Runnable programs live in [`examples/`](../examples/) at the repository root.
+
+[`multi_agent_idempotency/`](../examples/multi_agent_idempotency/) shows five replicas of one
+agent racing on the same refund: uncoordinated they charge five times, and through the engine
+one charge reaches the payment provider while the other four receive its result. It survives an
+engine restart.
 
 ---
 
