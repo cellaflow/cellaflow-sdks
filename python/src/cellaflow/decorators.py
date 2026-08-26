@@ -31,6 +31,9 @@ def workflow(
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
             # Pop _session_id if provided for recovery, else generate new
             session_id = kwargs.pop("_session_id", str(uuid.uuid4()))
+            # CEL-99: identifies the shared work, not the session. Agents in
+            # different sessions pass the same value to converge on one key.
+            coordination_id = kwargs.pop("_coordination_id", None)
 
             client = CellaflowClient(target=target, secure=secure)
             resp = client.start_session(
@@ -56,6 +59,7 @@ def workflow(
                 workflow_version=resp.version,
                 sequence=0,
                 replayed_steps=replayed_steps,
+                coordination_id=coordination_id,
             )
             token = set_context(ctx)
             try:
@@ -66,6 +70,9 @@ def workflow(
         @functools.wraps(func)
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
             session_id = kwargs.pop("_session_id", str(uuid.uuid4()))
+            # CEL-99: identifies the shared work, not the session. Agents in
+            # different sessions pass the same value to converge on one key.
+            coordination_id = kwargs.pop("_coordination_id", None)
 
             client = CellaflowClient(target=target, secure=secure)
             resp = client.start_session(
@@ -91,6 +98,7 @@ def workflow(
                 workflow_version=resp.version,
                 sequence=0,
                 replayed_steps=replayed_steps,
+                coordination_id=coordination_id,
             )
             token = set_context(ctx)
             try:
@@ -230,6 +238,7 @@ def step(
                 agent_id,
                 actual_tool_name,
                 scope,
+                ctx.coordination_id,
                 *args,
                 **kwargs,
             )
@@ -325,6 +334,7 @@ def step(
                 agent_id,
                 actual_tool_name,
                 scope,
+                ctx.coordination_id,
                 *args,
                 **kwargs,
             )

@@ -16,6 +16,9 @@ class WorkflowContext:
     # verify it is returning *this* step's result and not whatever happens to sit
     # at the same index.
     replayed_steps: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    # CEL-99: names the work several agents are collaborating on -- a ticket, a
+    # task, a tenant. Only SCOPE_SHARED reads it, and that scope requires it.
+    coordination_id: Optional[str] = None
     # CEL-98: the session position the engine last reported, held from a cache hit
     # until the next step consumes it. See `reconcile_sequence`.
     _reported_sequence: Optional[int] = None
