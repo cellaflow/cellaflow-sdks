@@ -18,6 +18,8 @@ To enable LangGraph support:
 
 import asyncio
 import logging
+import random
+import time
 import secrets
 from collections import defaultdict
 from typing import (
@@ -38,6 +40,20 @@ from cellaflow.client import CellaflowClient
 from cellaflow.v1 import common_pb2
 
 logger = logging.getLogger(__name__)
+
+# CEL-97: how many times a checkpoint commit re-derives its sequence and retries
+# before giving up.
+#
+# Appending to a strictly-sequenced log from N concurrent writers is inherently
+# O(N) rounds: every writer reads the same position, all propose it, and exactly
+# one wins per round. So the budget has to exceed the contention level rather
+# than sit at some small constant -- at 8 attempts a 100-writer test loses about
+# a third of its commits, and those losses look like an engine defect rather
+# than an exhausted retry budget.
+#
+# The cost of a generous ceiling is bounded work on a path that only runs under
+# contention. The cost of a tight one is spurious failures.
+_MAX_COMMIT_ATTEMPTS = 128
 
 if TYPE_CHECKING:
     from langchain_core.runnables import RunnableConfig
@@ -73,6 +89,7 @@ else:
         _BaseSaver = BaseCheckpointSaver
         HAS_LANGGRAPH = True
     except ImportError:  # pragma: no cover
+
         class _BaseSaver:
             def __init__(self, *args: Any, **kwargs: Any) -> None:
                 pass
@@ -237,9 +254,77 @@ class CellaflowSaver(_BaseSaver):
         self._next_sequence[session_id] = seq + 1
         return seq
 
-    def _fetch_history(
-        self, thread_id: str
-    ) -> Tuple[
+    def _refresh_sequence(self, session_id: str) -> int:
+        """Re-reads the session's true position from the engine.
+
+        CEL-97: `_next_sequence` is process-local. Concurrent savers on one
+        thread each seed it from the same history and then increment
+        independently, so they all propose the same sequence and the engine
+        accepts exactly one. Re-reading is how a loser finds out where the log
+        actually got to.
+        """
+        try:
+            steps, _ = self.client.get_graph(session_id=session_id)
+        except Exception:  # pragma: no cover - engine unreachable
+            return self._next_sequence.get(session_id, 1)
+
+        latest = max((cast(int, st["sequence"]) for st in steps), default=0)
+        self._next_sequence[session_id] = latest + 1
+        return latest + 1
+
+    def _commit_with_retry(
+        self, session_id: str, name: str, payload: Dict[str, Any]
+    ) -> int:
+        """Commits, re-deriving the sequence and retrying on an ordering conflict.
+
+        CEL-97: concurrent writers on one thread are *not* duplicates. Eight
+        savers writing eight different checkpoints should produce eight events
+        at successive positions -- they are appending to a shared log, not
+        contending over one operation. So deduplication is the wrong tool and no
+        idempotency key is used here; what is needed is for a writer that lost
+        the race to pick up the next free position and try again.
+
+        That is optimistic concurrency control, which is exactly what the
+        engine's `sequence == current + 1` check already implements. This
+        supplies the missing half.
+
+        Bounded, and on exhaustion the underlying error is re-raised rather than
+        a synthesised one, so the cause stays visible.
+        """
+        last_error: Optional[Exception] = None
+
+        for attempt in range(_MAX_COMMIT_ATTEMPTS):
+            seq = self._ensure_session_and_sequence(session_id)
+            try:
+                self.client.commit_step(
+                    session_id=session_id,
+                    sequence=seq,
+                    name=name,
+                    status=common_pb2.STEP_STATUS_SUCCESS,
+                    output_payload=payload,
+                )
+                return seq
+            except grpc.RpcError as exc:
+                if exc.code() != grpc.StatusCode.FAILED_PRECONDITION:
+                    raise
+                last_error = exc
+                logger.debug(
+                    "Sequence %d taken for %s (attempt %d/%d); refreshing",
+                    seq,
+                    session_id,
+                    attempt + 1,
+                    _MAX_COMMIT_ATTEMPTS,
+                )
+                # Jitter before re-reading. Without it every loser wakes, reads
+                # the same position and proposes it simultaneously, so each
+                # round still admits one writer and the rest burn an attempt.
+                time.sleep(random.uniform(0, 0.01 * min(attempt + 1, 10)))
+                self._refresh_sequence(session_id)
+
+        assert last_error is not None
+        raise last_error
+
+    def _fetch_history(self, thread_id: str) -> Tuple[
         Dict[
             str,
             Dict[
@@ -366,9 +451,7 @@ class CellaflowSaver(_BaseSaver):
                 return None
             checkpoint_id = requested_id
         else:
-            checkpoint_id = max(
-                ns_storage.keys(), key=lambda cid: ns_storage[cid][0]
-            )
+            checkpoint_id = max(ns_storage.keys(), key=lambda cid: ns_storage[cid][0])
 
         (
             _seq,
@@ -535,8 +618,6 @@ class CellaflowSaver(_BaseSaver):
     ) -> RunnableConfig:
         thread_id: str = config["configurable"]["thread_id"]
         checkpoint_ns: str = config["configurable"].get("checkpoint_ns", "")
-        seq = self._ensure_session_and_sequence(thread_id)
-
         c = dict(checkpoint)
         values: Dict[str, Any] = cast(Dict[str, Any], c.pop("channel_values", {}))
         blobs_dict: Dict[str, Dict[str, Any]] = {}
@@ -564,12 +645,8 @@ class CellaflowSaver(_BaseSaver):
         }
 
         try:
-            self.client.commit_step(
-                session_id=thread_id,
-                sequence=seq,
-                name=f"checkpoint:{checkpoint['id']}",
-                status=common_pb2.STEP_STATUS_SUCCESS,
-                output_payload=payload,
+            seq = self._commit_with_retry(
+                thread_id, f"checkpoint:{checkpoint['id']}", payload
             )
             logger.debug(
                 "Committed checkpoint %s for thread %s at sequence %d",
@@ -579,10 +656,10 @@ class CellaflowSaver(_BaseSaver):
             )
         except Exception as e:
             logger.error(
-                "Failed to commit checkpoint %s for thread %s at sequence %d: %s",
+                "Failed to commit checkpoint %s for thread %s after %d attempts: %s",
                 checkpoint["id"],
                 thread_id,
-                seq,
+                _MAX_COMMIT_ATTEMPTS,
                 e,
             )
             raise
@@ -605,8 +682,6 @@ class CellaflowSaver(_BaseSaver):
         thread_id: str = config["configurable"]["thread_id"]
         checkpoint_ns: str = config["configurable"].get("checkpoint_ns", "")
         checkpoint_id: str = config["configurable"]["checkpoint_id"]
-        seq = self._ensure_session_and_sequence(thread_id)
-
         writes_list = []
         for idx, (c, v) in enumerate(writes):
             t, b = self.serde.dumps_typed(v)
@@ -632,12 +707,8 @@ class CellaflowSaver(_BaseSaver):
         }
 
         try:
-            self.client.commit_step(
-                session_id=thread_id,
-                sequence=seq,
-                name=f"writes:{checkpoint_id}:{task_id}",
-                status=common_pb2.STEP_STATUS_SUCCESS,
-                output_payload=payload,
+            seq = self._commit_with_retry(
+                thread_id, f"writes:{checkpoint_id}:{task_id}", payload
             )
             logger.debug(
                 "Committed %d writes for task %s (checkpoint %s, thread %s) "
@@ -651,11 +722,11 @@ class CellaflowSaver(_BaseSaver):
         except Exception as e:
             logger.error(
                 "Failed to commit writes for task %s (checkpoint %s, thread %s) "
-                "at sequence %d: %s",
+                "after %d attempts: %s",
                 task_id,
                 checkpoint_id,
                 thread_id,
-                seq,
+                _MAX_COMMIT_ATTEMPTS,
                 e,
             )
             raise
@@ -680,9 +751,7 @@ class CellaflowSaver(_BaseSaver):
         limit: Optional[int] = None,
     ) -> AsyncIterator[CheckpointTuple]:
         items = await asyncio.to_thread(
-            lambda: list(
-                self.list(config, filter=filter, before=before, limit=limit)
-            )
+            lambda: list(self.list(config, filter=filter, before=before, limit=limit))
         )
         for item in items:
             yield item
