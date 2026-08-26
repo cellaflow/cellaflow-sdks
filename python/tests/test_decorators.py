@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import MagicMock
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 from cellaflow.decorators import workflow, step
 from cellaflow.v1 import service_pb2
@@ -830,3 +830,161 @@ def test_reconciliation_does_not_disturb_replayed_steps(
         "reconciling to the session's own position must not rewind into replayed "
         f"history; expected the next commit at 2, got {committed.step_result.sequence}"
     )
+
+
+def _recovered_session(mock_stub: MagicMock, session_id: str, names: List[str]) -> None:
+    """Seeds a recovered session whose history is `names`, committed at 1..n."""
+    from cellaflow.v1 import common_pb2
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id=session_id, version="1.0.0", is_recovered=True
+    )
+    mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(
+        steps=[
+            common_pb2.StepResult(
+                sequence=i,
+                name=name,
+                status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+                output_payload=serialize({"result": f"{name}-result"}),
+            )
+            for i, name in enumerate(names, start=1)
+        ],
+        next_cursor="",
+    )
+
+
+def test_replay_rejects_a_different_step_at_the_same_sequence(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """CEL-102: a resumed run that skips a branch must fail loudly.
+
+    Before this check it silently received the *previous* step's result — warmup's
+    output returned for shared — and carried on computing with foreign data.
+    """
+    from cellaflow import NondeterministicWorkflowError
+
+    _recovered_session(mock_stub, "sess-diverge", ["warmup", "shared", "after"])
+
+    @step
+    def shared() -> str:
+        return "executed"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        # History has warmup at 1; this run reaches `shared` there instead.
+        return shared()  # type: ignore[no-any-return]
+
+    with pytest.raises(NondeterministicWorkflowError) as excinfo:
+        wf()
+
+    message = str(excinfo.value)
+    assert "sequence 1" in message
+    assert "'shared'" in message, "the error must name the step that was expected"
+    assert "'warmup'" in message, "the error must name the step that was found"
+
+
+def test_replay_returns_the_recorded_result_when_identity_matches(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The normal crash-recovery path must be untouched — replay, no execution."""
+    _recovered_session(mock_stub, "sess-resume", ["first", "second"])
+
+    executed = []
+
+    @step
+    def first() -> str:
+        executed.append("first")
+        return "fresh"
+
+    @step
+    def second() -> str:
+        executed.append("second")
+        return "fresh"
+
+    @workflow(version="1.0.0")
+    def wf() -> Tuple[str, str]:
+        return (first(), second())
+
+    assert wf() == ("first-result", "second-result")
+    assert executed == [], "replayed steps must not re-execute"
+    mock_stub.CommitStep.assert_not_called()
+
+
+def test_replay_allows_extending_history_with_new_steps(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """A run that matches the recorded prefix then continues must work.
+
+    This is resumption after a crash partway through, which is the whole point
+    of replay — the check must not make it stricter than it should be.
+    """
+    _recovered_session(mock_stub, "sess-extend", ["first"])
+    mock_stub.CommitStep.return_value = service_pb2.CommitStepResponse(
+        session_id="sess-extend", next_sequence=3
+    )
+
+    executed = []
+
+    @step
+    def first() -> str:
+        executed.append("first")
+        return "fresh"
+
+    @step
+    def second() -> str:
+        executed.append("second")
+        return "new-work"
+
+    @workflow(version="1.0.0")
+    def wf() -> Tuple[str, str]:
+        return (first(), second())
+
+    assert wf() == ("first-result", "new-work")
+    assert executed == ["second"], "only the step beyond history should run"
+
+    committed = mock_stub.CommitStep.call_args[0][0]
+    assert committed.step_result.sequence == 2
+    assert committed.step_result.name == "second"
+
+
+def test_replay_refuses_history_it_cannot_verify(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """A record with no name is unverifiable, so replay must refuse it.
+
+    An earlier version replayed positionally here, justified as tolerating
+    history from before names were retained. No such history exists — every
+    writer sets a name — so the exemption protected nothing while silently
+    restoring the exact positional replay CEL-102 exists to prevent.
+    """
+    from cellaflow import NondeterministicWorkflowError
+
+    _recovered_session(mock_stub, "sess-unnamed", ["recorded"])
+    original = mock_stub.GetGraph.return_value
+    mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(
+        steps=[
+            type(original.steps[0])(
+                sequence=1,
+                name="",
+                status=original.steps[0].status,
+                output_payload=original.steps[0].output_payload,
+            )
+        ],
+        next_cursor="",
+    )
+
+    @step
+    def anything() -> str:
+        raise AssertionError("must not execute — the record is unverifiable")
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        return anything()  # type: ignore[no-any-return]
+
+    with pytest.raises(NondeterministicWorkflowError) as excinfo:
+        wf()
+
+    message = str(excinfo.value)
+    assert "sequence 1" in message
+    assert "no name" in message
+    assert "'anything'" in message, "the error must name the step that was expected"

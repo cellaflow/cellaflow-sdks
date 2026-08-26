@@ -11,7 +11,10 @@ class WorkflowContext:
     session_id: str
     workflow_version: str
     sequence: int = 0
-    # Map sequence number to a deserialized step payload for fast replay lookups
+    # Map sequence number to the recorded step at that position, as
+    # {"name": str, "payload": dict}. CEL-102: the name is retained so replay can
+    # verify it is returning *this* step's result and not whatever happens to sit
+    # at the same index.
     replayed_steps: Dict[int, Dict[str, Any]] = field(default_factory=dict)
     # CEL-98: the session position the engine last reported, held from a cache hit
     # until the next step consumes it. See `reconcile_sequence`.

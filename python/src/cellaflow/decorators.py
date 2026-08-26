@@ -41,7 +41,14 @@ def workflow(
             if resp.is_recovered:
                 steps, _ = client.get_graph(resp.session_id)
                 for step_info in steps:
-                    replayed_steps[step_info["sequence"]] = step_info["output_payload"]
+                    # CEL-102: keep the name, not just the payload. Replay is
+                    # keyed on position, and without the name there is no way to
+                    # tell a legitimate replay from a different step landing on
+                    # the same index.
+                    replayed_steps[step_info["sequence"]] = {
+                        "name": step_info["name"],
+                        "payload": step_info["output_payload"],
+                    }
 
             ctx = WorkflowContext(
                 client=client,
@@ -69,7 +76,14 @@ def workflow(
             if resp.is_recovered:
                 steps, _ = client.get_graph(resp.session_id)
                 for step_info in steps:
-                    replayed_steps[step_info["sequence"]] = step_info["output_payload"]
+                    # CEL-102: keep the name, not just the payload. Replay is
+                    # keyed on position, and without the name there is no way to
+                    # tell a legitimate replay from a different step landing on
+                    # the same index.
+                    replayed_steps[step_info["sequence"]] = {
+                        "name": step_info["name"],
+                        "payload": step_info["output_payload"],
+                    }
 
             ctx = WorkflowContext(
                 client=client,
@@ -89,6 +103,87 @@ def workflow(
         return cast(F, sync_wrapper)
 
     return decorator
+
+
+class NondeterministicWorkflowError(RuntimeError):
+    """Raised when a resumed run reaches a step that does not match history.
+
+    Replay is positional: the step at sequence N is answered from whatever was
+    committed at sequence N. That is only sound if the resumed run performs the
+    same steps in the same order, which is why the workflow body must be
+    deterministic given the session's inputs — all nondeterminism belongs inside
+    step bodies, never in the code deciding what to call.
+
+    Reaching this means the two diverged. Continuing would hand back another
+    step's result, so the run stops instead.
+    """
+
+
+def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
+    """Returns the recorded result at `seq`, or raises if it is a different step.
+
+    CEL-102: before this check the SDK matched on position alone, so a resumed
+    run that took a different branch silently received a foreign step's output.
+    The engine has never allowed this — CEL-71 added a content hash so a
+    different step at a consumed sequence is rejected rather than answered — but
+    the SDK's replay path predated that discipline.
+
+    A record whose name is empty is treated as unverifiable and rejected, not
+    replayed — see the comment on that branch for why no legitimate history
+    reaches it.
+
+    Matching is by step name. Two stronger options are unavailable rather than
+    rejected:
+
+    - The engine's `content_identity` covers the output payload, which is the
+      step's *result* and therefore unknown before it runs. It cannot be
+      computed at replay time by construction.
+    - The derived idempotency key would additionally catch same-name-different-
+      arguments, and `get_graph` appears to return it. But `commit_step` only
+      populates the *request-level* `idempotency_key`, never
+      `StepResult.idempotency_key`, so the recorded value is always absent and
+      the comparison would silently pass. Worth revisiting once CEL-84 settles
+      which field is authoritative.
+    """
+    recorded = ctx.replayed_steps[seq]
+    recorded_name = recorded.get("name")
+
+    # Fail closed on an unverifiable record. An earlier version of this check
+    # skipped the comparison when the name was empty, justified as tolerating
+    # history from before names were retained. That history does not exist:
+    # `commit_step` has set `name` and `get_graph` has returned it since the
+    # first commit of client.py, `@step` falls back to `func.__name__` so the
+    # name can never be empty, the LangGraph saver builds it from an f-string,
+    # and engine-generated TimerFired events carry their own. What CEL-102
+    # describes as discarded was the SDK's in-memory index, not the engine's
+    # record.
+    #
+    # Skipping the check therefore protected nothing, while reverting to exactly
+    # the positional replay this exists to prevent — silently — whenever a name
+    # arrived empty for any *other* reason. That is the failure the ticket calls
+    # the worst of the family, reintroduced through the escape hatch meant to be
+    # harmless.
+    if not recorded_name:
+        raise NondeterministicWorkflowError(
+            f"Cannot verify replay at sequence {seq}: the recorded step has no "
+            f"name, so there is no way to confirm it is {expected_name!r} rather "
+            f"than a different step at the same position. Every step this SDK "
+            f"commits records its name, so this history did not come from it."
+        )
+
+    if recorded_name != expected_name:
+        raise NondeterministicWorkflowError(
+            f"Workflow diverged from its recorded history at sequence {seq}: "
+            f"expected step {expected_name!r}, but {recorded_name!r} was "
+            f"committed there. A resumed run must perform the same steps in the "
+            f"same order — move any branching on model output, clocks, or "
+            f"network reads inside a step so its result is replayed too."
+        )
+
+    payload = recorded.get("payload")
+    if payload is None:
+        return None
+    return payload.get("result")
 
 
 def step(
@@ -123,7 +218,7 @@ def step(
         seq = ctx.sequence
 
         if seq in ctx.replayed_steps:
-            return ctx.replayed_steps[seq].get("result")
+            return _replay(ctx, seq, actual_tool_name)
 
         # Derive idempotency key
         ikey = idempotency_key
@@ -218,7 +313,7 @@ def step(
         seq = ctx.sequence
 
         if seq in ctx.replayed_steps:
-            return ctx.replayed_steps[seq].get("result")
+            return _replay(ctx, seq, actual_tool_name)
 
         # Derive idempotency key
         ikey = idempotency_key
