@@ -41,7 +41,14 @@ def workflow(
             if resp.is_recovered:
                 steps, _ = client.get_graph(resp.session_id)
                 for step_info in steps:
-                    replayed_steps[step_info["sequence"]] = step_info["output_payload"]
+                    # CEL-102: keep the name, not just the payload. Replay is
+                    # keyed on position, and without the name there is no way to
+                    # tell a legitimate replay from a different step landing on
+                    # the same index.
+                    replayed_steps[step_info["sequence"]] = {
+                        "name": step_info["name"],
+                        "payload": step_info["output_payload"],
+                    }
 
             ctx = WorkflowContext(
                 client=client,
@@ -69,7 +76,14 @@ def workflow(
             if resp.is_recovered:
                 steps, _ = client.get_graph(resp.session_id)
                 for step_info in steps:
-                    replayed_steps[step_info["sequence"]] = step_info["output_payload"]
+                    # CEL-102: keep the name, not just the payload. Replay is
+                    # keyed on position, and without the name there is no way to
+                    # tell a legitimate replay from a different step landing on
+                    # the same index.
+                    replayed_steps[step_info["sequence"]] = {
+                        "name": step_info["name"],
+                        "payload": step_info["output_payload"],
+                    }
 
             ctx = WorkflowContext(
                 client=client,
@@ -89,6 +103,64 @@ def workflow(
         return cast(F, sync_wrapper)
 
     return decorator
+
+
+class NondeterministicWorkflowError(RuntimeError):
+    """Raised when a resumed run reaches a step that does not match history.
+
+    Replay is positional: the step at sequence N is answered from whatever was
+    committed at sequence N. That is only sound if the resumed run performs the
+    same steps in the same order, which is why the workflow body must be
+    deterministic given the session's inputs — all nondeterminism belongs inside
+    step bodies, never in the code deciding what to call.
+
+    Reaching this means the two diverged. Continuing would hand back another
+    step's result, so the run stops instead.
+    """
+
+
+def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
+    """Returns the recorded result at `seq`, or raises if it is a different step.
+
+    CEL-102: before this check the SDK matched on position alone, so a resumed
+    run that took a different branch silently received a foreign step's output.
+    The engine has never allowed this — CEL-71 added a content hash so a
+    different step at a consumed sequence is rejected rather than answered — but
+    the SDK's replay path predated that discipline.
+
+    Matching is by step name. Two stronger options are unavailable rather than
+    rejected:
+
+    - The engine's `content_identity` covers the output payload, which is the
+      step's *result* and therefore unknown before it runs. It cannot be
+      computed at replay time by construction.
+    - The derived idempotency key would additionally catch same-name-different-
+      arguments, and `get_graph` appears to return it. But `commit_step` only
+      populates the *request-level* `idempotency_key`, never
+      `StepResult.idempotency_key`, so the recorded value is always absent and
+      the comparison would silently pass. Worth revisiting once CEL-84 settles
+      which field is authoritative.
+    """
+    recorded = ctx.replayed_steps[seq]
+    recorded_name = recorded.get("name")
+
+    # Falsy rather than `is not None`: protobuf strings default to "" when unset,
+    # so history written before names were retained arrives as empty, not absent.
+    # There is nothing to compare then, and failing on data we cannot check would
+    # break resumption of older sessions.
+    if recorded_name and recorded_name != expected_name:
+        raise NondeterministicWorkflowError(
+            f"Workflow diverged from its recorded history at sequence {seq}: "
+            f"expected step {expected_name!r}, but {recorded_name!r} was "
+            f"committed there. A resumed run must perform the same steps in the "
+            f"same order — move any branching on model output, clocks, or "
+            f"network reads inside a step so its result is replayed too."
+        )
+
+    payload = recorded.get("payload")
+    if payload is None:
+        return None
+    return payload.get("result")
 
 
 def step(
@@ -123,7 +195,7 @@ def step(
         seq = ctx.sequence
 
         if seq in ctx.replayed_steps:
-            return ctx.replayed_steps[seq].get("result")
+            return _replay(ctx, seq, actual_tool_name)
 
         # Derive idempotency key
         ikey = idempotency_key
@@ -218,7 +290,7 @@ def step(
         seq = ctx.sequence
 
         if seq in ctx.replayed_steps:
-            return ctx.replayed_steps[seq].get("result")
+            return _replay(ctx, seq, actual_tool_name)
 
         # Derive idempotency key
         ikey = idempotency_key
