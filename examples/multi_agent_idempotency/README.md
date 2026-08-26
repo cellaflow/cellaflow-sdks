@@ -87,10 +87,24 @@ Point at a different engine with `CELLAFLOW_TARGET=host:port`.
 
 This example covers **replicas of a single agent sharing one session** — the shape you get from
 running an agent redundantly, or from horizontal scaling where more than one worker claims the
-same job.
+same job. That is what `SCOPE_SESSION_WIDE` is for, and it is what the code here demonstrates.
 
-Coordinating *different* agents, each running its own workflow in its own session, is a
-separate capability and is not what this example shows.
+A different shape is coordinating **heterogeneous agents** — a coder, a researcher, and a doc
+writer, each running its own workflow in its own session — around one shared side effect. The
+SDK supports that with `SCOPE_SHARED`, which derives a key from a coordination domain you name
+instead of from the session:
+
+```python
+@tool(tool_name="publish_release_notes", scope=IdempotencyScope.SCOPE_SHARED)
+def publish(version: str) -> dict: ...
+
+coder_agent("v4.2", _coordination_id="release-4.2")
+doc_writer_agent("v4.2", _coordination_id="release-4.2")   # one publish, not two
+```
+
+That is documented in the [SDK README](../../python/README.md#3-coordinating-agents-across-different-sessions).
+This example does not exercise it — every agent here is deliberately a replica of one agent in
+one session, because that keeps the thing being demonstrated to a single variable.
 
 ## Files
 
