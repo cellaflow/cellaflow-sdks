@@ -83,6 +83,15 @@ session arrives at the same one. The engine grants exactly one of them the right
 `--agents N` (default 5) · `--scenario naive|coordinated|both` · `--session-id ID` to resume.
 Point at a different engine with `CELLAFLOW_TARGET=host:port`.
 
+## Current scope
+
+This example covers **replicas of a single agent sharing one session** — the shape you get from
+running an agent redundantly, or from horizontal scaling where more than one worker claims the
+same job.
+
+Coordinating *different* agents, each running its own workflow in its own session, is a
+separate capability and is not what this example shows.
+
 ## Files
 
 | File | |
