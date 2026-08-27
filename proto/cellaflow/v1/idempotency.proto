@@ -54,7 +54,18 @@ enum IdempotencyCommitStatus {
 // ============================================================================
 
 message CheckCacheRequest {
-  string agent_id = 1;              // Validated against caller principal; NOT parsed into key
+  // Opaque caller-supplied label, used for logging and diagnostics only.
+  //
+  // NOT an authorization boundary, despite what this comment claimed until
+  // 2026-08-27 ("Validated against caller principal"). The engine never
+  // validates it against anything: `grep agent_id` over the engine finds it in
+  // two `tracing` fields and nowhere else. Authentication is a single shared
+  // bearer token, so every authenticated caller can act as any agent_id on any
+  // session. See CEL-107.
+  //
+  // Also not parsed into the idempotency key -- key derivation is entirely an
+  // SDK concern and the engine treats the key as opaque.
+  string agent_id = 1;
   string idempotency_key = 2;       // Fully formed, opaque composite key
   optional uint64 wait_timeout_ms = 3;
   optional uint64 lease_ttl_ms = 4; // Crash-detection window; defaults to engine config
