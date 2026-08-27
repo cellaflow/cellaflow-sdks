@@ -324,9 +324,6 @@ session 'refund-4417' is already committed; the session is at 1. The lease was
 refused before execution because this position already holds a different step...
 ```
 
-Previously both replicas executed and the loser was rejected at commit time — after the money had
-moved, with a generic ordering error that named neither the tool nor the cause.
-
 **The fix belongs in the workflow.** Wrap whatever the replicas disagreed about in its own step,
 so they converge on one value before reaching the step that acts on it:
 
