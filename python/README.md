@@ -301,7 +301,7 @@ output, clocks, or network reads inside a step so its result is replayed too.
 
 **This is a bug in your workflow, not in the engine.** It means the resumed run took a different path than the run it is recovering — most often a branch on a value computed outside a step. Find the branch named in the error, and move whatever it tests into a step.
 
-The check compares step names, which catches a changed *shape* of execution: a skipped branch, a reordering, an extra step. It is a known limitation that it does **not** catch the same step replayed with different arguments — a resumed run calling `search("b")` where `search("a")` was recorded receives the recorded result silently. Deterministic branching, as above, is what keeps you out of that case.
+The check compares step names, which catches a changed *shape* of execution: a skipped branch, a reordering, an extra step. Deterministic branching, as above, is what keeps a resumed run matching the history it is recovering.
 
 A related error, `Cannot verify replay at sequence N: the recorded step has no name`, means the history was not written by this SDK. Every step it commits records a name, so a nameless record cannot be checked and is refused rather than replayed positionally.
 

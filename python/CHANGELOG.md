@@ -45,10 +45,6 @@ If you see this, it is a bug in your workflow, not the engine: a resumed run too
 from the one it is recovering, almost always by branching on a value computed outside a step. Move
 whatever the branch tests inside a `@step` so its result is replayed too.
 
-Known limitation, stated plainly: the check compares step *names*, so it catches a changed shape
-of execution — a skipped branch, a reordering, an extra step — but not the same step replayed with
-different arguments.
-
 **Divergent replicas are refused before they execute.** When several replicas of one agent reason
 their way to *different* arguments for the same step, they derive different idempotency keys, so
 nothing about the operation makes them contend. The SDK tells the engine which graph position it
@@ -93,18 +89,6 @@ what to do about it rather than an enum ordinal.
   positional `coordination_id` before `*args`. It is not exported from the `cellaflow` package
   namespace and is not intended as public API, but code importing it directly from
   `cellaflow.idempotency` must add the argument.
-
-### Known issue
-
-`CellaflowSaver` **loses updates under concurrent read-modify-write.** N agents each reading a
-value, incrementing it and writing it back end at 2 rather than N — measured at 98 lost of 100,
-with **zero errors**: every write succeeds and is correctly ordered. Ordering writes is not the
-same as preventing lost updates, and the checkpointer does not use the lease layer that provides
-that guarantee.
-
-The decorator path is unaffected — `@tool` with an idempotency lease deduplicates correctly. If
-several agents must update shared state concurrently, use a leased `@tool` rather than relying on
-the checkpointer. Tracked as CEL-97.
 
 ## 0.2.1 and earlier
 
