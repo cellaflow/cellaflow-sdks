@@ -318,6 +318,12 @@ agents/
 bmad/
 .claude/
 
+# Local agent tooling. This repository is public, so these stay on disk and are
+# never committed: CLAUDE.md carries internal working context, and .mcp.json
+# points at whichever MCP servers a given machine happens to have configured.
+CLAUDE.md
+.mcp.json
+
 _docs/
 docs/
 

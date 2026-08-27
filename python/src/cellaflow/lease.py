@@ -7,6 +7,34 @@ from cellaflow.client import CellaflowClient
 logger = logging.getLogger(__name__)
 
 
+def _renew_failure_detail(reason: int) -> str:
+    """Explains a renewal denial in terms of what the holder should do.
+
+    The raw enum value alone is close to useless in a log: the step body is still
+    running at this point and is about to attempt a commit that will be rejected,
+    so the message has to say why the lease is gone.
+    """
+    from cellaflow.v1 import idempotency_pb2 as _idem
+
+    if reason == _idem.RENEW_FAILURE_REASON_MAX_LIFETIME_EXCEEDED:
+        return (
+            "the engine reclaimed it after the maximum lease lifetime "
+            "(CELLAFLOW_MAX_LEASE_LIFETIME_MS). This step kept heartbeating but ran "
+            "too long, so the position was released to other workers. Its commit "
+            "will be rejected as a stale lease. If the step is legitimately this "
+            "slow, raise the engine's limit; if it is hung, that is the bug."
+        )
+    if reason == _idem.RENEW_FAILURE_REASON_SUPERSEDED:
+        return "a newer worker holds the lease; this one has been fenced out"
+    if reason == _idem.RENEW_FAILURE_REASON_EXPIRED:
+        return "it expired before this renewal arrived"
+    if reason == _idem.RENEW_FAILURE_REASON_COMPLETED:
+        return "the step was already committed by another worker"
+    if reason == _idem.RENEW_FAILURE_REASON_NOT_FOUND:
+        return "the key no longer exists"
+    return f"unrecognised reason {reason}"
+
+
 class LeaseHeartbeat:
     """
     Manages the background heartbeat (RenewLease) for an actively running step.
@@ -63,8 +91,9 @@ class LeaseHeartbeat:
                 )
                 if not resp.renewed:
                     logger.warning(
-                        f"Lease {self.idempotency_key} failed to renew: "
-                        f"{resp.failure_reason}"
+                        "Lease %s failed to renew: %s",
+                        self.idempotency_key,
+                        _renew_failure_detail(resp.failure_reason),
                     )
                     break
             except Exception as e:
@@ -110,8 +139,9 @@ class LeaseHeartbeat:
                     )
                     if not resp.renewed:
                         logger.warning(
-                            f"Lease {self.idempotency_key} failed to renew: "
-                            f"{resp.failure_reason}"
+                            "Lease %s failed to renew: %s",
+                            self.idempotency_key,
+                            _renew_failure_detail(resp.failure_reason),
                         )
                         break
                 except Exception as e:
