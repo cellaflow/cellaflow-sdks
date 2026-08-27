@@ -988,3 +988,126 @@ def test_replay_refuses_history_it_cannot_verify(
     assert "sequence 1" in message
     assert "no name" in message
     assert "'anything'" in message, "the error must name the step that was expected"
+
+
+def _refusal(details: str) -> Exception:
+    """A grpc.RpcError carrying FAILED_PRECONDITION, as the engine sends it."""
+    import grpc
+
+    # grpc's stubs give RpcError type Any, so strict mode rejects the subclass.
+    class _Refused(grpc.RpcError):  # type: ignore[misc]
+        def code(self) -> Any:
+            return grpc.StatusCode.FAILED_PRECONDITION
+
+        def details(self) -> str:
+            return details
+
+    return _Refused()
+
+
+def test_step_sends_its_intended_sequence(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """CEL-103: the engine cannot guard a position it was not told about."""
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="s", version="1.0.0", is_recovered=False
+    )
+    mock_stub.CommitStep.return_value = service_pb2.CommitStepResponse(
+        session_id="s", next_sequence=2
+    )
+
+    @step
+    def first(x: int) -> int:
+        return x
+
+    @step
+    def second(x: int) -> int:
+        return x
+
+    @workflow(version="1.0.0")
+    def wf() -> None:
+        first(1)
+        second(2)
+
+    wf()
+
+    sent = [c.args[0].sequence for c in mock_stub.CheckIdempotencyCache.call_args_list]
+    assert sent == [1, 2], (
+        "each step must report the position it intends to write, not a constant; "
+        f"got {sent}"
+    )
+
+
+def test_refused_lease_raises_divergent_step_error(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """CEL-103: a refusal must name the step, not surface as a raw RpcError.
+
+    The refusal arrives *before* the tool body runs -- that is the whole point --
+    so the test also asserts the body never executed.
+    """
+    from cellaflow.decorators import DivergentStepError
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="s", version="1.0.0", is_recovered=False
+    )
+    mock_stub.CheckIdempotencyCache.side_effect = _refusal(
+        "Sequence 1 in session 's' is already committed; the session is at 1."
+    )
+
+    executed: List[str] = []
+
+    @step
+    def issue_refund(amount: int) -> int:
+        executed.append("ran")
+        return amount
+
+    @workflow(version="1.0.0")
+    def wf() -> None:
+        issue_refund(3000)
+
+    with pytest.raises(DivergentStepError) as excinfo:
+        wf()
+
+    message = str(excinfo.value)
+    assert "issue_refund" in message, "the error must name the step that was refused"
+    assert "already committed" in message, "it must carry the engine's explanation"
+    assert (
+        executed == []
+    ), "the refusal must arrive before the side effect; the body must not have run"
+
+
+def test_non_precondition_rpc_errors_are_not_reinterpreted(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """Only FAILED_PRECONDITION means divergence; everything else passes through."""
+    import grpc
+
+    from cellaflow.decorators import DivergentStepError
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="s", version="1.0.0", is_recovered=False
+    )
+
+    class _Unavailable(grpc.RpcError):  # type: ignore[misc]
+        def code(self) -> Any:
+            return grpc.StatusCode.UNAVAILABLE
+
+        def details(self) -> str:
+            return "engine down"
+
+    mock_stub.CheckIdempotencyCache.side_effect = _Unavailable()
+
+    @step
+    def anything() -> int:
+        return 1
+
+    @workflow(version="1.0.0")
+    def wf() -> None:
+        anything()
+
+    with pytest.raises(grpc.RpcError) as excinfo:
+        wf()
+    assert not isinstance(
+        excinfo.value, DivergentStepError
+    ), "a transport failure is not a divergence and must not be relabelled as one"

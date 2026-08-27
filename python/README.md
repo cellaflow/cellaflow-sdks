@@ -307,6 +307,43 @@ A related error, `Cannot verify replay at sequence N: the recorded step has no n
 
 Extending history is fine and is the normal case: a run that matches the recorded prefix and then continues past it executes the new steps and commits them as usual. Only *divergence within* the recorded prefix raises.
 
+#### `DivergentStepError`
+
+Different failure, different cause. This one is about **concurrent replicas**, not replay.
+
+Two replicas of one agent reach the same step with *different* arguments — an LLM computing
+`2499` in one and `3000` in the other. Different arguments hash to different idempotency keys, so
+the engine sees two unrelated operations and neither blocks the other. The only thing they share
+is the graph position they both intend to write.
+
+The engine refuses the second one **before its body runs**:
+
+```
+DivergentStepError: Step 'issue_refund' at sequence 1 was refused: Sequence 1 in
+session 'refund-4417' is already committed; the session is at 1. The lease was
+refused before execution because this position already holds a different step...
+```
+
+Previously both replicas executed and the loser was rejected at commit time — after the money had
+moved, with a generic ordering error that named neither the tool nor the cause.
+
+**The fix belongs in the workflow.** Wrap whatever the replicas disagreed about in its own step,
+so they converge on one value before reaching the step that acts on it:
+
+```python
+@tool
+def decide_amount(ticket_id: str) -> int:
+    return llm.decide(ticket_id)      # nondeterministic, but leased -> one winner
+
+@tool
+def issue_refund(ticket_id: str, amount_cents: int) -> dict:
+    return gateway.charge(...)        # now sees identical arguments in every replica
+```
+
+One replica wins the lease on `decide_amount` and the rest receive its result from cache, so every
+replica calls `issue_refund` with identical arguments and identical keys — and takes the ordinary
+cache-hit path instead of a refusal.
+
 ---
 
 ### 2. Idempotency & Lease Lifecycle
