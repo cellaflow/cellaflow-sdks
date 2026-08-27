@@ -1,15 +1,18 @@
-# One refund, five agents, one charge
+# One refund, many agents, one charge
 
-Five copies of the same agent pick up the same customer refund at the same time. Only one
-charge reaches the payment provider — the other four receive that charge's result.
+Several agents decide the same customer needs refunding, at the same moment. Only one charge
+reaches the payment provider — every other agent receives that charge's result.
 
-## The agents
+Four scenarios, each a different way agents collide:
 
-Five **replicas of one agent**, all working the same session with the same inputs. This is the
-shape you get when you run an agent redundantly for durability, or scale it horizontally and
-more than one worker claims the same job.
+| | Who is racing | What stops the double charge |
+| --- | --- | --- |
+| 1 | Five replicas, no coordination | Nothing. Five charges. |
+| 2 | Five replicas, same session, same inputs | One derived key. One winner, four cache hits. |
+| 3 | Five replicas that **disagree** about the amount | The graph position they all target. Four are refused *before* they charge. |
+| 4 | Five **different** agents in five separate sessions | A coordination domain they each name. |
 
-They run as separate OS processes released simultaneously, so they genuinely race.
+Every agent runs as its own OS process, released simultaneously, so they genuinely race.
 
 ## Run it
 
@@ -21,7 +24,8 @@ docker run -d --name cellaflow-demo \
   ghcr.io/cellaflow/cellaflow:latest
 
 pip install cellaflow
-python run_demo.py
+python run_demo.py                     # scenarios 1 and 2
+python run_demo.py --scenario all      # all four
 ```
 
 ## What you'll see
@@ -78,33 +82,76 @@ handle_refund_request("TICKET-4417", 2499, _session_id="refund-4417")
 `SCOPE_SESSION_WIDE` leaves agent identity out of the derived key, so every replica in the
 session arrives at the same one. The engine grants exactly one of them the right to execute.
 
+### When replicas disagree (scenario 3)
+
+The key above includes a hash of the arguments, so replicas that reason their way to *different*
+amounts derive *different* keys. From the engine's view those are two unrelated operations, and
+nothing about the key makes them contend.
+
+What they still share is the position in the session's graph that each is about to write. The
+engine claims that position when it grants a lease, so the second agent is refused there —
+before its function body runs:
+
+```
+DivergentStepError: Step 'issue_refund' at sequence 1 was refused: Sequence 1 in
+session 'refund-4417' is already claimed by a different step identity ...
+```
+
+The durable fix is in the workflow rather than at the call site: put the value the replicas
+disagree about inside its own `@tool`, and they converge on one amount before reaching the step
+that spends it.
+
+### When the agents are not replicas at all (scenario 4)
+
+Five different agents in five different sessions share no position, so none of that applies.
+`SCOPE_SHARED` derives a key from a domain the caller names instead — dropping both the session
+and the workflow version, since these agents agree on neither:
+
+```python
+@tool(tool_name="issue_refund", scope=IdempotencyScope.SCOPE_SHARED)
+def issue_refund_step(ticket_id: str, amount_cents: int) -> dict: ...
+
+@workflow(version="2.4.1")
+def review_flagged_order(ticket_id: str, amount_cents: int) -> dict:
+    return issue_refund_step(ticket_id, amount_cents)
+
+review_flagged_order("TICKET-4417", 2499, _coordination_id="refund-TICKET-4417")
+```
+
+The domain is required and has no default. A default would make two unrelated callers that
+happen to make the same call deduplicate against each other, suppressing one of them with no
+error anywhere.
+
 ## Options
 
-`--agents N` (default 5) · `--scenario naive|coordinated|both` · `--session-id ID` to resume.
+`--agents N` (default 5) · `--session-id ID` to resume ·
+`--scenario naive|coordinated|both|divergent|heterogeneous|all`.
 Point at a different engine with `CELLAFLOW_TARGET=host:port`.
+
+Scenario 4 defines five distinct agent roles, so `--scenario heterogeneous` accepts at most
+`--agents 5`.
+
+## Two footguns worth knowing
+
+Both scenarios 3 and 4 depend on agents agreeing about things that are easy to get wrong.
+
+**`tool_name` defaults to the function name.** In scenario 4 the five agents are five *different*
+functions, so without pinning `tool_name="issue_refund"` on every one of them they would derive
+five different keys and never converge — five charges, silently. If heterogeneous agents are not
+sharing when you expect them to, check this first.
+
+**Arguments are hashed.** `issue_refund(ticket, 2499)` and `issue_refund(ticket, 2500)` are
+different operations by construction, which is what scenario 3 is about. That is deliberate:
+collapsing them onto one key would hand the loser a confirmation for an amount it never
+requested, which is worse than refusing it.
 
 ## Current scope
 
-This example covers **replicas of a single agent sharing one session** — the shape you get from
-running an agent redundantly, or from horizontal scaling where more than one worker claims the
-same job. That is what `SCOPE_SESSION_WIDE` is for, and it is what the code here demonstrates.
-
-A different shape is coordinating **heterogeneous agents** — a coder, a researcher, and a doc
-writer, each running its own workflow in its own session — around one shared side effect. The
-SDK supports that with `SCOPE_SHARED`, which derives a key from a coordination domain you name
-instead of from the session:
-
-```python
-@tool(tool_name="publish_release_notes", scope=IdempotencyScope.SCOPE_SHARED)
-def publish(version: str) -> dict: ...
-
-coder_agent("v4.2", _coordination_id="release-4.2")
-doc_writer_agent("v4.2", _coordination_id="release-4.2")   # one publish, not two
-```
-
-That is documented in the [SDK README](../../python/README.md#3-coordinating-agents-across-different-sessions).
-This example does not exercise it — every agent here is deliberately a replica of one agent in
-one session, because that keeps the thing being demonstrated to a single variable.
+The shape not covered here is **partial failure across a swarm** — an agent that charges
+successfully and then crashes before its result is durable, or a tool that half-succeeds. The
+engine's lease and fencing machinery is what handles those, and `raw_leases.py` shows the
+primitives at the gRPC level, but this demo deliberately keeps every tool call
+all-or-nothing so the coordination story stays legible.
 
 ## Files
 
