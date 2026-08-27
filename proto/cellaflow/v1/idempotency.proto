@@ -31,6 +31,15 @@ enum RenewFailureReason {
   RENEW_FAILURE_REASON_SUPERSEDED = 2;  // A newer worker acquired a higher fencing token
   RENEW_FAILURE_REASON_NOT_FOUND = 3;   // Key does not exist or was deleted
   RENEW_FAILURE_REASON_COMPLETED = 4;   // Step was already committed by another worker
+
+  // CEL-106: the lease hit its maximum total lifetime and was taken back.
+  //
+  // Deliberately distinct from EXPIRED. Expired means the holder stopped
+  // renewing; this means it kept renewing and the engine reclaimed anyway. The
+  // holder is still running, may already have performed its side effect, and
+  // must be told the engine took the lease rather than that it lost track of
+  // time.
+  RENEW_FAILURE_REASON_MAX_LIFETIME_EXCEEDED = 5;
 }
 
 enum IdempotencyCommitStatus {
