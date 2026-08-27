@@ -131,27 +131,18 @@ Point at a different engine with `CELLAFLOW_TARGET=host:port`.
 Scenario 4 defines five distinct agent roles, so `--scenario heterogeneous` accepts at most
 `--agents 5`.
 
-## Two footguns worth knowing
+## What makes agents converge
 
-Both scenarios 3 and 4 depend on agents agreeing about things that are easy to get wrong.
+Two things decide whether agents share an execution, and both are worth setting deliberately.
 
-**`tool_name` defaults to the function name.** In scenario 4 the five agents are five *different*
-functions, so without pinning `tool_name="issue_refund"` on every one of them they would derive
-five different keys and never converge — five charges, silently. If heterogeneous agents are not
-sharing when you expect them to, check this first.
+**Pin `tool_name`.** It defaults to the function name, so the five agents in scenario 4 — five
+different functions — each derive their own key unless you set `tool_name="issue_refund"` on all
+of them. Pinning it is what makes heterogeneous agents converge, and it is the first thing to
+check if they are not.
 
-**Arguments are hashed.** `issue_refund(ticket, 2499)` and `issue_refund(ticket, 2500)` are
-different operations by construction, which is what scenario 3 is about. That is deliberate:
-collapsing them onto one key would hand the loser a confirmation for an amount it never
-requested, which is worse than refusing it.
-
-## Current scope
-
-The shape not covered here is **partial failure across a swarm** — an agent that charges
-successfully and then crashes before its result is durable, or a tool that half-succeeds. The
-engine's lease and fencing machinery is what handles those, and `raw_leases.py` shows the
-primitives at the gRPC level, but this demo deliberately keeps every tool call
-all-or-nothing so the coordination story stays legible.
+**Arguments are part of the identity.** `issue_refund(ticket, 2499)` and
+`issue_refund(ticket, 2500)` are different operations by construction — that is what scenario 3
+turns on. It means an agent always receives a result for the arguments it actually asked for.
 
 ## Files
 
