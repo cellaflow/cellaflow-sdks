@@ -1,0 +1,114 @@
+# Changelog
+
+All notable changes to the CellaFlow Python SDK.
+
+## 0.3.0
+
+The first release since `0.2.1`, covering six tickets. Two of them change behaviour you may
+currently be relying on — read **Behaviour changes** before upgrading.
+
+### Added
+
+**`IdempotencyScope.SCOPE_SHARED` — deduplicate across sessions.** The four existing scopes all
+narrow the derived key from the session default, so every agent sharing a result had to be in the
+same session. `SCOPE_SHARED` is the first that widens past it: agents running *different*
+workflows, on *different* versions, in *different* sessions converge on one execution.
+
+```python
+@tool(tool_name="issue_refund", scope=IdempotencyScope.SCOPE_SHARED)
+def issue_refund(ticket_id: str, amount_cents: int) -> dict: ...
+
+support_agent("T-4417", 2499, _coordination_id="refund-T-4417")
+fraud_detector("T-4417", 2499, _coordination_id="refund-T-4417")   # one refund, not two
+```
+
+`_coordination_id` names the work being shared — a ticket, a release, a tenant — and is passed at
+the call site because it belongs to the collaboration rather than to the tool. It is **required**
+for `SCOPE_SHARED` and has no default; a default would silently deduplicate unrelated callers that
+happen to make the same call, suppressing one of them with no error anywhere.
+
+Three things must match for two agents to converge, and one is a footgun: **`tool_name` defaults
+to the function name.** Agents whose functions are named differently must pin it to the same
+explicit value or they will never share. The other two are the coordination id and the arguments.
+
+### Behaviour changes
+
+Both are fixes for silent-wrong-answer bugs. Both convert silence into an exception, so code that
+appeared to work may now raise — which is the point.
+
+**Replayed steps are verified before being returned.** Replay was positional: the step at sequence
+*N* was answered from whatever was committed at sequence *N*, with no check that it was the same
+step. A resumed run that took a different branch silently received a foreign step's result. The
+SDK now compares step names and raises `NondeterministicWorkflowError` on a mismatch.
+
+If you see this, it is a bug in your workflow, not the engine: a resumed run took a different path
+from the one it is recovering, almost always by branching on a value computed outside a step. Move
+whatever the branch tests inside a `@step` so its result is replayed too.
+
+Known limitation, stated plainly: the check compares step *names*, so it catches a changed shape
+of execution — a skipped branch, a reordering, an extra step — but not the same step replayed with
+different arguments.
+
+**Divergent replicas are refused before they execute.** When several replicas of one agent reason
+their way to *different* arguments for the same step, they derive different idempotency keys, so
+nothing about the operation makes them contend. Previously all of them executed and the losers
+were rejected at commit — after the side effect. The SDK now tells the engine which graph position
+it intends to write, and a replica whose position is taken raises `DivergentStepError` **before**
+its function body runs.
+
+The durable fix is in the workflow rather than at the call site: wrap the value the replicas
+disagree about in its own leased step, and they converge on it before reaching the step that acts
+on it.
+
+```python
+@tool
+def decide_amount(ticket_id: str) -> int:
+    return llm.decide(ticket_id)       # nondeterministic, but leased -> one winner
+
+@tool
+def issue_refund(ticket_id: str, amount_cents: int) -> dict:
+    return gateway.charge(...)         # every replica now sees identical arguments
+```
+
+### Fixed
+
+**A cache hit no longer desynchronises the caller's sequence.** A caller taking a cache hit returns
+without committing, so its local counter advanced while the session's did not, and its *next*
+commit failed the ordering check — reporting a sequence mismatch one step after the real cause.
+The SDK now adopts the position the engine reports on the response.
+
+**Concurrent LangGraph savers on one thread no longer collide.** Each `CellaflowSaver` kept a
+process-local sequence counter, so concurrent replicas on one `thread_id` all attempted the same
+sequence and all but one took `FAILED_PRECONDITION`. Commits now retry against a refreshed
+sequence. Measured: 1-of-8 succeeding became 100-of-100.
+
+**Lease renewal failures explain themselves.** The heartbeat logged a bare enum ordinal at the one
+moment it matters — the step is still running and is about to attempt a commit that will be
+rejected. Each reason now says what happened and what to do about it.
+
+### Compatibility
+
+- **Requires no engine upgrade.** The new request fields are optional; an older engine ignores them
+  and behaves exactly as before. Verified against the previously published image.
+- **`DivergentStepError` only fires against an engine that arbitrates graph positions.** Against an
+  older engine the call succeeds and the divergence is caught at commit, as it was before.
+- **Not a breaking API change**, with one exception: `derive_idempotency_key` gained a required
+  positional `coordination_id` before `*args`. It is not exported from the `cellaflow` package
+  namespace and is not intended as public API, but code importing it directly from
+  `cellaflow.idempotency` must add the argument.
+
+### Known issue
+
+`CellaflowSaver` **loses updates under concurrent read-modify-write.** N agents each reading a
+value, incrementing it and writing it back end at 2 rather than N — measured at 98 lost of 100,
+with **zero errors**: every write succeeds and is correctly ordered. Ordering writes is not the
+same as preventing lost updates, and the checkpointer does not use the lease layer that provides
+that guarantee.
+
+The decorator path is unaffected — `@tool` with an idempotency lease deduplicates correctly. If
+several agents must update shared state concurrently, use a leased `@tool` rather than relying on
+the checkpointer. Tracked as CEL-97.
+
+## 0.2.1 and earlier
+
+Not recorded here. See the git history.
