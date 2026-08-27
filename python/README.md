@@ -16,6 +16,7 @@ The official Python SDK for the [CellaFlow Engine](https://www.cellaflow.com) �
 - ⚡ **Zero-Friction Decorators**: Annotate standard Python functions with `@workflow`, `@step`, and `@tool` (supporting both `def` and `async def`).
 - 🧠 **LangGraph Drop-in Checkpointer**: Native `CellaflowSaver` checkpointer for LangGraph workflows with immutable MessagePack state snapshots, time-travel, and crash recovery.
 - 🛡️ **Deterministic Idempotency**: Automatic input hashing via RFC 8785 Canonical JSON and SHA-256 guarantees cross-language determinism across multi-agent swarms.
+- 🤝 **Cross-Session Coordination**: `SCOPE_SHARED` lets heterogeneous agents — different workflows, different sessions, different versions — converge on a single execution of a shared side effect.
 - 🔒 **Background Lease Management**: Non-blocking heartbeat management keeps engine locks alive and eliminates split-brain execution using fencing tokens.
 - 📦 **Secure Serialization**: Strictly uses MessagePack for all state payloads to optimize throughput over gRPC and eliminate Remote Code Execution (RCE) deserialization vectors.
 
@@ -107,7 +108,67 @@ if __name__ == "__main__":
 
 ---
 
-### 3. Transparent Replay & Session Recovery
+### 3. Coordinating Agents Across Different Sessions
+
+The scopes above deduplicate *within* one session. `SCOPE_SHARED` deduplicates *across* them: several
+agents, each running its own workflow in its own session, converge on one execution of a shared
+operation.
+
+```python
+from cellaflow import workflow, tool, IdempotencyScope
+
+# Same tool_name, same arguments, same coordination_id -> same key.
+@tool(tool_name="publish_release_notes", scope=IdempotencyScope.SCOPE_SHARED)
+def publish(version: str) -> dict:
+    return notes_service.publish(version)   # runs exactly once
+
+@workflow(version="1.0.0")
+def coder_agent(version: str) -> dict:
+    return publish(version)
+
+@workflow(version="2.3.0")          # a different workflow, on a different version
+def doc_writer_agent(version: str) -> dict:
+    return publish(version)
+
+# Different sessions, different workflows -- one publish.
+coder_agent("v4.2", _coordination_id="release-4.2")
+doc_writer_agent("v4.2", _coordination_id="release-4.2")
+```
+
+`_coordination_id` names **the work being shared** — a release, a ticket, a task, a tenant — and is
+passed at the call site alongside `_session_id`, because it is a property of the collaboration and
+not of the tool definition.
+
+It is **required** for `SCOPE_SHARED` and has no default; omitting it raises `ValueError`. A default
+would silently deduplicate unrelated callers that happen to make the same call — one agent's
+operation is suppressed and it is handed a result it never asked for, with no error raised anywhere.
+Making the domain explicit forces that boundary to be a decision rather than an accident. The other
+scopes ignore `_coordination_id` if it is passed.
+
+**Three things must match for two agents to converge.** All of them are under your control, and any
+one of them being different means both agents execute:
+
+| Must match | Note |
+| --- | --- |
+| `coordination_id` | Different domains stay isolated. This is what keeps the scope from being too wide. |
+| `tool_name` | Defaults to the *function name*. Agents whose functions are named differently must set `tool_name=` explicitly to the same value. |
+| Arguments | Hashed with RFC 8785 + SHA-256, so `publish("v4.2")` and `publish("V4.2")` are different operations. |
+
+The derived key drops both `session_id` and `workflow_version`:
+
+```
+shared:[coordination_id]:[tool_name]:[RFC8785_SHA256(args)]
+```
+
+Dropping the version is deliberate — heterogeneous agents will not be on the same workflow version,
+and requiring them to be would defeat the purpose. The consequence is that **changing a shared tool's
+behaviour without changing its name or arguments will not produce a new key**, so an agent on the new
+version can receive a result produced by the old one. Encode the behaviour change in the arguments,
+or in `tool_name`, when that matters.
+
+---
+
+### 4. Transparent Replay & Session Recovery
 
 To recover an interrupted execution after a process crash or restart, supply the `_session_id` keyword argument:
 
@@ -124,7 +185,7 @@ recovered_result = research_workflow(
 
 ---
 
-### 4. LangGraph Checkpointer (`CellaflowSaver`)
+### 5. LangGraph Checkpointer (`CellaflowSaver`)
 
 Use `CellaflowSaver` as a drop-in checkpointer for any LangGraph `StateGraph`:
 
@@ -284,6 +345,7 @@ Marks the entry point for a durable workflow execution:
 - **Automatic Client Management**: Transparently initializes the underlying gRPC client and session state.
 - **Context Isolation**: Uses Python's `contextvars` to manage session context safely across async event loops and threads.
 - **Replay State Loader**: Loads completed step history from the engine whenever `_session_id` is supplied.
+- **Call-time keyword arguments**: `_session_id` resumes an existing session; `_coordination_id` names the coordination domain for `SCOPE_SHARED` steps. Both are popped before your function is called.
 
 ### `@step` and `@tool`
 Decorators for atomic units of execution within a workflow:
@@ -297,6 +359,8 @@ Decorators for atomic units of execution within a workflow:
 ```
 - **Idempotency Key Derivation**: Automatically builds a deterministic key using:
   `[Session_ID]:[Workflow_Version]:[Step_Sequence]:[Agent_ID]:[Tool_Name]:[RFC8785_SHA256_Hash]`
+  — except under `SCOPE_SHARED`, which drops the session and version entirely:
+  `shared:[Coordination_ID]:[Tool_Name]:[RFC8785_SHA256_Hash]`
 - **Replay Interception**: If a step was already completed in the session history, immediately returns the cached output without re-running the function body.
 - **Lease Heartbeating**: Automatically runs background heartbeats (`RenewLease`) via daemon threads (sync) or asyncio tasks (async) to keep engine locks refreshed.
 - **Lock Release on Failure**: If an unhandled exception occurs, automatically releases the lease with `reason="TOOL_ERROR"`.
@@ -306,6 +370,10 @@ Controls how cached step and tool results are shared across multi-agent sessions
 - `IdempotencyScope.SCOPE_SESSION_WIDE` *(Default)*: Cached results are shared across all agents in the session.
 - `IdempotencyScope.SCOPE_AGENT_PRIVATE`: Isolates cache hits to the executing `agent_id`.
 - `IdempotencyScope.SCOPE_STEP_LOCAL`: Strictly isolates cache hits to the current superstep sequence and `agent_id`.
+- `IdempotencyScope.SCOPE_SHARED`: Shares one execution across **different sessions** within a declared coordination domain. Requires `_coordination_id` at the call site — see [Coordinating Agents Across Different Sessions](#3-coordinating-agents-across-different-sessions).
+
+The first three narrow the key from the session default; `SCOPE_SHARED` is the only one that widens
+past the session, which is why it is the only one that demands an explicit domain.
 
 ---
 
