@@ -108,6 +108,7 @@ class CellaflowClient:
         wait_timeout_ms: Optional[int] = None,
         lease_ttl_ms: Optional[int] = None,
         session_id: Optional[str] = None,
+        sequence: Optional[int] = None,
     ) -> idempotency_pb2.CheckCacheResponse:
         """Arbitrates the lease for `idempotency_key`.
 
@@ -115,6 +116,13 @@ class CellaflowClient:
         position, returned as `current_sequence` on every status. The idempotency
         key is opaque to the engine, so the session cannot be inferred from it —
         without this the engine has nothing to answer from. See CEL-98.
+
+        Supplying `sequence` — the position this caller intends to write to —
+        additionally lets the engine refuse a lease that would authorise a side
+        effect at an already-committed position, instead of rejecting the commit
+        afterwards once the side effect has happened. Raises `FAILED_PRECONDITION`
+        when refused. Both fields are optional on the wire; omitting `sequence`
+        keeps the older, unguarded behaviour. See CEL-103.
         """
         req = idempotency_pb2.CheckCacheRequest(
             agent_id=agent_id,
@@ -126,6 +134,8 @@ class CellaflowClient:
             req.lease_ttl_ms = lease_ttl_ms
         if session_id is not None:
             req.session_id = session_id
+        if sequence is not None:
+            req.sequence = sequence
 
         return cast(
             idempotency_pb2.CheckCacheResponse,

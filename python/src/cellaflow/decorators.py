@@ -6,6 +6,8 @@ import time
 import logging
 from typing import Any, Callable, TypeVar, cast, Optional
 
+import grpc
+
 from cellaflow.client import CellaflowClient
 from cellaflow.context import WorkflowContext, set_context, reset_context, get_context
 from cellaflow.idempotency import derive_idempotency_key, IdempotencyScope
@@ -111,6 +113,25 @@ def workflow(
         return cast(F, sync_wrapper)
 
     return decorator
+
+
+class DivergentStepError(RuntimeError):
+    """Raised when the engine refuses a lease because the position is committed.
+
+    Two replicas of one agent reached the same step with *different* arguments.
+    Different arguments hash to different idempotency keys, so from the engine's
+    view these are unrelated operations and neither blocks the other — the
+    divergence is only detectable against the graph position they both target.
+
+    The first replica committed there. This one is refused *before* running its
+    tool body, which is the whole point: previously both executed and the loser
+    was only rejected at commit time, after the irreversible action had already
+    happened.
+
+    The fix is in the workflow, not the call: whatever the replicas disagreed
+    about must itself be a leased step, so they converge on one value before
+    reaching the step that acts on it. See CEL-103.
+    """
 
 
 class NondeterministicWorkflowError(RuntimeError):
@@ -247,11 +268,23 @@ def step(
         hb: Optional[LeaseHeartbeat] = None
 
         while True:
-            resp = ctx.client.check_idempotency_cache(
-                agent_id=agent_id,
-                idempotency_key=ikey,
-                session_id=ctx.session_id,
-            )
+            try:
+                resp = ctx.client.check_idempotency_cache(
+                    agent_id=agent_id,
+                    idempotency_key=ikey,
+                    session_id=ctx.session_id,
+                    # CEL-103: tell the engine where this call intends to write,
+                    # so a lease at an already-committed position is refused
+                    # before the tool body runs rather than after.
+                    sequence=seq,
+                )
+            except grpc.RpcError as exc:
+                if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
+                    raise DivergentStepError(
+                        f"Step '{actual_tool_name}' at sequence {seq} was refused: "
+                        f"{exc.details()}"
+                    ) from exc
+                raise
             if resp.status == CACHE_STATUS_HIT:
                 # CEL-98: this path returns without committing, so record where
                 # the engine says the session sits. The next step adopts it.
@@ -343,11 +376,23 @@ def step(
         hb: Optional[LeaseHeartbeat] = None
 
         while True:
-            resp = ctx.client.check_idempotency_cache(
-                agent_id=agent_id,
-                idempotency_key=ikey,
-                session_id=ctx.session_id,
-            )
+            try:
+                resp = ctx.client.check_idempotency_cache(
+                    agent_id=agent_id,
+                    idempotency_key=ikey,
+                    session_id=ctx.session_id,
+                    # CEL-103: tell the engine where this call intends to write,
+                    # so a lease at an already-committed position is refused
+                    # before the tool body runs rather than after.
+                    sequence=seq,
+                )
+            except grpc.RpcError as exc:
+                if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
+                    raise DivergentStepError(
+                        f"Step '{actual_tool_name}' at sequence {seq} was refused: "
+                        f"{exc.details()}"
+                    ) from exc
+                raise
             if resp.status == CACHE_STATUS_HIT:
                 # CEL-98: this path returns without committing, so record where
                 # the engine says the session sits. The next step adopts it.

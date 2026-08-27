@@ -60,6 +60,24 @@ message CheckCacheRequest {
   // Optional for wire compatibility: clients predating this field still work,
   // they simply receive no `current_sequence` back.
   optional string session_id = 5;
+
+  // CEL-103: the graph position this caller intends to write to.
+  //
+  // The engine already knows which session is asking (field 5) and where that
+  // session has committed to (`latest_committed_sequence`). This supplies the
+  // one missing input: where the caller is going. With all three, a lease that
+  // would authorise a side effect at an already-committed position can be
+  // refused *before* the side effect happens, rather than rejected at commit
+  // time after the money has moved.
+  //
+  // Note this is the caller's *intended* position, not the response's
+  // `current_sequence`, which reports where the session already sits.
+  //
+  // Optional for wire compatibility: clients that omit it keep the previous
+  // behaviour and are still granted leases. Sending 0 is an error rather than
+  // a synonym for "unset" -- sequences are 1-based, so 0 is never a position a
+  // caller could legitimately intend to write.
+  optional uint64 sequence = 6;
 }
 
 message CheckCacheResponse {
