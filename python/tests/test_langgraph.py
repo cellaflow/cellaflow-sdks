@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, cast
 from unittest.mock import MagicMock, patch
+import grpc
 import pytest
 
 from cellaflow import CellaflowSaver
@@ -20,12 +21,42 @@ class WorkflowState:
     path: List[str] = field(default_factory=list)
 
 
+# grpc's stubs give RpcError type Any, so strict mode rejects the subclass.
+class _FailedPrecondition(grpc.RpcError):  # type: ignore[misc]
+    """What the engine returns when a commit is out of sequence order."""
+
+    def __init__(self, details: str) -> None:
+        self._details = details
+
+    def code(self) -> Any:
+        return grpc.StatusCode.FAILED_PRECONDITION
+
+    def details(self) -> str:
+        return self._details
+
+
 class MockCellaflowClient:
-    """In-memory mock of CellaflowClient mimicking engine gRPC behavior."""
+    """In-memory mock of CellaflowClient mimicking engine gRPC behavior.
+
+    Two behaviours here are load-bearing and were absent originally, which is
+    why CEL-108 shipped: this double was *more capable* than the engine, so the
+    suite passed against limits the real backend enforces.
+
+    - ``get_graph`` pages. The engine returns at most ``limit`` events (default
+      100, capped at 1000), oldest first, plus a cursor for the rest.
+    - ``commit_step`` enforces ``sequence == current + 1`` and raises
+      FAILED_PRECONDITION otherwise, as the session actor does.
+    """
+
+    #: Matches the engine's default page size (main.rs, GetGraph).
+    DEFAULT_PAGE = 100
+    MAX_PAGE = 1000
 
     def __init__(self) -> None:
         self.sessions: Dict[str, Dict[str, str]] = {}
         self.graphs: Dict[str, List[Dict[str, Any]]] = {}
+        #: Every get_graph call, as (limit, cursor) — lets tests assert on paging.
+        self.graph_calls: List[Tuple[Optional[int], Optional[str]]] = []
 
     def start_session(
         self, workflow_id: str, version: str, session_id: Optional[str] = None
@@ -57,7 +88,17 @@ class MockCellaflowClient:
         packed = serialize(output_payload)
         unpacked = deserialize(packed)
 
-        self.graphs[session_id].append(
+        # The engine's actor rejects anything that is not exactly the next
+        # position, so a double that accepts any sequence hides sequence bugs.
+        existing = self.graphs.setdefault(session_id, [])
+        expected = (max(s["sequence"] for s in existing) + 1) if existing else 1
+        if sequence != expected:
+            raise _FailedPrecondition(
+                f"Sequence mismatch: expected sequence {expected}, "
+                f"but request specified {sequence}"
+            )
+
+        existing.append(
             {
                 "sequence": sequence,
                 "name": name,
@@ -74,8 +115,24 @@ class MockCellaflowClient:
     def get_graph(
         self, session_id: str, limit: Optional[int] = None, cursor: Optional[str] = None
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-        steps = self.graphs.get(session_id, [])
-        return list(steps), None
+        self.graph_calls.append((limit, cursor))
+
+        page = (
+            self.DEFAULT_PAGE if not limit or limit <= 0 else min(limit, self.MAX_PAGE)
+        )
+        start = int(cursor) if cursor else 1
+
+        # Oldest first from `start`, exactly like the engine's forward seek over
+        # the zero-padded event keyspace.
+        ordered = sorted(self.graphs.get(session_id, []), key=lambda s: s["sequence"])
+        remaining = [s for s in ordered if s["sequence"] >= start]
+
+        steps = remaining[:page]
+        # The cursor is the sequence of the first unread record, inclusive.
+        next_cursor = (
+            str(remaining[page]["sequence"]) if len(remaining) > page else None
+        )
+        return list(steps), next_cursor
 
 
 def test_init_default_client() -> None:
@@ -631,3 +688,91 @@ def test_import_without_langgraph_dependency() -> None:
                 del sys.modules[k]
         if "cellaflow.langgraph" in sys.modules:
             importlib.reload(sys.modules["cellaflow.langgraph"])
+
+
+# ---------------------------------------------------------------------------
+# CEL-108: a thread longer than one page of engine history
+# ---------------------------------------------------------------------------
+#
+# The engine returns at most 100 events per GetGraph, oldest first, with a
+# cursor for the rest. A saver that ignores the cursor sees only the beginning
+# of a long thread, and is wrong about it in two separate ways.
+
+
+def _long_thread(saver: CellaflowSaver, thread: str, n: int) -> None:
+    """Writes `n` checkpoints to `thread` through one live saver."""
+    parent = None
+    for i in range(1, n + 1):
+        cfg: RunnableConfig = {
+            "configurable": {"thread_id": thread, "checkpoint_ns": ""}
+        }
+        if parent:
+            cfg["configurable"]["checkpoint_id"] = parent
+        ckpt = cast(
+            Checkpoint,
+            {
+                "v": 1,
+                "id": f"ckpt-{i:04d}",
+                "ts": f"2026-08-28T00:00:{i % 60:02d}Z",
+                "channel_values": {"n": i},
+                "channel_versions": {"n": f"{i:032}.aaaaaaaa"},
+                "versions_seen": {},
+            },
+        )
+        saver.put(cfg, ckpt, CheckpointMetadata(), {"n": f"{i:032}.aaaaaaaa"})
+        parent = f"ckpt-{i:04d}"
+
+
+def test_reads_the_newest_checkpoint_past_one_page() -> None:
+    """A reader must see the end of the thread, not the end of the first page."""
+    client = MockCellaflowClient()
+    thread = "long-thread"
+    _long_thread(CellaflowSaver(client=cast(CellaflowClient, client)), thread, 130)
+
+    # A fresh saver has no local cache and must rebuild purely from the engine.
+    reader = CellaflowSaver(client=cast(CellaflowClient, client))
+    tup = reader.get_tuple({"configurable": {"thread_id": thread}})
+
+    assert tup is not None, "the thread has 130 checkpoints, so this cannot be empty"
+    assert tup.checkpoint["id"] == "ckpt-0130", (
+        "resumed from a stale checkpoint: only the first page of history was read, "
+        "so LangGraph would re-execute every superstep after it"
+    )
+
+
+def test_a_new_saver_can_write_to_a_long_thread() -> None:
+    """The severe half: a restart or a second replica must still be able to commit.
+
+    A fresh saver seeds its sequence from the engine. Reading only the first page
+    makes it propose a position that is long gone, and no amount of retrying can
+    resolve that because every refresh re-reads the same page.
+    """
+    client = MockCellaflowClient()
+    thread = "restartable"
+    _long_thread(CellaflowSaver(client=cast(CellaflowClient, client)), thread, 130)
+
+    successor = CellaflowSaver(client=cast(CellaflowClient, client))
+    cfg: RunnableConfig = {
+        "configurable": {
+            "thread_id": thread,
+            "checkpoint_ns": "",
+            "checkpoint_id": "ckpt-0130",
+        }
+    }
+    ckpt = cast(
+        Checkpoint,
+        {
+            "v": 1,
+            "id": "ckpt-0131",
+            "ts": "2026-08-28T00:01:00Z",
+            "channel_values": {"n": 131},
+            "channel_versions": {"n": f"{131:032}.aaaaaaaa"},
+            "versions_seen": {},
+        },
+    )
+
+    successor.put(cfg, ckpt, CheckpointMetadata(), {"n": f"{131:032}.aaaaaaaa"})
+
+    assert (
+        max(s["sequence"] for s in client.graphs[thread]) > 130
+    ), "a saver that did not build the thread could not append to it"
