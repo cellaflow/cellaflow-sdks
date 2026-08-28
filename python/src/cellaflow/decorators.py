@@ -33,7 +33,7 @@ def workflow(
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
             # Pop _session_id if provided for recovery, else generate new
             session_id = kwargs.pop("_session_id", str(uuid.uuid4()))
-            # CEL-99: identifies the shared work, not the session. Agents in
+            # Identifies the shared work, not the session. Agents in
             # different sessions pass the same value to converge on one key.
             coordination_id = kwargs.pop("_coordination_id", None)
 
@@ -46,7 +46,7 @@ def workflow(
             if resp.is_recovered:
                 steps, _ = client.get_graph(resp.session_id)
                 for step_info in steps:
-                    # CEL-102: keep the name, not just the payload. Replay is
+                    # Keep the name, not just the payload. Replay is
                     # keyed on position, and without the name there is no way to
                     # tell a legitimate replay from a different step landing on
                     # the same index.
@@ -72,7 +72,7 @@ def workflow(
         @functools.wraps(func)
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
             session_id = kwargs.pop("_session_id", str(uuid.uuid4()))
-            # CEL-99: identifies the shared work, not the session. Agents in
+            # Identifies the shared work, not the session. Agents in
             # different sessions pass the same value to converge on one key.
             coordination_id = kwargs.pop("_coordination_id", None)
 
@@ -85,7 +85,7 @@ def workflow(
             if resp.is_recovered:
                 steps, _ = client.get_graph(resp.session_id)
                 for step_info in steps:
-                    # CEL-102: keep the name, not just the payload. Replay is
+                    # Keep the name, not just the payload. Replay is
                     # keyed on position, and without the name there is no way to
                     # tell a legitimate replay from a different step landing on
                     # the same index.
@@ -124,13 +124,13 @@ class DivergentStepError(RuntimeError):
     divergence is only detectable against the graph position they both target.
 
     The first replica committed there. This one is refused *before* running its
-    tool body, which is the whole point: previously both executed and the loser
+    tool body, so only one replica reaches the side effect.
     was only rejected at commit time, after the irreversible action had already
     happened.
 
     The fix is in the workflow, not the call: whatever the replicas disagreed
     about must itself be a leased step, so they converge on one value before
-    reaching the step that acts on it. See CEL-103.
+    reaching the step that acts on it.
     """
 
 
@@ -151,47 +151,21 @@ class NondeterministicWorkflowError(RuntimeError):
 def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
     """Returns the recorded result at `seq`, or raises if it is a different step.
 
-    CEL-102: before this check the SDK matched on position alone, so a resumed
-    run that took a different branch silently received a foreign step's output.
-    The engine has never allowed this — CEL-71 added a content hash so a
-    different step at a consumed sequence is rejected rather than answered — but
-    the SDK's replay path predated that discipline.
+    Replay is positional, so the step recorded at a sequence is only the right
+    answer if the resumed run reached that sequence by the same path. Matching on
+    the step name establishes that before the recorded result is returned.
 
-    A record whose name is empty is treated as unverifiable and rejected, not
-    replayed — see the comment on that branch for why no legitimate history
-    reaches it.
-
-    Matching is by step name. Two stronger options are unavailable rather than
-    rejected:
-
-    - The engine's `content_identity` covers the output payload, which is the
-      step's *result* and therefore unknown before it runs. It cannot be
-      computed at replay time by construction.
-    - The derived idempotency key would additionally catch same-name-different-
-      arguments, and `get_graph` appears to return it. But `commit_step` only
-      populates the *request-level* `idempotency_key`, never
-      `StepResult.idempotency_key`, so the recorded value is always absent and
-      the comparison would silently pass. Worth revisiting once CEL-84 settles
-      which field is authoritative.
+    A record whose name is empty is treated as unverifiable and rejected rather
+    than replayed.
     """
     recorded = ctx.replayed_steps[seq]
     recorded_name = recorded.get("name")
 
-    # Fail closed on an unverifiable record. An earlier version of this check
-    # skipped the comparison when the name was empty, justified as tolerating
-    # history from before names were retained. That history does not exist:
-    # `commit_step` has set `name` and `get_graph` has returned it since the
-    # first commit of client.py, `@step` falls back to `func.__name__` so the
-    # name can never be empty, the LangGraph saver builds it from an f-string,
-    # and engine-generated TimerFired events carry their own. What CEL-102
-    # describes as discarded was the SDK's in-memory index, not the engine's
-    # record.
-    #
-    # Skipping the check therefore protected nothing, while reverting to exactly
-    # the positional replay this exists to prevent — silently — whenever a name
-    # arrived empty for any *other* reason. That is the failure the ticket calls
-    # the worst of the family, reintroduced through the escape hatch meant to be
-    # harmless.
+    # Fail closed on an unverifiable record. Every step this SDK commits carries a
+    # name -- `@step` falls back to `func.__name__`, the LangGraph saver builds
+    # one, and engine-generated timer events carry their own -- so an empty name
+    # means the record cannot be checked, not that checking is unnecessary.
+    # Replaying it would be positional replay, which is what this guards against.
     if not recorded_name:
         raise NondeterministicWorkflowError(
             f"Cannot verify replay at sequence {seq}: the recorded step has no "
@@ -237,7 +211,7 @@ def step(
     @functools.wraps(func)
     async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
         ctx = get_context()
-        # CEL-98: a previous cache hit may have left this counter ahead of the
+        # A cache hit may have left this counter ahead of the
         # engine's. Adopt the position it reported before claiming the next
         # sequence, or this commit fails the ordering check and names the wrong
         # step. Deferred to here rather than done on the hit itself so a workflow
@@ -273,7 +247,7 @@ def step(
                     agent_id=agent_id,
                     idempotency_key=ikey,
                     session_id=ctx.session_id,
-                    # CEL-103: tell the engine where this call intends to write,
+                    # Tell the engine where this call intends to write,
                     # so a lease at an already-committed position is refused
                     # before the tool body runs rather than after.
                     sequence=seq,
@@ -286,7 +260,7 @@ def step(
                     ) from exc
                 raise
             if resp.status == CACHE_STATUS_HIT:
-                # CEL-98: this path returns without committing, so record where
+                # This path returns without committing, so record where
                 # the engine says the session sits. The next step adopts it.
                 if resp.HasField("current_sequence"):
                     ctx.record_engine_sequence(resp.current_sequence)
@@ -345,7 +319,7 @@ def step(
     @functools.wraps(func)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
         ctx = get_context()
-        # CEL-98: a previous cache hit may have left this counter ahead of the
+        # A cache hit may have left this counter ahead of the
         # engine's. Adopt the position it reported before claiming the next
         # sequence, or this commit fails the ordering check and names the wrong
         # step. Deferred to here rather than done on the hit itself so a workflow
@@ -381,7 +355,7 @@ def step(
                     agent_id=agent_id,
                     idempotency_key=ikey,
                     session_id=ctx.session_id,
-                    # CEL-103: tell the engine where this call intends to write,
+                    # Tell the engine where this call intends to write,
                     # so a lease at an already-committed position is refused
                     # before the tool body runs rather than after.
                     sequence=seq,
@@ -394,7 +368,7 @@ def step(
                     ) from exc
                 raise
             if resp.status == CACHE_STATUS_HIT:
-                # CEL-98: this path returns without committing, so record where
+                # This path returns without committing, so record where
                 # the engine says the session sits. The next step adopts it.
                 if resp.HasField("current_sequence"):
                     ctx.record_engine_sequence(resp.current_sequence)

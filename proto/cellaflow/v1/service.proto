@@ -25,7 +25,7 @@ service WorkflowEngineService {
   // on large graph histories.
   rpc GetGraph(GetGraphRequest) returns (GetGraphResponse);
 
-  // Idempotency cache RPCs (CEL-30)
+  // Idempotency cache RPCs
   rpc CheckIdempotencyCache(CheckCacheRequest) returns (CheckCacheResponse);
   rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
   rpc ReleaseLease(ReleaseLeaseRequest) returns (ReleaseLeaseResponse);
@@ -48,7 +48,7 @@ message CommitStepRequest {
   string session_id = 1;
   StepResult step_result = 2;
 
-  // Idempotency lease validation fields (CEL-30)
+  // Idempotency lease validation fields
   optional string idempotency_key = 10;
   optional uint64 idempotency_fencing_token = 11; // Required whenever idempotency_key is set
 }

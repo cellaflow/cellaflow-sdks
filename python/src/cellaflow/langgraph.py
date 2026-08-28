@@ -41,7 +41,7 @@ from cellaflow.v1 import common_pb2
 
 logger = logging.getLogger(__name__)
 
-# CEL-97: how many times a checkpoint commit re-derives its sequence and retries
+# How many times a checkpoint commit re-derives its sequence and retries
 # before giving up.
 #
 # Appending to a strictly-sequenced log from N concurrent writers is inherently
@@ -257,7 +257,7 @@ class CellaflowSaver(_BaseSaver):
     def _refresh_sequence(self, session_id: str) -> int:
         """Re-reads the session's true position from the engine.
 
-        CEL-97: `_next_sequence` is process-local. Concurrent savers on one
+        `_next_sequence` is process-local. Concurrent savers on one
         thread each seed it from the same history and then increment
         independently, so they all propose the same sequence and the engine
         accepts exactly one. Re-reading is how a loser finds out where the log
@@ -277,7 +277,7 @@ class CellaflowSaver(_BaseSaver):
     ) -> int:
         """Commits, re-deriving the sequence and retrying on an ordering conflict.
 
-        CEL-97: concurrent writers on one thread are *not* duplicates. Eight
+        Concurrent writers on one thread are *not* duplicates. Eight
         savers writing eight different checkpoints should produce eight events
         at successive positions -- they are appending to a shared log, not
         contending over one operation. So deduplication is the wrong tool and no
