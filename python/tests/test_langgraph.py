@@ -22,17 +22,23 @@ class WorkflowState:
 
 
 # grpc's stubs give RpcError type Any, so strict mode rejects the subclass.
-class _FailedPrecondition(grpc.RpcError):  # type: ignore[misc]
-    """What the engine returns when a commit is out of sequence order."""
+class _RpcFailure(grpc.RpcError):  # type: ignore[misc]
+    """A gRPC failure with a chosen status code, as the engine would raise it."""
 
-    def __init__(self, details: str) -> None:
+    def __init__(self, code: Any, details: str) -> None:
+        self._code = code
         self._details = details
 
     def code(self) -> Any:
-        return grpc.StatusCode.FAILED_PRECONDITION
+        return self._code
 
     def details(self) -> str:
         return self._details
+
+
+def _FailedPrecondition(details: str) -> _RpcFailure:
+    """What the engine returns when a commit is out of sequence order."""
+    return _RpcFailure(grpc.StatusCode.FAILED_PRECONDITION, details)
 
 
 class MockCellaflowClient:
@@ -57,6 +63,8 @@ class MockCellaflowClient:
         self.graphs: Dict[str, List[Dict[str, Any]]] = {}
         #: Every get_graph call, as (limit, cursor) — lets tests assert on paging.
         self.graph_calls: List[Tuple[Optional[int], Optional[str]]] = []
+        #: Set to a status code to make get_graph fail, as the engine would.
+        self.get_graph_fails_with: Optional[Any] = None
 
     def start_session(
         self, workflow_id: str, version: str, session_id: Optional[str] = None
@@ -116,6 +124,17 @@ class MockCellaflowClient:
         self, session_id: str, limit: Optional[int] = None, cursor: Optional[str] = None
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         self.graph_calls.append((limit, cursor))
+
+        if self.get_graph_fails_with is not None:
+            raise _RpcFailure(self.get_graph_fails_with, "injected failure")
+
+        # The engine answers NOT_FOUND for a session it has never seen, rather
+        # than an empty page, so a thread with no history is a distinct case
+        # from a thread it could not read.
+        if session_id not in self.graphs:
+            raise _RpcFailure(
+                grpc.StatusCode.NOT_FOUND, f"Session {session_id} not found"
+            )
 
         page = (
             self.DEFAULT_PAGE if not limit or limit <= 0 else min(limit, self.MAX_PAGE)
@@ -458,13 +477,15 @@ def test_get_tuple_empty_or_error() -> None:
     res_missing = saver.get_tuple(non_existent_config)
     assert res_missing is None
 
-    # Error during get_graph
+    # A read that fails is NOT an empty thread. This previously asserted None,
+    # which is what made a transport failure look like a thread with no history
+    # and start the run over. See CEL-109.
     mock_failing_client = MagicMock()
     mock_failing_client.get_graph.side_effect = RuntimeError("gRPC connection error")
     failing_saver = CellaflowSaver(client=cast(CellaflowClient, mock_failing_client))
     failing_config: RunnableConfig = {"configurable": {"thread_id": "failing-thread"}}
-    res2 = failing_saver.get_tuple(failing_config)
-    assert res2 is None
+    with pytest.raises(RuntimeError, match="gRPC connection error"):
+        failing_saver.get_tuple(failing_config)
 
 
 def test_recovery_from_existing_graph_and_exception_handling() -> None:
@@ -521,13 +542,16 @@ def test_recovery_from_existing_graph_and_exception_handling() -> None:
     assert res["configurable"]["checkpoint_id"] == "cp-6"
     assert new_saver._next_sequence["pre-existing-thread"] == 7
 
-    # Test error in get_graph during sequence initialization
+    # A failed read during sequence initialisation must not resolve to 1.
+    # This previously asserted seq == 1, which meant an unreadable engine
+    # produced a confident guess at a position that is taken on any thread with
+    # history. See CEL-109.
     err_client = MagicMock()
     err_client.get_graph.side_effect = RuntimeError("network down")
     err_client.start_session.side_effect = RuntimeError("session start failed")
     err_saver = CellaflowSaver(client=cast(CellaflowClient, err_client))
-    seq = err_saver._ensure_session_and_sequence("err-thread")
-    assert seq == 1
+    with pytest.raises(RuntimeError, match="network down"):
+        err_saver._ensure_session_and_sequence("err-thread")
     assert "err-thread" not in err_saver._session_started
 
 
@@ -776,3 +800,103 @@ def test_a_new_saver_can_write_to_a_long_thread() -> None:
     assert (
         max(s["sequence"] for s in client.graphs[thread]) > 130
     ), "a saver that did not build the thread could not append to it"
+
+
+# ---------------------------------------------------------------------------
+# CEL-109: an engine that cannot be read is not an empty thread
+# ---------------------------------------------------------------------------
+#
+# `get_tuple` returning None tells LangGraph to start the run from the
+# beginning. That is the right answer for a thread with no history and the
+# most destructive possible answer for a thread it simply could not read.
+
+
+def test_unreadable_engine_does_not_look_like_an_empty_thread() -> None:
+    client = MockCellaflowClient()
+    saver = CellaflowSaver(client=cast(CellaflowClient, client))
+
+    cfg: RunnableConfig = {"configurable": {"thread_id": "has-state"}}
+    ckpt = cast(
+        Checkpoint,
+        {
+            "v": 1,
+            "id": "cp-1",
+            "ts": "2026-08-28T00:00:00Z",
+            "channel_values": {"n": 1},
+            "channel_versions": {"n": "1"},
+            "versions_seen": {},
+        },
+    )
+    saver.put(cfg, ckpt, CheckpointMetadata(), {"n": "1"})
+
+    # The engine goes away. The thread still has state.
+    client.get_graph_fails_with = grpc.StatusCode.UNAVAILABLE
+    reader = CellaflowSaver(client=cast(CellaflowClient, client))
+
+    with pytest.raises(grpc.RpcError):
+        reader.get_tuple(cfg)
+
+
+def test_a_thread_with_no_history_still_reads_as_empty() -> None:
+    """The counterpart: NOT_FOUND is a real answer, not a failure.
+
+    Every first run hits this, so treating it as an error would break the
+    common path in the course of fixing the rare one.
+    """
+    client = MockCellaflowClient()
+    saver = CellaflowSaver(client=cast(CellaflowClient, client))
+
+    assert saver.get_tuple({"configurable": {"thread_id": "brand-new"}}) is None
+
+
+def test_a_brand_new_thread_can_be_written() -> None:
+    """Sequence seeding must survive NOT_FOUND for the same reason."""
+    client = MockCellaflowClient()
+    saver = CellaflowSaver(client=cast(CellaflowClient, client))
+
+    cfg: RunnableConfig = {"configurable": {"thread_id": "first-run"}}
+    ckpt = cast(
+        Checkpoint,
+        {
+            "v": 1,
+            "id": "cp-1",
+            "ts": "2026-08-28T00:00:00Z",
+            "channel_values": {"n": 1},
+            "channel_versions": {"n": "1"},
+            "versions_seen": {},
+        },
+    )
+    saver.put(cfg, ckpt, CheckpointMetadata(), {"n": "1"})
+
+    assert client.graphs["first-run"][0]["sequence"] == 1
+
+
+def test_seeding_does_not_guess_a_position_it_could_not_read() -> None:
+    """A failed seed read must not fall back to sequence 1.
+
+    Position 1 is long taken on any thread with history, so guessing it commits
+    into a collision and then spends the retry budget discovering that.
+    """
+    client = MockCellaflowClient()
+    saver = CellaflowSaver(client=cast(CellaflowClient, client))
+
+    cfg: RunnableConfig = {"configurable": {"thread_id": "existing"}}
+    ckpt = cast(
+        Checkpoint,
+        {
+            "v": 1,
+            "id": "cp-1",
+            "ts": "2026-08-28T00:00:00Z",
+            "channel_values": {"n": 1},
+            "channel_versions": {"n": "1"},
+            "versions_seen": {},
+        },
+    )
+    saver.put(cfg, ckpt, CheckpointMetadata(), {"n": "1"})
+
+    # A new saver seeds from an engine that will not answer.
+    client.get_graph_fails_with = grpc.StatusCode.UNAVAILABLE
+    successor = CellaflowSaver(client=cast(CellaflowClient, client))
+
+    with pytest.raises(grpc.RpcError):
+        successor.put(cfg, ckpt, CheckpointMetadata(), {"n": "1"})

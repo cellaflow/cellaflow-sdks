@@ -199,11 +199,29 @@ class CellaflowSaver(_BaseSaver):
         Yields rather than returning a list because the two sequence callers want
         only the highest sequence and have no reason to hold the whole thread in
         memory to find it.
+
+        A thread the engine has never seen answers NOT_FOUND rather than an empty
+        page, and that is a real answer: it means no history, which is what every
+        first run looks like. Every *other* failure means the history could not be
+        read, which is a different thing entirely and is allowed to propagate.
+        Collapsing the two is what CEL-109 was.
         """
         cursor: Optional[str] = None
+        yielded = False
         while True:
-            steps, cursor = self.client.get_graph(session_id=session_id, cursor=cursor)
+            try:
+                steps, cursor = self.client.get_graph(
+                    session_id=session_id, cursor=cursor
+                )
+            except grpc.RpcError as exc:
+                # NOT_FOUND partway through means the session went away while we
+                # were reading it, which is a failure rather than an empty thread.
+                if exc.code() == grpc.StatusCode.NOT_FOUND and not yielded:
+                    return
+                raise
+
             for step in steps:
+                yielded = True
                 yield step
             if not cursor:
                 return
@@ -223,28 +241,26 @@ class CellaflowSaver(_BaseSaver):
         initializes the next sequence number based on existing history if recovering.
         """
         if session_id not in self._next_sequence:
-            try:
-                logger.debug(
-                    "Querying graph history for session %s to determine sequence",
+            logger.debug(
+                "Querying graph history for session %s to determine sequence",
+                session_id,
+            )
+            # Deliberately unguarded. Position 1 is already taken on any thread
+            # with history, so guessing it after a failed read commits into a
+            # collision and then spends the retry budget discovering that. A read
+            # that failed means the position is unknown, and unknown is not 1.
+            # _iter_steps already treats "session does not exist" as no history,
+            # so reaching here with an error means a genuine read failure.
+            latest = self._latest_sequence(session_id)
+            if latest:
+                self._next_sequence[session_id] = latest + 1
+                self._session_started.add(session_id)
+                logger.info(
+                    "Resuming session %s at next sequence %d",
                     session_id,
+                    self._next_sequence[session_id],
                 )
-                latest = self._latest_sequence(session_id)
-                if latest:
-                    self._next_sequence[session_id] = latest + 1
-                    self._session_started.add(session_id)
-                    logger.info(
-                        "Resuming session %s at next sequence %d",
-                        session_id,
-                        self._next_sequence[session_id],
-                    )
-                else:
-                    self._next_sequence[session_id] = 1
-            except Exception as e:
-                logger.debug(
-                    "Unable to query existing graph for session %s: %s",
-                    session_id,
-                    e,
-                )
+            else:
                 self._next_sequence[session_id] = 1
 
         if session_id not in self._session_started:
@@ -407,21 +423,19 @@ class CellaflowSaver(_BaseSaver):
             Dict[Tuple[str, int], Tuple[str, str, Tuple[str, bytes], str]],
         ] = defaultdict(dict)
 
-        try:
-            logger.debug("Fetching graph history for thread %s", thread_id)
-            steps = list(self._iter_steps(thread_id))
-            logger.debug(
-                "Successfully fetched %d steps for thread %s",
-                len(steps),
-                thread_id,
-            )
-        except Exception as e:
-            logger.warning(
-                "Failed to fetch graph history for thread %s: %s",
-                thread_id,
-                e,
-            )
-            return storage, blobs, writes
+        # Deliberately unguarded. `get_tuple` returning nothing tells LangGraph to
+        # start the run from the beginning, which is right for a thread with no
+        # history and destructive for one that merely could not be read -- it
+        # re-executes every node against state that already exists. A read failure
+        # therefore has to reach the caller. `_iter_steps` already reports a
+        # never-seen session as no history, so anything raising here is real.
+        logger.debug("Fetching graph history for thread %s", thread_id)
+        steps = list(self._iter_steps(thread_id))
+        logger.debug(
+            "Successfully fetched %d steps for thread %s",
+            len(steps),
+            thread_id,
+        )
 
         for step in steps:
             payload = step.get("output_payload", {})
@@ -708,11 +722,14 @@ class CellaflowSaver(_BaseSaver):
                 seq,
             )
         except Exception as e:
+            # Deliberately does not claim a number of attempts. Most failures
+            # here never entered the retry loop -- an unreachable engine raises
+            # on the first call -- and naming the ceiling sends whoever reads
+            # this looking for contention that did not happen.
             logger.error(
-                "Failed to commit checkpoint %s for thread %s after %d attempts: %s",
+                "Failed to commit checkpoint %s for thread %s: %s",
                 checkpoint["id"],
                 thread_id,
-                _MAX_COMMIT_ATTEMPTS,
                 e,
             )
             raise
@@ -774,12 +791,10 @@ class CellaflowSaver(_BaseSaver):
             )
         except Exception as e:
             logger.error(
-                "Failed to commit writes for task %s (checkpoint %s, thread %s) "
-                "after %d attempts: %s",
+                "Failed to commit writes for task %s (checkpoint %s, thread %s): %s",
                 task_id,
                 checkpoint_id,
                 thread_id,
-                _MAX_COMMIT_ATTEMPTS,
                 e,
             )
             raise
