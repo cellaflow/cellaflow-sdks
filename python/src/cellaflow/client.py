@@ -115,14 +115,14 @@ class CellaflowClient:
         Supplying `session_id` also asks the engine for that session's committed
         position, returned as `current_sequence` on every status. The idempotency
         key is opaque to the engine, so the session cannot be inferred from it —
-        without this the engine has nothing to answer from. See CEL-98.
+        without this the engine has nothing to answer from.
 
         Supplying `sequence` — the position this caller intends to write to —
         additionally lets the engine refuse a lease that would authorise a side
         effect at an already-committed position, instead of rejecting the commit
         afterwards once the side effect has happened. Raises `FAILED_PRECONDITION`
         when refused. Both fields are optional on the wire; omitting `sequence`
-        keeps the older, unguarded behaviour. See CEL-103.
+        keeps the position unguarded.
         """
         req = idempotency_pb2.CheckCacheRequest(
             agent_id=agent_id,

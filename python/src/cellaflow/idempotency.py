@@ -11,7 +11,7 @@ class IdempotencyScope(Enum):
     SCOPE_SESSION_WIDE = 1  # Shared across all agents in the session (Default)
     SCOPE_AGENT_PRIVATE = 2  # Isolated to the executing agent
     SCOPE_STEP_LOCAL = 3  # Isolated to the specific superstep / node
-    # CEL-99: shared across *sessions* within a declared coordination domain.
+    # Shared across *sessions* within a declared coordination domain.
     # The only scope whose key omits session_id, so agents running different
     # workflows in different sessions can deduplicate one shared side effect.
     SCOPE_SHARED = 4
@@ -52,7 +52,7 @@ def derive_idempotency_key(
     inputs_hash = _hash_inputs(*args, **kwargs)
 
     if scope == IdempotencyScope.SCOPE_SHARED:
-        # CEL-99: the only scope that omits session_id, so agents in different
+        # The only scope that omits session_id, so agents in different
         # sessions converge on one key. It also omits workflow_version, because
         # the whole point is that *different* workflows share the operation and
         # they will not be on the same version.

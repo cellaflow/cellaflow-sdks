@@ -20,7 +20,7 @@ message LeaseRecord {
   uint64 acquired_at_ms = 3;  // When the lease was acquired (epoch ms)
   uint64 expires_at_ms = 4;   // When the lease expires if not renewed (epoch ms)
 
-  // CEL-92: the graph position this lease claimed, if the caller declared one.
+  // the graph position this lease claimed, if the caller declared one.
   //
   // Carried on the lease rather than passed to release_lease / commit_result so
   // that clearing the claim is a consequence of releasing the lease rather than
@@ -32,42 +32,26 @@ message LeaseRecord {
   string claimed_session_id = 5;
   uint64 claimed_sequence = 6;
 
-  // CEL-106: the wall-clock ceiling on this lease, independent of renewals.
+  // The wall-clock ceiling on this lease, independent of renewals. Past it the
+  // lease is reclaimable however recently it was renewed, which bounds how long a
+  // holder can hold a position.
   //
-  // A lease expires only if nobody renews it, and the SDK heartbeats for as long
-  // as the step body runs -- so a holder that hangs *without dying* renews
-  // forever and starves everyone behind it. This is the bound that cannot be
-  // extended: past it the lease is reclaimable however recently it was renewed.
-  //
-  // Computed once at acquisition, so a record written before this field existed
-  // decodes as 0, which is treated as "no ceiling" rather than "expired at the
-  // epoch" -- the opposite reading would reclaim every pre-existing lease on
-  // upgrade.
+  // Computed once at acquisition. A value of 0 means no ceiling.
   uint64 hard_expires_at_ms = 7;
 }
 
-// CEL-92: records which idempotency key currently owns a graph position.
+// Records which idempotency key currently owns a graph position.
 //
-// Lives in its own `sequence_claims` column family, NOT in `idempotency_cache`.
-// That CF is keyed by the raw caller-supplied idempotency key with no prefix, and
-// `@step(idempotency_key=...)` is a documented public override — so any prefixed
-// engine record sharing that keyspace could be read or overwritten by a user who
-// happened to choose a colliding key. A separate CF makes that impossible rather
-// than improbable.
-//
-// Keyed by `<session_id>:<sequence padded to 20>`. Unambiguous because session
-// ids are validated to contain no colons, so the split point is never in doubt.
+// Stored in its own `sequence_claims` column family, keyed by
+// `<session_id>:<sequence padded to 20>`. Session ids are validated to contain no
+// colons, so the key parses unambiguously.
 message SequenceClaimRecord {
   string idempotency_key = 1; // Who owns the position
   uint64 fencing_token = 2;   // The lease that created this claim
   string holder_id = 3;       // Opaque per-attempt id, for diagnostics
-  // ADVISORY ONLY -- the lease's expiry at the moment this claim was written.
-  //
-  // Do NOT read liveness from this field. `renew_lease` extends the lease without
-  // rewriting the claim, so any step that outlives its initial TTL by heartbeating
-  // leaves this value in the past while its holder is still running. Liveness is
-  // read from the owning lease record, which is the thing renewal actually
-  // updates. Kept for diagnostics and for the refusal message.
+  // Advisory: the lease's expiry when this claim was written. Renewal extends the
+  // lease without rewriting the claim, so liveness is read from the owning lease
+  // record. Kept for diagnostics and for the refusal message.
   uint64 expires_at_ms = 4;
 }
 
@@ -76,7 +60,7 @@ message CompletedRecord {
   cellaflow.v1.StepResult result = 1;
   uint64 completed_at_ms = 2; // When the result was committed (epoch ms)
 
-  // CEL-73: the fencing token held by the worker that committed this result.
+  // The fencing token held by the worker that committed this result.
   //
   // Without it, once a key transitions to Completed the token that completed it
   // was discarded, so a later caller's token had nothing to be validated against
@@ -86,7 +70,7 @@ message CompletedRecord {
   // legitimately 0.
   uint64 fencing_token = 3;
 
-  // CEL-73: the graph sequence this result was journaled at.
+  // The graph sequence this result was journaled at.
   //
   // An AlreadyCommitted outcome only implies a durable event exists at *that*
   // sequence. A caller committing the same key at a different position has no
