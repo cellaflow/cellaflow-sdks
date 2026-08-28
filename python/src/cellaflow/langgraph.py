@@ -55,6 +55,12 @@ logger = logging.getLogger(__name__)
 # contention. The cost of a tight one is spurious failures.
 _MAX_COMMIT_ATTEMPTS = 128
 
+#: How many consecutive rejections of the *same* sequence count as a stall
+#: rather than contention. Contention advances the log, so a repeat means the
+#: position is not moving and retrying cannot help. Kept well above the number
+#: of writers that could plausibly collide in one round.
+_STALLED_SEQUENCE_ATTEMPTS = 8
+
 if TYPE_CHECKING:
     from langchain_core.runnables import RunnableConfig
     from langgraph.checkpoint.base import (
@@ -182,6 +188,35 @@ class CellaflowSaver(_BaseSaver):
         self._next_sequence: Dict[str, int] = {}
         self._session_started: Set[str] = set()
 
+    def _iter_steps(self, session_id: str) -> Iterator[Dict[str, Any]]:
+        """Yields every step of a session, following the engine's page cursor.
+
+        `get_graph` returns a bounded page and a cursor for the rest, so a single
+        call sees only the beginning of a long thread. The cursor it returns is
+        the sequence of the first unread record and is inclusive, so passing it
+        straight back resumes exactly where the previous page stopped.
+
+        Yields rather than returning a list because the two sequence callers want
+        only the highest sequence and have no reason to hold the whole thread in
+        memory to find it.
+        """
+        cursor: Optional[str] = None
+        while True:
+            steps, cursor = self.client.get_graph(session_id=session_id, cursor=cursor)
+            for step in steps:
+                yield step
+            if not cursor:
+                return
+
+    def _latest_sequence(self, session_id: str) -> int:
+        """The session's highest committed sequence, or 0 if it has none."""
+        latest = 0
+        for step in self._iter_steps(session_id):
+            seq = cast(int, step.get("sequence", 0))
+            if seq > latest:
+                latest = seq
+        return latest
+
     def _ensure_session_and_sequence(self, session_id: str) -> int:
         """
         Ensures the session has been started with the CellaFlow Engine and
@@ -193,17 +228,14 @@ class CellaflowSaver(_BaseSaver):
                     "Querying graph history for session %s to determine sequence",
                     session_id,
                 )
-                steps, _ = self.client.get_graph(session_id=session_id)
-                if steps:
-                    max_seq = max(cast(int, step["sequence"]) for step in steps)
-                    self._next_sequence[session_id] = max_seq + 1
+                latest = self._latest_sequence(session_id)
+                if latest:
+                    self._next_sequence[session_id] = latest + 1
                     self._session_started.add(session_id)
                     logger.info(
-                        "Resuming session %s at next sequence %d "
-                        "from existing %d steps",
+                        "Resuming session %s at next sequence %d",
                         session_id,
                         self._next_sequence[session_id],
-                        len(steps),
                     )
                 else:
                     self._next_sequence[session_id] = 1
@@ -264,11 +296,10 @@ class CellaflowSaver(_BaseSaver):
         actually got to.
         """
         try:
-            steps, _ = self.client.get_graph(session_id=session_id)
+            latest = self._latest_sequence(session_id)
         except Exception:  # pragma: no cover - engine unreachable
             return self._next_sequence.get(session_id, 1)
 
-        latest = max((cast(int, st["sequence"]) for st in steps), default=0)
         self._next_sequence[session_id] = latest + 1
         return latest + 1
 
@@ -290,8 +321,15 @@ class CellaflowSaver(_BaseSaver):
 
         Bounded, and on exhaustion the underlying error is re-raised rather than
         a synthesised one, so the cause stays visible.
+
+        Retrying only helps while the position is genuinely moving. If a refresh
+        keeps proposing the same rejected sequence the log is not advancing and
+        further attempts cannot succeed, so the loop gives up early rather than
+        spending its whole budget on a stall.
         """
         last_error: Optional[Exception] = None
+        stalled_at: Optional[int] = None
+        stalls = 0
 
         for attempt in range(_MAX_COMMIT_ATTEMPTS):
             seq = self._ensure_session_and_sequence(session_id)
@@ -308,6 +346,21 @@ class CellaflowSaver(_BaseSaver):
                 if exc.code() != grpc.StatusCode.FAILED_PRECONDITION:
                     raise
                 last_error = exc
+
+                # Under real contention the winner advances the log, so the next
+                # refresh yields a different position. The same one coming back
+                # repeatedly means nothing is moving.
+                stalls = stalls + 1 if seq == stalled_at else 0
+                stalled_at = seq
+                if stalls >= _STALLED_SEQUENCE_ATTEMPTS:
+                    raise RuntimeError(
+                        f"Could not commit to session {session_id!r}: the engine "
+                        f"rejected sequence {seq} on {stalls + 1} consecutive "
+                        f"attempts and re-reading its position returned the same "
+                        f"value each time, so retrying cannot resolve it. "
+                        f"Engine said: {exc.details()}"
+                    ) from exc
+
                 logger.debug(
                     "Sequence %d taken for %s (attempt %d/%d); refreshing",
                     seq,
@@ -356,7 +409,7 @@ class CellaflowSaver(_BaseSaver):
 
         try:
             logger.debug("Fetching graph history for thread %s", thread_id)
-            steps, _ = self.client.get_graph(session_id=thread_id)
+            steps = list(self._iter_steps(thread_id))
             logger.debug(
                 "Successfully fetched %d steps for thread %s",
                 len(steps),
