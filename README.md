@@ -13,7 +13,7 @@ Official client SDKs and protocol definitions for the [CellaFlow Engine](https:/
 
 | Language | Package | Status | Documentation |
 | :--- | :--- | :--- | :--- |
-| **Python** | [`cellaflow`](https://pypi.org/project/cellaflow/) | ✅ **v0.3.0** (Released) | [Python SDK Guide](python/README.md) |
+| **Python** | [`cellaflow`](https://pypi.org/project/cellaflow/) | ✅ **v0.4.0** (Released) | [Python SDK Guide](python/README.md) |
 | **TypeScript** | `@cellaflow/sdk` | 🚧 *In Development* | Coming Soon |
 
 ---

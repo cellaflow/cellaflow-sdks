@@ -2,6 +2,13 @@
 
 All notable changes to the CellaFlow Python SDK.
 
+## 0.4.0
+
+### Fixed
+
+- **`durable_tools` in multi-node LangGraph workflows**: Dropped positional replay within `durable_tools` so graphs with multiple tool-bearing nodes resume correctly across failures without sequence mismatches.
+- **Config validation in `durable_tools`**: Added robust handling for LangGraph config formats, accepting bare string thread IDs, hashing thread IDs containing colons to ensure valid session IDs, and rejecting empty thread IDs.
+
 ## 0.3.0
 
 The first release since `0.2.1`, covering six tickets. Two of them change behaviour you may
