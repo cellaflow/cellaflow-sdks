@@ -485,6 +485,10 @@ counters and would otherwise compete for graph positions — and **deterministic
 thread, so the idempotency key survives a restart. `tool_session_id(thread_id)` exposes the
 mapping for inspection. See [Leased Tool Calls Inside LangGraph Nodes](#6-leased-tool-calls-inside-langgraph-nodes-durable_tools).
 
+`config` is the same mapping you pass to `invoke` — only `configurable.thread_id` is read from it,
+and a bare thread id string is accepted too. Leasing is independent of where checkpoints are
+stored, so this works with any LangGraph checkpointer, not just `CellaflowSaver`.
+
 ### `IdempotencyScope`
 Controls how cached step and tool results are shared across multi-agent sessions:
 - `IdempotencyScope.SCOPE_SESSION_WIDE` *(Default)*: Cached results are shared across all agents in the session.

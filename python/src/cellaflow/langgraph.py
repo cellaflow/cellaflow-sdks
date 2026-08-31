@@ -17,11 +17,13 @@ To enable LangGraph support:
 """
 
 import asyncio
+import hashlib
 import logging
 import random
 import time
 import secrets
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import (
     TYPE_CHECKING,
@@ -142,13 +144,60 @@ def tool_session_id(thread_id: str) -> str:
 
     Deterministic, so a restart derives the same value and the lease taken
     before a crash is still recognised afterwards.
+
+    Thread ids are chosen by the application and colons are reserved by the
+    engine's key layout, so an id containing one is hashed rather than rejected:
+    `"user:123"` is an ordinary way to namespace a thread, and refusing it would
+    turn an engine storage detail into a constraint on the caller's naming.
+    Hashing keeps the one property that matters -- the same thread always
+    derives the same session -- at the cost of a session id that no longer reads
+    back as the thread's name.
     """
+    if not isinstance(thread_id, str) or not thread_id:
+        raise ValueError(
+            f"thread_id must be a non-empty string, got {thread_id!r}. Every "
+            f"thread needs its own id: an empty one would put unrelated runs in "
+            f"a single session, where they would deduplicate against each other."
+        )
+    if ":" in thread_id:
+        digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:32]
+        return f"lgthread-{digest}{_TOOL_SESSION_SUFFIX}"
     return f"{thread_id}{_TOOL_SESSION_SUFFIX}"
+
+
+def _thread_id_from(config: Any) -> str:
+    """Pulls the thread id out of a LangGraph config, or takes one directly.
+
+    Accepts the `config` already being passed to `invoke`, which is the common
+    case, or a bare thread id for callers who have nothing else to hand. The
+    errors here exist because the raw failures are `KeyError: 'configurable'`
+    and `TypeError: string indices must be integers`, neither of which names the
+    thing that is actually missing.
+    """
+    if isinstance(config, str):
+        return config
+
+    if not isinstance(config, Mapping):
+        raise TypeError(
+            f"durable_tools() needs the LangGraph config you pass to invoke(), "
+            f"or a thread id string; got {type(config).__name__}. Usage: "
+            f'durable_tools({{"configurable": {{"thread_id": "..."}}}}).'
+        )
+
+    configurable = config.get("configurable")
+    if not isinstance(configurable, Mapping) or "thread_id" not in configurable:
+        raise ValueError(
+            "durable_tools() needs a config carrying configurable.thread_id -- "
+            "the same one you pass to invoke(). The thread id is what the tool "
+            "session is derived from, so there is nothing to bind the lease to "
+            "without it."
+        )
+    return cast(str, configurable["thread_id"])
 
 
 @contextmanager
 def durable_tools(
-    config: "RunnableConfig",
+    config: Any,
     *,
     workflow_id: str = "langgraph",
     version: str = "1.0.0",
@@ -180,10 +229,14 @@ def durable_tools(
     invocations of the *same* thread contend for graph positions. That is the
     same constraint LangGraph itself imposes -- one execution per thread -- not
     an additional one.
+
+    `config` is normally the same mapping passed to `invoke`, and only
+    `configurable.thread_id` is read from it. A bare thread id string is
+    accepted too, for callers who have no config to hand.
     """
     from cellaflow.context import WorkflowContext, set_context, reset_context
 
-    thread_id = config["configurable"]["thread_id"]
+    thread_id = _thread_id_from(config)
     session_id = tool_session_id(thread_id)
 
     client = CellaflowClient(target=target, secure=secure)

@@ -1094,3 +1094,99 @@ def test_durable_tools_replays_committed_steps_across_pages() -> None:
 
     assert len(ctx.replayed_steps) == 130, "recovery stopped short of the full history"
     assert ctx.replayed_steps[130]["name"] == "charge"
+
+
+def test_durable_tools_accepts_a_config_or_a_bare_thread_id() -> None:
+    """Only `configurable.thread_id` is read, so a bare id is equally complete."""
+    client = LeasingMockClient()
+    seen = []
+
+    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+        cfg: RunnableConfig = {"configurable": {"thread_id": "t-forms"}}
+        with durable_tools(cfg) as a:
+            seen.append(a.session_id)
+        with durable_tools("t-forms") as b:
+            seen.append(b.session_id)
+
+    assert seen[0] == seen[1] == tool_session_id("t-forms")
+
+
+@pytest.mark.parametrize(
+    "bad, exc, message",
+    [
+        ({"thread_id": "t-1"}, ValueError, "configurable.thread_id"),
+        ({"configurable": {}}, ValueError, "configurable.thread_id"),
+        ({"configurable": None}, ValueError, "configurable.thread_id"),
+        (None, TypeError, "thread id string"),
+        (42, TypeError, "thread id string"),
+    ],
+)
+def test_durable_tools_rejects_a_malformed_config_by_name(
+    bad: Any, exc: type, message: str
+) -> None:
+    """The raw failures were `KeyError: 'configurable'` and `TypeError: string
+    indices must be integers` — neither names the thing that is missing, and
+    both arrive from inside a context manager the caller just opened.
+    """
+    with pytest.raises(exc, match=message):
+        with durable_tools(bad):
+            pass
+
+
+def test_a_thread_id_with_a_colon_still_gets_a_stable_session() -> None:
+    """`user:123` is an ordinary way to namespace a thread; the engine reserves
+    colons in session ids. Hashing keeps the property that matters — the same
+    thread derives the same session — without making an engine storage detail
+    into a constraint on what callers may name their threads.
+    """
+    got = tool_session_id("user:123")
+
+    assert ":" not in got, "the engine rejects a session id containing a colon"
+    assert got == tool_session_id("user:123"), "not stable across calls"
+    assert got != tool_session_id("user:124"), "distinct threads collided"
+
+
+def test_an_empty_thread_id_is_refused() -> None:
+    """Silently accepting it maps every such caller onto one shared session,
+    where unrelated runs would deduplicate against each other — a wrong answer
+    that looks like a working one.
+    """
+    with pytest.raises(ValueError, match="non-empty string"):
+        tool_session_id("")
+
+
+def test_durable_tools_does_not_require_the_cellaflow_checkpointer() -> None:
+    """Leased tools are independent of where checkpoints are stored.
+
+    Worth pinning: it means a team already committed to PostgresSaver can adopt
+    the leasing without moving their checkpoint storage, and it is what makes
+    the colon handling useful today — `CellaflowSaver` uses the raw thread id as
+    its session and so cannot accept one, but nothing here goes through it.
+    """
+    from langgraph.checkpoint.memory import MemorySaver
+
+    client = LeasingMockClient()
+    seen: Dict[str, Any] = {}
+
+    def _charge(amount: int) -> Dict[str, Any]:
+        seen["session"] = get_context().session_id
+        return {"charged": amount}
+
+    charge = cast(Any, tool(tool_name="charge")(_charge))
+
+    def node(state: PaymentState) -> Dict[str, Any]:
+        return {"receipt": charge(state.amount)}
+
+    graph = StateGraph(PaymentState)
+    graph.add_node("pay", node)
+    graph.add_edge(START, "pay")
+    graph.add_edge("pay", END)
+    app = graph.compile(checkpointer=MemorySaver())
+
+    cfg: RunnableConfig = {"configurable": {"thread_id": "tenant:acme/u-1"}}
+    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+        with durable_tools(cfg):
+            app.invoke(PaymentState(amount=2499), cfg)
+
+    assert seen["session"] == tool_session_id("tenant:acme/u-1")
+    assert client.granted, "the tool never took a lease"
