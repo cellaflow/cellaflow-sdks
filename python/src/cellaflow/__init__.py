@@ -7,9 +7,11 @@ from cellaflow.decorators import (
     NondeterministicWorkflowError,
 )
 from cellaflow.idempotency import IdempotencyScope
-from cellaflow.langgraph import CellaflowSaver
+from cellaflow.langgraph import CellaflowSaver, durable_tools, tool_session_id
 
 __all__ = [
+    "durable_tools",
+    "tool_session_id",
     "DivergentStepError",
     "NondeterministicWorkflowError",
     "CellaflowClient",

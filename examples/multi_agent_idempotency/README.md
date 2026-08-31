@@ -3,7 +3,7 @@
 Several agents decide the same customer needs refunding, at the same moment. Only one charge
 reaches the payment provider — every other agent receives that charge's result.
 
-Four scenarios, each a different way agents collide:
+Five scenarios, each a different way a charge gets duplicated:
 
 | | Who is racing | What stops the double charge |
 | --- | --- | --- |
@@ -11,6 +11,9 @@ Four scenarios, each a different way agents collide:
 | 2 | Five replicas, same session, same inputs | One derived key. One winner, four cache hits. |
 | 3 | Five replicas that **disagree** about the amount | The graph position they all target. Four are refused *before* they charge. |
 | 4 | Five **different** agents in five separate sessions | A coordination domain they each name. |
+| 5 | One agent, killed **after** charging | A lease scoped to the thread. The resumed run reuses the charge. |
+
+Scenario 5 is the one a checkpointer cannot do: the side effect happens inside a LangGraph node.
 
 Every agent runs as its own OS process, released simultaneously, so they genuinely race.
 
@@ -23,9 +26,10 @@ docker run -d --name cellaflow-demo \
   -e CELLAFLOW_HOST=:: \
   ghcr.io/cellaflow/cellaflow:latest
 
-pip install cellaflow
+pip install 'cellaflow[langgraph]'    # scenario 5 needs LangGraph; the rest do not
 python run_demo.py                     # scenarios 1 and 2
-python run_demo.py --scenario all      # all four
+python run_demo.py --scenario all      # all five
+python run_demo.py --scenario langgraph   # the crash-mid-charge one
 ```
 
 ## What you'll see
@@ -122,10 +126,53 @@ The domain is required and has no default. A default would make two unrelated ca
 happen to make the same call deduplicate against each other, suppressing one of them with no
 error anywhere.
 
+### When the side effect lives inside a LangGraph node (scenario 5)
+
+The first four scenarios call the leased tool directly. Real agents rarely do — the tool call sits
+inside a graph node, which is exactly the place a checkpointer cannot help. LangGraph makes the
+graph's *state* durable; nothing in it makes a node's *side effect* happen once.
+
+Scenario 5 kills the process at the worst possible moment: after the gateway is charged, before
+the checkpoint recording it lands. The money has moved and nothing durable says so. A second
+process then resumes the thread from cold, LangGraph re-runs the pending node, and the tool is
+reached a second time:
+
+```python
+from cellaflow import CellaflowSaver, durable_tools, tool
+
+@tool(tool_name="issue_refund")
+def issue_refund(ticket_id: str, amount_cents: int, agent_id: str) -> dict:
+    return gateway.issue_refund(ticket_id, amount_cents, charged_by=agent_id)
+
+def refund_node(state):
+    return {"receipt": issue_refund(state.ticket_id, state.amount_cents, state.agent_id)}
+
+app = graph.compile(checkpointer=CellaflowSaver(target=ENGINE_TARGET))
+
+with durable_tools(config):
+    app.invoke(None, config)          # None resumes; an input would start a second run
+```
+
+```
+phase 1: process exited with 17, ledger has 1 charge(s)
+phase 2: resumed and completed, ledger has 1 charge(s)
+graph reached: refunded -> confirmed rf_91000dc621d8
+```
+
+The node ran twice and the customer was charged once.
+
+`durable_tools` is doing one specific thing: deriving the session that owns the thread's leased
+calls. It has to be **stable** across restarts, or the resumed run derives a different idempotency
+key and the lease recognises nothing — which fails by charging again rather than by raising. It
+also has to be **separate** from the checkpointer's own session, because the saver and `@step`
+advance independent sequence counters and would otherwise compete for the same graph positions.
+Deriving one from the other satisfies both, which is why this is a helper and not a paragraph of
+instructions.
+
 ## Options
 
 `--agents N` (default 5) · `--session-id ID` to resume ·
-`--scenario naive|coordinated|both|divergent|heterogeneous|all`.
+`--scenario naive|coordinated|both|divergent|heterogeneous|langgraph|all`.
 Point at a different engine with `CELLAFLOW_TARGET=host:port`.
 
 Scenario 4 defines five distinct agent roles, so `--scenario heterogeneous` accepts at most
@@ -151,4 +198,5 @@ turns on. It means an agent always receives a result for the arguments it actual
 | `run_demo.py` | Entry point — spawns the agents, prints the scoreboard |
 | `swarm.py` | The two agent implementations, uncoordinated and coordinated |
 | `gateway.py` | Stand-in payment provider; writes the ledger |
+| `langgraph_agent.py` | The LangGraph agent for scenario 5, killed mid-charge and resumed |
 | `raw_leases.py` | The same coordination at the gRPC level, one call at a time |

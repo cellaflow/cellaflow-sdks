@@ -15,6 +15,7 @@ The official Python SDK for the [CellaFlow Engine](https://www.cellaflow.com) �
 - 🔄 **Durable Execution & Transparent Replay**: Workflows survive process restarts and infrastructure crashes without re-executing completed steps.
 - ⚡ **Zero-Friction Decorators**: Annotate standard Python functions with `@workflow`, `@step`, and `@tool` (supporting both `def` and `async def`).
 - 🧠 **LangGraph Drop-in Checkpointer**: Native `CellaflowSaver` checkpointer for LangGraph workflows with immutable MessagePack state snapshots, time-travel, and crash recovery.
+- 💳 **Leased Tool Calls Inside LangGraph Nodes**: `durable_tools` makes a node's irreversible side effect happen at most once — across a crash, a restart, or a resumed thread. A checkpointer makes your state durable; this makes your *charges* durable.
 - 🛡️ **Deterministic Idempotency**: Automatic input hashing via RFC 8785 Canonical JSON and SHA-256 guarantees cross-language determinism across multi-agent swarms.
 - 🤝 **Cross-Session Coordination**: `SCOPE_SHARED` lets heterogeneous agents — different workflows, different sessions, different versions — converge on a single execution of a shared side effect.
 - 🔒 **Background Lease Management**: Non-blocking heartbeat management keeps engine locks alive and eliminates split-brain execution using fencing tokens.
@@ -227,6 +228,103 @@ for checkpoint_tuple in checkpointer.list(config):
 
 ---
 
+### 6. Leased Tool Calls Inside LangGraph Nodes (`durable_tools`)
+
+A checkpointer makes your graph's **state** durable. It does nothing for a
+node's **side effects** — if a node charges a customer and the pod dies before
+the next checkpoint lands, the resumed run re-enters that node and charges
+again.
+
+`durable_tools` closes that window. Wrap the invocation, and any `@tool` called
+inside a node body is leased: it runs at most once per thread, across crashes
+and restarts.
+
+```python
+from cellaflow import CellaflowSaver, durable_tools, tool
+
+@tool(tool_name="issue_refund")
+def issue_refund(ticket_id: str, cents: int) -> dict:
+    return payment_gateway.charge(ticket_id, cents)   # irreversible
+
+def refund_node(state):
+    return {"receipt": issue_refund(state["ticket"], state["amount"])}
+
+app = builder.compile(checkpointer=CellaflowSaver(target="localhost:50051"))
+config = {"configurable": {"thread_id": "ticket-4417"}}
+
+with durable_tools(config):
+    app.invoke({"ticket": "T-4417", "amount": 2499}, config)
+```
+
+If that process dies after the charge and a new one resumes the thread,
+LangGraph re-runs the pending node, the tool is reached a second time, and the
+lease answers from the recorded result instead of calling the gateway. The
+customer is charged once. `examples/multi_agent_idempotency` scenario 5
+demonstrates exactly this, killing the process between the charge and the
+checkpoint.
+
+**Use the context manager rather than assembling the equivalent yourself.** A
+tool's idempotency key is derived from its session id, and `durable_tools`
+derives that session from the thread — stable across restarts, so the lease
+still recognises the earlier attempt, and separate from the checkpointer's own
+session, so the two do not compete for positions in the graph. A tool called
+outside `durable_tools` raises rather than running unleased.
+
+#### Using it with the checkpointer you already have
+
+`durable_tools` does not go through the checkpointer. It establishes the context
+the `@tool` reads and talks to the engine directly, so leasing works with
+whichever `BaseCheckpointSaver` you already use — adopting it does not mean
+moving your checkpoint storage:
+
+```python
+from langgraph.checkpoint.postgres import PostgresSaver
+from cellaflow import durable_tools, tool
+
+with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
+    checkpointer.setup()
+    app = builder.compile(checkpointer=checkpointer)
+
+    with durable_tools(config):
+        app.invoke({"ticket": "T-4417", "amount": 2499}, config)
+```
+
+Checkpoints go to Postgres exactly as before; the node's irreversible tool call
+is leased. The same holds for `MemorySaver` or any other checkpointer.
+
+#### Two nodes calling the same tool
+
+Under the default `SCOPE_SESSION_WIDE` the key is derived from the tool name and
+arguments, **not** the graph position — which is exactly what lets the guarantee
+survive a resume, since LangGraph re-runs only the pending node and so reaches
+tools in a different order.
+
+The consequence: two *different* nodes calling the same `tool_name` with the same
+arguments in one thread deduplicate into a single execution. Give them distinct
+`tool_name`s, or an explicit `idempotency_key`, when they are genuinely different
+operations.
+
+#### When replicas disagree about the arguments
+
+Worth knowing before relying on this. The derived key hashes the tool's
+arguments, so two replicas that reach the same node with **different**
+arguments derive different keys and do not contend — each is, as far as the
+engine can tell, a distinct operation.
+
+Passing an explicit key makes them converge:
+
+```python
+@tool(tool_name="issue_refund", idempotency_key=f"refund-{ticket_id}")
+```
+
+That prevents the double charge, with a trade-off to state plainly: the replica
+that loses receives a result computed from arguments it did not supply. If the
+replicas disagreed about the amount, the loser is handed a refund for someone
+else's number. The durable fix is to make the disputed value itself a leased
+step, so they agree on it before reaching the step that spends it.
+
+---
+
 ## Architecture & How It Works
 
 ### 1. Transparent Replay Recovery
@@ -398,6 +496,32 @@ Decorators for atomic units of execution within a workflow:
 - **Replay Interception**: If a step was already completed in the session history, immediately returns the cached output without re-running the function body.
 - **Lease Heartbeating**: Automatically runs background heartbeats (`RenewLease`) via daemon threads (sync) or asyncio tasks (async) to keep engine locks refreshed.
 - **Lock Release on Failure**: If an unhandled exception occurs, automatically releases the lease with `reason="TOOL_ERROR"`.
+
+> **A lease is only as durable as its session.** The key is derived from the session id, and
+> `@workflow` generates a fresh session per call unless you pass `_session_id` — so without a
+> stable session id, a `@tool` deduplicates *within* a run but not across a restart. If you are
+> using `@tool` to make a side effect happen at most once across a crash, pass a stable
+> `_session_id`. Inside LangGraph, use `durable_tools`, which derives one from the thread.
+
+### `durable_tools(config, *, workflow_id="langgraph", version="1.0.0", target=..., secure=False, coordination_id=None)`
+Context manager that makes `@tool` work inside LangGraph node bodies, where there is no
+`@workflow` frame to resolve. Derives a session from the graph's `thread_id`, establishes the
+context around the invocation, and loads previously committed steps so a resumed run replays them
+rather than re-executing.
+
+```python
+with durable_tools(config):
+    app.invoke({"ticket": "T-4417"}, config)
+```
+
+The derived session is **distinct** from the checkpointer's — the two advance independent sequence
+counters and would otherwise compete for graph positions — and **deterministic** for a given
+thread, so the idempotency key survives a restart. `tool_session_id(thread_id)` exposes the
+mapping for inspection. See [Leased Tool Calls Inside LangGraph Nodes](#6-leased-tool-calls-inside-langgraph-nodes-durable_tools).
+
+`config` is the same mapping you pass to `invoke` — only `configurable.thread_id` is read from it,
+and a bare thread id string is accepted too. Leasing is independent of where checkpoints are
+stored, so this works with any LangGraph checkpointer, not just `CellaflowSaver`.
 
 ### `IdempotencyScope`
 Controls how cached step and tool results are shared across multi-agent sessions:
