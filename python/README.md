@@ -270,6 +270,28 @@ still recognises the earlier attempt, and separate from the checkpointer's own
 session, so the two do not compete for positions in the graph. A tool called
 outside `durable_tools` raises rather than running unleased.
 
+#### Using it with the checkpointer you already have
+
+`durable_tools` does not go through the checkpointer. It establishes the context
+the `@tool` reads and talks to the engine directly, so leasing works with
+whichever `BaseCheckpointSaver` you already use — adopting it does not mean
+moving your checkpoint storage:
+
+```python
+from langgraph.checkpoint.postgres import PostgresSaver
+from cellaflow import durable_tools, tool
+
+with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
+    checkpointer.setup()
+    app = builder.compile(checkpointer=checkpointer)
+
+    with durable_tools(config):
+        app.invoke({"ticket": "T-4417", "amount": 2499}, config)
+```
+
+Checkpoints go to Postgres exactly as before; the node's irreversible tool call
+is leased. The same holds for `MemorySaver` or any other checkpointer.
+
 #### Two nodes calling the same tool
 
 Under the default `SCOPE_SESSION_WIDE` the key is derived from the tool name and
