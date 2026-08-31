@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
+import os
 import sys
 import time
 import uuid
 from typing import Any, Callable, Dict, List
 
 import gateway
+import langgraph_agent
 import swarm
 
 TICKET_ID = "TICKET-4417"
@@ -257,12 +259,85 @@ def scenario_heterogeneous(n_agents: int) -> tuple[int, int]:
     return len(charges), 1
 
 
+def scenario_langgraph() -> tuple[int, int]:
+    """A LangGraph node charges the customer, dies, and resumes."""
+    print("\n" + "=" * 72)
+    print("  SCENARIO 5 - a LangGraph node that crashes after moving money")
+    print("=" * 72)
+    print(
+        "\n  The refund now happens inside a LangGraph node, which is where a real\n"
+        "  agent's side effects live. The first process is killed the instant after\n"
+        "  the gateway is charged and before the checkpoint recording it lands --\n"
+        "  so the money has moved and nothing durable says so.\n\n"
+        "  A second process then resumes the same thread from cold. LangGraph\n"
+        "  re-runs the pending node, so the tool is reached again and has to\n"
+        "  decline."
+    )
+
+    gateway.reset_ledger()
+    thread_id = f"lg-{TICKET_ID}-{uuid.uuid4().hex[:6]}"
+    ctx = mp.get_context("spawn")
+
+    # Phase 1: crash after the charge. Runs in its own process because it exits
+    # hard -- there is no returning from it.
+    crash_env = dict(os.environ, **{langgraph_agent.CRASH_ENV: "1"})
+    proc = ctx.Process(
+        target=_crash_worker,
+        args=(thread_id, TICKET_ID, AMOUNT_CENTS, "lg-agent", crash_env),
+    )
+    proc.start()
+    proc.join(timeout=120)
+
+    after_crash = len(gateway.read_ledger())
+    print(f"\n  phase 1: process exited with {proc.exitcode}, "
+          f"ledger has {after_crash} charge(s)")
+
+    # Phase 2: a cold process resumes the thread.
+    queue: Any = ctx.Queue()
+    resume = ctx.Process(
+        target=_worker,
+        args=(langgraph_agent.run_phase,
+              (thread_id, TICKET_ID, AMOUNT_CENTS, "lg-agent"), queue),
+    )
+    resume.start()
+    result = queue.get(timeout=120)
+    resume.join(timeout=30)
+
+    charges = gateway.read_ledger()
+    print(f"  phase 2: resumed and completed, ledger has {len(charges)} charge(s)")
+    print(f"\n  {'-' * 68}")
+    print(f"  thread:              {thread_id}")
+    print(f"  confirmation:        {result['confirmation_id']}")
+    print(f"  graph reached:       {' -> '.join(result['notes']) or '(none)'}")
+    print(f"  {'-' * 68}")
+    print(f"  REAL CHARGES ON THE LEDGER: {len(charges)}")
+    if len(charges) == 1 and after_crash == 1:
+        print("  The node ran twice. The customer was charged once.")
+    return len(charges), 1
+
+
+def _crash_worker(
+    thread_id: str, ticket_id: str, amount: int, agent_id: str, env: Dict[str, str]
+) -> None:
+    """Runs phase 1 with the crash flag set, in a process expected to die."""
+    os.environ.update(env)
+    try:
+        langgraph_agent.run_phase(thread_id, ticket_id, amount, agent_id)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--agents", type=int, default=5, help="swarm size (default 5)")
     parser.add_argument(
         "--scenario",
-        choices=("both", "naive", "coordinated", "divergent", "heterogeneous", "all"),
+        choices=(
+            "both", "naive", "coordinated", "divergent",
+            "heterogeneous", "langgraph", "all",
+        ),
         default="both",
     )
     parser.add_argument(
@@ -299,11 +374,13 @@ def main() -> int:
             args.agents, args.session_id
         )
 
-    divergent_charges = heterogeneous_charges = None
+    divergent_charges = heterogeneous_charges = langgraph_charges = None
     if args.scenario in ("all", "divergent"):
         divergent_charges, _ = scenario_divergent(args.agents)
     if args.scenario in ("all", "heterogeneous"):
         heterogeneous_charges, _ = scenario_heterogeneous(args.agents)
+    if args.scenario in ("all", "langgraph"):
+        langgraph_charges, _ = scenario_langgraph()
 
     print("\n" + "=" * 72)
     print("  VERDICT")
@@ -327,10 +404,16 @@ def main() -> int:
             f"  {args.agents} unrelated agents:  {heterogeneous_charges} charge across "
             f"{args.agents} separate sessions"
         )
+    if langgraph_charges is not None:
+        print(
+            f"  LangGraph node:    {langgraph_charges} charge, across a crash "
+            f"and a resume"
+        )
     print(f"\n  ({time.time() - started:.1f}s total)\n")
 
     for label, got in (("divergent", divergent_charges),
-                       ("heterogeneous", heterogeneous_charges)):
+                       ("heterogeneous", heterogeneous_charges),
+                       ("langgraph", langgraph_charges)):
         if got is not None and got != 1:
             print(f"  UNEXPECTED: {label} scenario produced {got} charges, expected 1.\n")
             return 1
