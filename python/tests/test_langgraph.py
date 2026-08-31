@@ -1069,7 +1069,7 @@ def test_durable_tools_replays_committed_steps_across_pages() -> None:
 
     The history is seeded past one page on purpose: recovery that stops at the
     first page rebuilds a partial view, and a tool whose record sat on page two
-    would execute a second time — the CEL-108 failure reached by another route.
+    would execute a second time.
     """
     client = LeasingMockClient()
     session = tool_session_id("t-replay")
