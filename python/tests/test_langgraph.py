@@ -4,9 +4,11 @@ from unittest.mock import MagicMock, patch
 import grpc
 import pytest
 
-from cellaflow import CellaflowSaver
+from cellaflow import CellaflowSaver, durable_tools, tool, tool_session_id
+from cellaflow.context import get_context
 from cellaflow.client import CellaflowClient
 from cellaflow.serialization import serialize, deserialize
+from cellaflow.v1.idempotency_pb2 import CACHE_STATUS_ACQUIRED, CACHE_STATUS_HIT
 from langgraph.graph import StateGraph, START, END
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
@@ -900,3 +902,195 @@ def test_seeding_does_not_guess_a_position_it_could_not_read() -> None:
 
     with pytest.raises(grpc.RpcError):
         successor.put(cfg, ckpt, CheckpointMetadata(), {"n": "1"})
+
+
+# ---------------------------------------------------------------------------
+# durable_tools: leased tool calls inside LangGraph nodes
+# ---------------------------------------------------------------------------
+
+
+class LeasingMockClient(MockCellaflowClient):
+    """Adds the lease arbitration `@tool` needs, keyed like the engine's cache.
+
+    Grants a key once and answers HIT with the recorded result thereafter, which
+    is the only part of the real arbitration these tests depend on.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cache: Dict[str, Any] = {}
+        self.granted: List[str] = []
+
+    def check_idempotency_cache(
+        self,
+        agent_id: str,
+        idempotency_key: str,
+        wait_timeout_ms: Optional[int] = None,
+        lease_ttl_ms: Optional[int] = None,
+        session_id: Optional[str] = None,
+        sequence: Optional[int] = None,
+    ) -> Any:
+        resp = MagicMock()
+        resp.HasField.return_value = False
+        if idempotency_key in self.cache:
+            resp.status = CACHE_STATUS_HIT
+            resp.cached_result.output_payload = self.cache[idempotency_key]
+            return resp
+        self.granted.append(idempotency_key)
+        resp.status = CACHE_STATUS_ACQUIRED
+        resp.fencing_token = 1
+        resp.heartbeat_interval_ms = 60000
+        return resp
+
+    def commit_step(
+        self,
+        session_id: str,
+        sequence: int,
+        name: str,
+        status: Any,
+        output_payload: Dict[str, Any],
+        idempotency_key: Optional[str] = None,
+        idempotency_fencing_token: Optional[int] = None,
+    ) -> Any:
+        if idempotency_key:
+            self.cache[idempotency_key] = serialize(output_payload)
+        return super().commit_step(
+            session_id,
+            sequence,
+            name,
+            status,
+            output_payload,
+            idempotency_key,
+            idempotency_fencing_token,
+        )
+
+    def release_lease(
+        self,
+        agent_id: str,
+        idempotency_key: str,
+        fencing_token: int,
+        reason: Optional[str] = None,
+    ) -> Any:
+        return MagicMock()
+
+    def renew_lease(
+        self, agent_id: str, idempotency_key: str, fencing_token: int, extend_ms: int
+    ) -> Any:
+        return MagicMock()
+
+
+@dataclass
+class PaymentState:
+    amount: int = 0
+    receipt: Dict[str, Any] = field(default_factory=dict)
+
+
+def test_tool_session_is_derived_and_distinct_from_the_thread() -> None:
+    """The two properties the whole mechanism rests on, asserted directly.
+
+    Distinct, or the saver's checkpoints and the tool's steps compete for graph
+    positions in one session and the loser is refused. Deterministic, or a
+    restart derives a different idempotency key and the lease recognises
+    nothing, which fails by repeating the side effect rather than by raising.
+    """
+    assert tool_session_id("t-1") != "t-1"
+    assert tool_session_id("t-1") == tool_session_id("t-1")
+    assert tool_session_id("t-1") != tool_session_id("t-2")
+
+
+def test_tool_inside_a_node_resolves_the_enclosing_context() -> None:
+    """The load-bearing claim: a @tool in a node body reaches the outer context.
+
+    LangGraph runs sync nodes on a thread pool, and ContextVars do not cross
+    threads on their own — this passes because LangGraph copies the calling
+    context into the executor. If that ever changes, this test is how we find
+    out, so it drives a real compiled graph rather than calling the node.
+    """
+    client = LeasingMockClient()
+    seen: Dict[str, Any] = {}
+
+    def _charge(amount: int) -> Dict[str, Any]:
+        seen["session"] = get_context().session_id
+        return {"charged": amount}
+
+    charge = cast(Any, tool(tool_name="charge")(_charge))
+
+    def node(state: PaymentState) -> Dict[str, Any]:
+        return {"receipt": charge(state.amount)}
+
+    graph = StateGraph(PaymentState)
+    graph.add_node("pay", node)
+    graph.add_edge(START, "pay")
+    graph.add_edge("pay", END)
+    app = graph.compile(
+        checkpointer=CellaflowSaver(client=cast(CellaflowClient, client))
+    )
+
+    cfg: RunnableConfig = {"configurable": {"thread_id": "t-ctx"}}
+    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+        with durable_tools(cfg):
+            app.invoke(PaymentState(amount=2499), cfg)
+
+    assert seen["session"] == tool_session_id("t-ctx")
+    assert client.granted, "the tool never took a lease"
+
+
+def test_a_tool_in_a_node_is_not_leased_without_the_helper() -> None:
+    """Unwrapped, a node's tool call has no context and says so.
+
+    Failing loudly here is the point: the alternative to a clear error is a tool
+    that runs unleased and looks fine until a retry charges twice.
+    """
+    client = LeasingMockClient()
+
+    def _charge(amount: int) -> Dict[str, Any]:
+        return {"charged": amount}
+
+    charge = cast(Any, tool(tool_name="charge")(_charge))
+
+    def node(state: PaymentState) -> Dict[str, Any]:
+        return {"receipt": charge(state.amount)}
+
+    graph = StateGraph(PaymentState)
+    graph.add_node("pay", node)
+    graph.add_edge(START, "pay")
+    graph.add_edge("pay", END)
+    app = graph.compile(
+        checkpointer=CellaflowSaver(client=cast(CellaflowClient, client))
+    )
+
+    cfg: RunnableConfig = {"configurable": {"thread_id": "t-bare"}}
+    with pytest.raises(RuntimeError, match="No active workflow context"):
+        app.invoke(PaymentState(amount=2499), cfg)
+
+
+def test_durable_tools_replays_committed_steps_across_pages() -> None:
+    """A resumed run must not re-execute a tool that already committed.
+
+    The history is seeded past one page on purpose: recovery that stops at the
+    first page rebuilds a partial view, and a tool whose record sat on page two
+    would execute a second time — the CEL-108 failure reached by another route.
+    """
+    client = LeasingMockClient()
+    session = tool_session_id("t-replay")
+    client.sessions[session] = {"workflow_id": "langgraph", "version": "1.0.0"}
+    client.graphs[session] = [
+        {
+            "sequence": i,
+            "name": "charge",
+            "output_payload": {"result": {"charged": i}},
+        }
+        for i in range(1, 131)
+    ]
+
+    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+        with patch.object(client, "start_session", wraps=client.start_session) as start:
+            start.return_value = MagicMock(
+                session_id=session, version="1.0.0", is_recovered=True
+            )
+            cfg: RunnableConfig = {"configurable": {"thread_id": "t-replay"}}
+            with durable_tools(cfg) as ctx:
+                pass
+
+    assert len(ctx.replayed_steps) == 130, "recovery stopped short of the full history"
+    assert ctx.replayed_steps[130]["name"] == "charge"

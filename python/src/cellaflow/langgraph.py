@@ -22,6 +22,7 @@ import random
 import time
 import secrets
 from collections import defaultdict
+from contextlib import contextmanager
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -120,6 +121,102 @@ else:
             config: RunnableConfig, metadata: CheckpointMetadata
         ) -> CheckpointMetadata:
             return metadata
+
+
+#: Distinguishes the session holding a thread's leased tool calls from the one
+#: holding its checkpoints. They cannot be the same session: the saver and
+#: `@step` advance *independent* sequence counters, so pointing both at one
+#: session makes them compete for graph positions and the loser is refused.
+#: They also cannot be unrelated, because a tool's idempotency key is derived
+#: from its session id -- an id that changes between runs derives a different
+#: key, and a lease that cannot recognise the earlier attempt does not prevent
+#: the side effect from happening twice.
+#:
+#: Deriving one from the other satisfies both: distinct, and identical on every
+#: run of the same thread.
+_TOOL_SESSION_SUFFIX = "-cellaflow-tools"
+
+
+def tool_session_id(thread_id: str) -> str:
+    """Returns the session id holding `thread_id`'s leased tool calls.
+
+    Deterministic, so a restart derives the same value and the lease taken
+    before a crash is still recognised afterwards.
+    """
+    return f"{thread_id}{_TOOL_SESSION_SUFFIX}"
+
+
+@contextmanager
+def durable_tools(
+    config: "RunnableConfig",
+    *,
+    workflow_id: str = "langgraph",
+    version: str = "1.0.0",
+    target: str = "localhost:50051",
+    secure: bool = False,
+    coordination_id: Optional[str] = None,
+) -> Iterator[Any]:
+    """Runs a LangGraph invocation so `@tool` calls inside nodes are leased.
+
+    A `@tool` resolves its context from a `ContextVar`, and LangGraph copies the
+    calling context into its executor, so a tool inside a node body reaches
+    whatever context is active around `invoke`. This establishes one bound to
+    the graph's own thread:
+
+        with durable_tools(config):
+            app.invoke({"ticket": "T-4417"}, config)
+
+    which is what makes a node's side effect happen at most once across a crash
+    and resume. Without it, a tool in a node either finds no context at all or
+    -- if the graph is wrapped in a plain `@workflow` -- finds one whose session
+    id is freshly generated per run, which derives a different idempotency key
+    each time and so leases nothing across the restart that matters.
+
+    Prefer this over hand-rolling the equivalent: the session derivation is the
+    part that is easy to get wrong, and getting it wrong fails silently, by
+    repeating the side effect rather than raising.
+
+    Nested tool calls share one session per thread, so two concurrent
+    invocations of the *same* thread contend for graph positions. That is the
+    same constraint LangGraph itself imposes -- one execution per thread -- not
+    an additional one.
+    """
+    from cellaflow.context import WorkflowContext, set_context, reset_context
+
+    thread_id = config["configurable"]["thread_id"]
+    session_id = tool_session_id(thread_id)
+
+    client = CellaflowClient(target=target, secure=secure)
+    resp = client.start_session(
+        workflow_id=workflow_id, version=version, session_id=session_id
+    )
+
+    replayed_steps = {}
+    if resp.is_recovered:
+        steps, cursor = client.get_graph(session_id=resp.session_id)
+        while True:
+            for step_info in steps:
+                replayed_steps[step_info["sequence"]] = {
+                    "name": step_info["name"],
+                    "payload": step_info["output_payload"],
+                }
+            if not cursor:
+                break
+            steps, cursor = client.get_graph(session_id=resp.session_id, cursor=cursor)
+
+    ctx = WorkflowContext(
+        client=client,
+        session_id=resp.session_id,
+        workflow_version=resp.version,
+        sequence=0,
+        replayed_steps=replayed_steps,
+        coordination_id=coordination_id,
+    )
+    token = set_context(ctx)
+    try:
+        yield ctx
+    finally:
+        reset_context(token)
 
 
 class CellaflowSaver(_BaseSaver):
