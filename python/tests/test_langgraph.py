@@ -1064,12 +1064,21 @@ def test_a_tool_in_a_node_is_not_leased_without_the_helper() -> None:
         app.invoke(PaymentState(amount=2499), cfg)
 
 
-def test_durable_tools_replays_committed_steps_across_pages() -> None:
-    """A resumed run must not re-execute a tool that already committed.
+def test_durable_tools_does_not_seed_positional_replay() -> None:
+    """Replaces a test that asserted the defect: it pinned that recovery seeded
+    `replayed_steps` from history, which is correct for `@workflow` and wrong
+    here.
 
-    The history is seeded past one page on purpose: recovery that stops at the
-    first page rebuilds a partial view, and a tool whose record sat on page two
-    would execute a second time.
+    That replay answers the step at sequence N with whatever was committed at
+    sequence N — sound only when the resumed run re-executes from the start.
+    `@workflow` does; **LangGraph resume does not**. It restores from a
+    checkpoint and re-runs only the pending node, so a later tool arrives at an
+    earlier position and is answered with a different tool's result.
+
+    Deduplication comes from the idempotency cache instead, which does not
+    encode the position: under `SCOPE_SESSION_WIDE` the derived key sets
+    `seq_part = "session_wide"`, so a resumed call derives the same key and the
+    engine answers HIT wherever the counter happens to be.
     """
     client = LeasingMockClient()
     session = tool_session_id("t-replay")
@@ -1084,7 +1093,7 @@ def test_durable_tools_replays_committed_steps_across_pages() -> None:
     ]
 
     with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
-        with patch.object(client, "start_session", wraps=client.start_session) as start:
+        with patch.object(client, "start_session") as start:
             start.return_value = MagicMock(
                 session_id=session, version="1.0.0", is_recovered=True
             )
@@ -1092,8 +1101,71 @@ def test_durable_tools_replays_committed_steps_across_pages() -> None:
             with durable_tools(cfg) as ctx:
                 pass
 
-    assert len(ctx.replayed_steps) == 130, "recovery stopped short of the full history"
-    assert ctx.replayed_steps[130]["name"] == "charge"
+    assert ctx.replayed_steps == {}, (
+        "durable_tools seeded positional replay; a resumed LangGraph run reaches "
+        "a later tool at an earlier position, so this answers it with the wrong "
+        "tool's result"
+    )
+
+
+def test_a_second_tool_node_resumes_at_its_own_identity() -> None:
+    """The case the original crash test missed.
+
+    It used a single tool-bearing node, so the sequence lined up on resume by
+    coincidence. With two, run 2 re-runs only the pending node — the second tool
+    arrives at position 1, where the *first* tool's record sits.
+
+    Asserts on the derived key rather than the counter: the key is what the
+    engine deduplicates on, and it must be identical across both runs for the
+    second tool despite the position differing.
+    """
+    from cellaflow.idempotency import IdempotencyScope, derive_idempotency_key
+
+    session = tool_session_id("t-two")
+
+    # Run 1: charge_card is the 2nd tool reached, so sequence 2.
+    first_run = derive_idempotency_key(
+        session,
+        "1.0.0",
+        2,
+        "default",
+        "charge_card",
+        IdempotencyScope.SCOPE_SESSION_WIDE,
+        None,
+        "BK-77",
+        2499,
+    )
+    # Run 2: LangGraph skips the completed node, so it is the 1st reached.
+    second_run = derive_idempotency_key(
+        session,
+        "1.0.0",
+        1,
+        "default",
+        "charge_card",
+        IdempotencyScope.SCOPE_SESSION_WIDE,
+        None,
+        "BK-77",
+        2499,
+    )
+
+    assert first_run == second_run, (
+        "the key moved with the position, so a resumed run would not recognise "
+        "the charge it already made"
+    )
+
+    # And the first tool must stay distinct, or resume would dedupe them together.
+    other_tool = derive_idempotency_key(
+        session,
+        "1.0.0",
+        1,
+        "default",
+        "reserve_seat",
+        IdempotencyScope.SCOPE_SESSION_WIDE,
+        None,
+        "BK-77",
+        2499,
+    )
+    assert other_tool != first_run, "two different tools collided on one key"
 
 
 def test_durable_tools_accepts_a_config_or_a_bare_thread_id() -> None:

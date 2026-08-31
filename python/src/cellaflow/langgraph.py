@@ -244,25 +244,34 @@ def durable_tools(
         workflow_id=workflow_id, version=version, session_id=session_id
     )
 
-    replayed_steps = {}
-    if resp.is_recovered:
-        steps, cursor = client.get_graph(session_id=resp.session_id)
-        while True:
-            for step_info in steps:
-                replayed_steps[step_info["sequence"]] = {
-                    "name": step_info["name"],
-                    "payload": step_info["output_payload"],
-                }
-            if not cursor:
-                break
-            steps, cursor = client.get_graph(session_id=resp.session_id, cursor=cursor)
-
+    # Deliberately no `replayed_steps`, which is the one thing that must not be
+    # carried over from `@workflow`.
+    #
+    # That replay is *positional*: the step at sequence N is answered from
+    # whatever was committed at sequence N, which is sound only when the resumed
+    # run re-executes from the start. `@workflow` does. **LangGraph resume does
+    # not** -- it restores from a checkpoint and re-runs only the pending node,
+    # so a second run reaches a *later* tool at an *earlier* position. Seeding
+    # positional history here made a two-node graph answer `charge_card` with
+    # whatever `reserve_seat` committed at sequence 1, which the name check in
+    # `_replay` turns into a permanently unresumable thread.
+    #
+    # Nothing is lost by omitting it. Under the default `SCOPE_SESSION_WIDE` the
+    # derived key sets `seq_part = "session_wide"` (`idempotency.py`), so the key
+    # does **not** encode the position: the resumed call derives the same key,
+    # the engine answers `CACHE_STATUS_HIT` from the committed result, and the
+    # tool body never runs. Deduplication comes from the idempotency cache, which
+    # is position-independent, instead of from a counter that cannot stay aligned.
+    #
+    # A hit also arbitrates no graph position (the engine's `Hit` arm returns
+    # untouched, CEL-92) and reports `current_sequence`, which
+    # `reconcile_sequence` adopts before the next step -- so the counter
+    # re-converges on the engine's view rather than drifting.
     ctx = WorkflowContext(
         client=client,
         session_id=resp.session_id,
         workflow_version=resp.version,
         sequence=0,
-        replayed_steps=replayed_steps,
         coordination_id=coordination_id,
     )
     token = set_context(ctx)

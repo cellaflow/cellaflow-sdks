@@ -270,6 +270,18 @@ still recognises the earlier attempt, and separate from the checkpointer's own
 session, so the two do not compete for positions in the graph. A tool called
 outside `durable_tools` raises rather than running unleased.
 
+#### Two nodes calling the same tool
+
+Under the default `SCOPE_SESSION_WIDE` the key is derived from the tool name and
+arguments, **not** the graph position — which is exactly what lets the guarantee
+survive a resume, since LangGraph re-runs only the pending node and so reaches
+tools in a different order.
+
+The consequence: two *different* nodes calling the same `tool_name` with the same
+arguments in one thread deduplicate into a single execution. Give them distinct
+`tool_name`s, or an explicit `idempotency_key`, when they are genuinely different
+operations.
+
 #### When replicas disagree about the arguments
 
 Worth knowing before relying on this. The derived key hashes the tool's
