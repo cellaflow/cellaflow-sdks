@@ -1,0 +1,22 @@
+# Postgres holds the LangGraph checkpoints. CellaFlow holds the leases.
+# Both arms of the proof run against exactly this, so the only variable is
+# whether the tool call is leased.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: proof
+      POSTGRES_DB: proof
+    ports: ["55433:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  cellaflow:
+    image: ghcr.io/cellaflow/cellaflow:latest
+    environment:
+      CELLAFLOW_HOST: "::"
+      CELLAFLOW_DB_PATH: /data/cellaflow
+    ports: ["50051:50051", "9090:9090"]
