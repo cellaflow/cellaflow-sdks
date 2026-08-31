@@ -23,7 +23,6 @@ import uuid
 from typing import Any, Callable, Dict, List
 
 import gateway
-import langgraph_agent
 import swarm
 
 TICKET_ID = "TICKET-4417"
@@ -261,6 +260,10 @@ def scenario_heterogeneous(n_agents: int) -> tuple[int, int]:
 
 def scenario_langgraph() -> tuple[int, int]:
     """A LangGraph node charges the customer, dies, and resumes."""
+    # Imported here, not at module scope: LangGraph is an optional extra and the
+    # other four scenarios must still run without it installed.
+    import langgraph_agent
+
     print("\n" + "=" * 72)
     print("  SCENARIO 5 - a LangGraph node that crashes after moving money")
     print("=" * 72)
@@ -320,6 +323,8 @@ def _crash_worker(
     thread_id: str, ticket_id: str, amount: int, agent_id: str, env: Dict[str, str]
 ) -> None:
     """Runs phase 1 with the crash flag set, in a process expected to die."""
+    import langgraph_agent
+
     os.environ.update(env)
     try:
         langgraph_agent.run_phase(thread_id, ticket_id, amount, agent_id)

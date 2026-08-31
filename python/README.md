@@ -15,6 +15,7 @@ The official Python SDK for the [CellaFlow Engine](https://www.cellaflow.com) �
 - 🔄 **Durable Execution & Transparent Replay**: Workflows survive process restarts and infrastructure crashes without re-executing completed steps.
 - ⚡ **Zero-Friction Decorators**: Annotate standard Python functions with `@workflow`, `@step`, and `@tool` (supporting both `def` and `async def`).
 - 🧠 **LangGraph Drop-in Checkpointer**: Native `CellaflowSaver` checkpointer for LangGraph workflows with immutable MessagePack state snapshots, time-travel, and crash recovery.
+- 💳 **Leased Tool Calls Inside LangGraph Nodes**: `durable_tools` makes a node's irreversible side effect happen at most once — across a crash, a restart, or a resumed thread. A checkpointer makes your state durable; this makes your *charges* durable.
 - 🛡️ **Deterministic Idempotency**: Automatic input hashing via RFC 8785 Canonical JSON and SHA-256 guarantees cross-language determinism across multi-agent swarms.
 - 🤝 **Cross-Session Coordination**: `SCOPE_SHARED` lets heterogeneous agents — different workflows, different sessions, different versions — converge on a single execution of a shared side effect.
 - 🔒 **Background Lease Management**: Non-blocking heartbeat management keeps engine locks alive and eliminates split-brain execution using fencing tokens.
@@ -224,6 +225,69 @@ for checkpoint_tuple in checkpointer.list(config):
     print("Checkpoint ID:", checkpoint_tuple.checkpoint["id"])
     print("State snapshot:", checkpoint_tuple.checkpoint["channel_values"])
 ```
+
+---
+
+### 6. Leased Tool Calls Inside LangGraph Nodes (`durable_tools`)
+
+A checkpointer makes your graph's **state** durable. It does nothing for a
+node's **side effects** — if a node charges a customer and the pod dies before
+the next checkpoint lands, the resumed run re-enters that node and charges
+again.
+
+`durable_tools` closes that window. Wrap the invocation, and any `@tool` called
+inside a node body is leased: it runs at most once per thread, across crashes
+and restarts.
+
+```python
+from cellaflow import CellaflowSaver, durable_tools, tool
+
+@tool(tool_name="issue_refund")
+def issue_refund(ticket_id: str, cents: int) -> dict:
+    return payment_gateway.charge(ticket_id, cents)   # irreversible
+
+def refund_node(state):
+    return {"receipt": issue_refund(state["ticket"], state["amount"])}
+
+app = builder.compile(checkpointer=CellaflowSaver(target="localhost:50051"))
+config = {"configurable": {"thread_id": "ticket-4417"}}
+
+with durable_tools(config):
+    app.invoke({"ticket": "T-4417", "amount": 2499}, config)
+```
+
+If that process dies after the charge and a new one resumes the thread,
+LangGraph re-runs the pending node, the tool is reached a second time, and the
+lease answers from the recorded result instead of calling the gateway. The
+customer is charged once. `examples/multi_agent_idempotency` scenario 5
+demonstrates exactly this, killing the process between the charge and the
+checkpoint.
+
+**Use the context manager rather than assembling the equivalent yourself.** A
+tool's idempotency key is derived from its session id, and `durable_tools`
+derives that session from the thread — stable across restarts, so the lease
+still recognises the earlier attempt, and separate from the checkpointer's own
+session, so the two do not compete for positions in the graph. A tool called
+outside `durable_tools` raises rather than running unleased.
+
+#### When replicas disagree about the arguments
+
+Worth knowing before relying on this. The derived key hashes the tool's
+arguments, so two replicas that reach the same node with **different**
+arguments derive different keys and do not contend — each is, as far as the
+engine can tell, a distinct operation.
+
+Passing an explicit key makes them converge:
+
+```python
+@tool(tool_name="issue_refund", idempotency_key=f"refund-{ticket_id}")
+```
+
+That prevents the double charge, with a trade-off to state plainly: the replica
+that loses receives a result computed from arguments it did not supply. If the
+replicas disagreed about the amount, the loser is handed a refund for someone
+else's number. The durable fix is to make the disputed value itself a leased
+step, so they agree on it before reaching the step that spends it.
 
 ---
 
