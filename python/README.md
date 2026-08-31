@@ -463,6 +463,28 @@ Decorators for atomic units of execution within a workflow:
 - **Lease Heartbeating**: Automatically runs background heartbeats (`RenewLease`) via daemon threads (sync) or asyncio tasks (async) to keep engine locks refreshed.
 - **Lock Release on Failure**: If an unhandled exception occurs, automatically releases the lease with `reason="TOOL_ERROR"`.
 
+> **A lease is only as durable as its session.** The key is derived from the session id, and
+> `@workflow` generates a fresh session per call unless you pass `_session_id` — so without a
+> stable session id, a `@tool` deduplicates *within* a run but not across a restart. If you are
+> using `@tool` to make a side effect happen at most once across a crash, pass a stable
+> `_session_id`. Inside LangGraph, use `durable_tools`, which derives one from the thread.
+
+### `durable_tools(config, *, workflow_id="langgraph", version="1.0.0", target=..., secure=False, coordination_id=None)`
+Context manager that makes `@tool` work inside LangGraph node bodies, where there is no
+`@workflow` frame to resolve. Derives a session from the graph's `thread_id`, establishes the
+context around the invocation, and loads previously committed steps so a resumed run replays them
+rather than re-executing.
+
+```python
+with durable_tools(config):
+    app.invoke({"ticket": "T-4417"}, config)
+```
+
+The derived session is **distinct** from the checkpointer's — the two advance independent sequence
+counters and would otherwise compete for graph positions — and **deterministic** for a given
+thread, so the idempotency key survives a restart. `tool_session_id(thread_id)` exposes the
+mapping for inspection. See [Leased Tool Calls Inside LangGraph Nodes](#6-leased-tool-calls-inside-langgraph-nodes-durable_tools).
+
 ### `IdempotencyScope`
 Controls how cached step and tool results are shared across multi-agent sessions:
 - `IdempotencyScope.SCOPE_SESSION_WIDE` *(Default)*: Cached results are shared across all agents in the session.
