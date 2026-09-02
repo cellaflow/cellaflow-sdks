@@ -41,6 +41,24 @@ confirmation should be.
 claims it did the right thing is not evidence; a file that only the charge path
 appends to is. Same discipline as `examples/at_most_once_proof`.
 
+## If you paste the wrong session id
+
+Nothing bad happens, and the script tells you:
+
+```
+⚠️  charge_card DID run. That session id had no history on this
+    engine, so this started a new run rather than resuming one.
+    Use the id printed by your own first run.
+```
+
+`_session_id` is create-or-resume, so an unknown id starts a fresh session rather
+than failing. That is correct engine behaviour — but it means the id has to be
+one *your* engine issued, not one copied from documentation.
+
+The script knows which happened because the counter lives inside the tool body:
+a replayed step never enters its body, so the count stays at zero. It reports
+what it observed rather than what it hoped.
+
 ## Things you can check yourself
 
 - **Run it fresh again** — a *different* session charges again, as it should.
