@@ -41,6 +41,34 @@ confirmation should be.
 claims it did the right thing is not evidence; a file that only the charge path
 appends to is. Same discipline as `examples/at_most_once_proof`.
 
+It is **append-only**, and every line carries its session id:
+
+```
+8fc58c27-8253-44e4-83d4-bc971787b2b6 ch_02eb56524f ORD-1001 2499
+```
+
+That matters because **the engine outlives any single run.** An earlier version
+cleared the ledger on each fresh run, so resuming an older session produced a
+confirmation id with no matching ledger line — the file had been reset while the
+engine had not, and the two no longer agreed about what happened.
+
+The script now reports the charges for *this* session separately from the file
+total, so the two numbers can never imply a relationship they don't have.
+
+## Resuming a session created somewhere else
+
+Sessions live in the engine, not in this directory. If you resume one that was
+created by a run elsewhere, the replay is real but the local ledger has no line
+for it, and the script says so:
+
+```
+charge_card did NOT run -- replayed from the durable log.
+(No ledger line here for that session: it was charged by a run
+ in another directory. The engine still has the record, which
+ is why the confirmation above is the original one.)
+this session: 0 charge(s)
+```
+
 ## If you paste the wrong session id
 
 Nothing bad happens, and the script tells you:
