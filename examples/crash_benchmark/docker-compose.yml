@@ -1,0 +1,21 @@
+# Postgres holds the LangGraph checkpoints for all three arms. CellaFlow holds
+# the leases for arm C only. Every arm runs against exactly this.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    ports: ["55434:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  cellaflow:
+    image: ghcr.io/cellaflow/cellaflow:latest
+    environment:
+      CELLAFLOW_HOST: "::"
+      CELLAFLOW_DB_PATH: /data/cellaflow
+    ports: ["50051:50051", "9090:9090"]
