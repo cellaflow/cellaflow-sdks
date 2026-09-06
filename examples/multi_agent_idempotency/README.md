@@ -10,7 +10,7 @@ Five scenarios, each a different way a charge gets duplicated:
 | 1 | Five replicas, no coordination | Nothing. Five charges. |
 | 2 | Five replicas, same session, same inputs | One derived key. One winner, four cache hits. |
 | 3 | Five replicas that **disagree** about the amount | The graph position they all target. Four are refused *before* they charge. |
-| 4 | Five **different** agents in five separate sessions | A coordination domain they each name. |
+| 4 | Five **different** agents that disagree about the amount | A coordination domain, plus a declaration of what identifies the work. |
 | 5 | One agent, killed **after** charging | A lease scoped to the thread. The resumed run reuses the charge. |
 
 Scenario 5 is the one a checkpointer cannot do: the side effect happens inside a LangGraph node.
@@ -123,6 +123,23 @@ def review_flagged_order(ticket_id: str, amount_cents: int) -> dict:
 
 review_flagged_order("TICKET-4417", 2499, _coordination_id="refund-TICKET-4417")
 ```
+
+The agents deliberately propose **different amounts**, because five agents that independently
+concluded a refund is needed will not have concluded the same number — that is what makes them
+independent. An earlier version of this scenario gave them all the same amount, which tested a
+weaker version of its own premise and hid a real defect.
+
+The output names what that costs:
+
+```
+  4 agent(s) proposed a different amount and adopted $24.99:
+    fraud-detector, billing-recon, csat-followup, ops-sweeper
+```
+
+Convergence is not free. Four agents accepted a result computed from arguments they did not
+supply. That is the right answer when the ticket identifies the work and the amount is incidental,
+and the wrong answer when the amount *is* the disagreement — in which case make the disputed value
+its own leased step, so they agree on it before reaching the step that spends it.
 
 `shared_on` names what identifies the work — the ticket, not the amount. That distinction is
 load-bearing: agents that reasoned their way to different amounts must still converge on one
