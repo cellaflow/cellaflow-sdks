@@ -1,8 +1,9 @@
 import pytest
 from unittest.mock import MagicMock
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from cellaflow.decorators import workflow, step
+from cellaflow.decorators import workflow, step, tool
+from cellaflow.idempotency import IdempotencyScope
 from cellaflow.v1 import service_pb2
 from cellaflow.serialization import serialize
 from cellaflow.v1 import idempotency_pb2
@@ -1111,3 +1112,51 @@ def test_non_precondition_rpc_errors_are_not_reinterpreted(
     assert not isinstance(
         excinfo.value, DivergentStepError
     ), "a transport failure is not a divergence and must not be relabelled as one"
+
+
+def test_shared_scope_refuses_a_tool_that_has_not_named_its_work() -> None:
+    """SCOPE_SHARED cannot derive a safe key on its own, so it must not guess.
+
+    Hashing every argument splits the key across agents that disagree, and each
+    then performs the side effect. An agent cannot detect that locally -- it
+    sees only its own arguments -- so the decision belongs to the caller, made
+    once, at import rather than in production.
+    """
+    with pytest.raises(ValueError, match="which of its arguments identify"):
+
+        def issue_refund(ticket_id: str, amount_cents: int) -> Dict[str, Any]:
+            return {}
+
+        tool(tool_name="issue_refund", scope=IdempotencyScope.SCOPE_SHARED)(
+            issue_refund
+        )
+
+
+def test_shared_on_typo_is_caught_at_import() -> None:
+    """A misspelled argument name would silently hash nothing and converge
+    everything, so it fails at decoration with the real parameter list."""
+    with pytest.raises(ValueError, match="not parameters of"):
+
+        def issue_refund(ticket_id: str, amount_cents: int) -> Dict[str, Any]:
+            return {}
+
+        tool(
+            tool_name="issue_refund",
+            scope=IdempotencyScope.SCOPE_SHARED,
+            shared_on=["tickett_id"],
+        )(issue_refund)
+
+
+def test_shared_scope_accepts_an_explicit_key_instead() -> None:
+    """A static key is still a valid way to say what the work is."""
+
+    def issue_refund(ticket_id: str, amount_cents: int) -> Dict[str, Any]:
+        return {}
+
+    wrapped = tool(
+        tool_name="issue_refund",
+        scope=IdempotencyScope.SCOPE_SHARED,
+        idempotency_key="refund:fixed",
+    )(issue_refund)
+
+    assert wrapped is not None

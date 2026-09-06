@@ -109,10 +109,12 @@ that spends it.
 
 Five different agents in five different sessions share no position, so none of that applies.
 `SCOPE_SHARED` derives a key from a domain the caller names instead — dropping both the session
-and the workflow version, since these agents agree on neither:
+and the workflow version, since these agents agree on neither, and hashing only the arguments
+named in `shared_on`:
 
 ```python
-@tool(tool_name="issue_refund", scope=IdempotencyScope.SCOPE_SHARED)
+@tool(tool_name="issue_refund", scope=IdempotencyScope.SCOPE_SHARED,
+      shared_on=["ticket_id"])
 def issue_refund_step(ticket_id: str, amount_cents: int) -> dict: ...
 
 @workflow(version="2.4.1")
@@ -121,6 +123,11 @@ def review_flagged_order(ticket_id: str, amount_cents: int) -> dict:
 
 review_flagged_order("TICKET-4417", 2499, _coordination_id="refund-TICKET-4417")
 ```
+
+`shared_on` names what identifies the work — the ticket, not the amount. That distinction is
+load-bearing: agents that reasoned their way to different amounts must still converge on one
+refund, and hashing the amount would give each of them its own key and its own charge. It is
+required for this scope, and omitting it raises at import.
 
 The domain is required and has no default. A default would make two unrelated callers that
 happen to make the same call deduplicate against each other, suppressing one of them with no

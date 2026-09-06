@@ -119,7 +119,8 @@ operation.
 from cellaflow import workflow, tool, IdempotencyScope
 
 # Same tool_name, same arguments, same coordination_id -> same key.
-@tool(tool_name="publish_release_notes", scope=IdempotencyScope.SCOPE_SHARED)
+@tool(tool_name="publish_release_notes", scope=IdempotencyScope.SCOPE_SHARED,
+      shared_on=["version"])
 def publish(version: str) -> dict:
     return notes_service.publish(version)   # runs exactly once
 
@@ -140,7 +141,20 @@ doc_writer_agent("v4.2", _coordination_id="release-4.2")
 passed at the call site alongside `_session_id`, because it is a property of the collaboration and
 not of the tool definition.
 
-It is **required** for `SCOPE_SHARED` and has no default; omitting it raises `ValueError`. A default
+`shared_on` names the arguments that identify the shared work — here, the version being
+published. **It is required** (or an explicit `idempotency_key`), and omitting it raises at import
+rather than in production.
+
+The reason is the point of the scope. Agents sharing a side effect will not agree on every
+argument — that is what makes them different agents — so hashing all of their arguments gives each
+one its own key and each performs the side effect. Naming the identifying arguments lets them
+disagree about everything else and still converge.
+
+Note the trade-off you accept by doing so: the agents that lose receive a result computed from
+arguments they did not supply. If that matters, make the disputed value itself a leased step so
+they agree on it before reaching the step that spends it.
+
+`_coordination_id` is **required** for `SCOPE_SHARED` and has no default; omitting it raises `ValueError`. A default
 would silently deduplicate unrelated callers that happen to make the same call — one agent's
 operation is suppressed and it is handed a result it never asked for, with no error raised anywhere.
 Making the domain explicit forces that boundary to be a decision rather than an accident. The other
@@ -491,7 +505,8 @@ Decorators for atomic units of execution within a workflow:
 ```
 - **Idempotency Key Derivation**: Automatically builds a deterministic key using:
   `[Session_ID]:[Workflow_Version]:[Step_Sequence]:[Agent_ID]:[Tool_Name]:[RFC8785_SHA256_Hash]`
-  — except under `SCOPE_SHARED`, which drops the session and version entirely:
+  — except under `SCOPE_SHARED`, which drops the session and version entirely, and hashes only
+  the arguments named in `shared_on`:
   `shared:[Coordination_ID]:[Tool_Name]:[RFC8785_SHA256_Hash]`
 - **Replay Interception**: If a step was already completed in the session history, immediately returns the cached output without re-running the function body.
 - **Lease Heartbeating**: Automatically runs background heartbeats (`RenewLease`) via daemon threads (sync) or asyncio tasks (async) to keep engine locks refreshed.
