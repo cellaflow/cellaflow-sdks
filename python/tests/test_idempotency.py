@@ -179,3 +179,68 @@ def test_shared_scope_still_separates_different_inputs() -> None:
         )
 
     assert key("alpha") != key("beta")
+
+
+# ---------------------------------------------------------------------------
+# SCOPE_SHARED must converge agents that disagree on arguments
+# ---------------------------------------------------------------------------
+
+
+def test_shared_scope_converges_agents_with_divergent_arguments() -> None:
+    """Five agents reason five different amounts for one refund.
+
+    Measured against a live engine before this fix: five separate charges,
+    because the derived key hashed the amount. A hand-rolled advisory lock
+    keyed on the ticket produced one.
+
+    `shared_on` names the arguments that identify the shared work, so the
+    amount is free to differ without splitting the key.
+    """
+    keys = {
+        derive_idempotency_key(
+            f"session-{i}",
+            "1.0.0",
+            1,
+            "default",
+            "issue_refund",
+            IdempotencyScope.SCOPE_SHARED,
+            "refund-T-4417",
+            _shared_on=("ticket",),
+            ticket="T-4417",
+            amount_cents=2499 + i,
+        )
+        for i in range(5)
+    }
+    assert len(keys) == 1, (
+        f"agents that disagree on the amount must still converge on one "
+        f"refund for the ticket; got {len(keys)} distinct keys: {keys}"
+    )
+
+
+def test_shared_scope_still_separates_different_work() -> None:
+    """Convergence must not become collision: different tickets stay distinct."""
+    a = derive_idempotency_key(
+        "s1",
+        "1.0.0",
+        1,
+        "default",
+        "issue_refund",
+        IdempotencyScope.SCOPE_SHARED,
+        "refund-A",
+        _shared_on=("ticket",),
+        ticket="T-1",
+        amount_cents=100,
+    )
+    b = derive_idempotency_key(
+        "s2",
+        "1.0.0",
+        1,
+        "default",
+        "issue_refund",
+        IdempotencyScope.SCOPE_SHARED,
+        "refund-B",
+        _shared_on=("ticket",),
+        ticket="T-2",
+        amount_cents=100,
+    )
+    assert a != b, "different tickets must not collide"

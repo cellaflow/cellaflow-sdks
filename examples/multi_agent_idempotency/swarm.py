@@ -240,6 +240,11 @@ def run_shared_agent(
         # would derive different keys and never converge. This is the footgun.
         tool_name="issue_refund",
         scope=IdempotencyScope.SCOPE_SHARED,
+        # The ticket identifies the shared work. amount_cents deliberately does
+        # not: agents that reasoned their way to different amounts must still
+        # converge on one refund, and hashing the amount would give each of them
+        # its own key and its own charge.
+        shared_on=["ticket_id"],
     )
     def issue_refund_step(ticket_id: str, amount_cents: int) -> Dict[str, Any]:
         return gateway.issue_refund(ticket_id, amount_cents, charged_by=agent_id)

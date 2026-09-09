@@ -1,6 +1,6 @@
 import hashlib
 import rfc8785
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 
 from enum import Enum
@@ -43,13 +43,26 @@ def derive_idempotency_key(
     scope: IdempotencyScope,
     coordination_id: Optional[str],
     *args: Any,
+    _shared_on: Optional[Sequence[str]] = None,
     **kwargs: Any,
 ) -> str:
     """
     Derives the canonical idempotency key for a step or tool execution.
     Format varies based on IdempotencyScope.
     """
-    inputs_hash = _hash_inputs(*args, **kwargs)
+    if _shared_on is not None:
+        # Only the arguments that identify the shared work contribute.
+        # Heterogeneous agents converge on one side effect precisely when they
+        # disagree about everything else, so hashing everything they pass is the
+        # one thing guaranteed to keep them apart.
+        #
+        # Underscored to keep it out of the caller's keyword namespace: every
+        # other keyword here is a user argument being hashed, and a tool with a
+        # parameter named `shared_on` would otherwise silently lose it.
+        selected = {k: kwargs[k] for k in _shared_on if k in kwargs}
+        inputs_hash = _hash_inputs(**selected)
+    else:
+        inputs_hash = _hash_inputs(*args, **kwargs)
 
     if scope == IdempotencyScope.SCOPE_SHARED:
         # The only scope that omits session_id, so agents in different

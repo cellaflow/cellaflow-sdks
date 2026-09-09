@@ -215,7 +215,9 @@ def scenario_heterogeneous(n_agents: int) -> tuple[int, int]:
         "  reconciler each concluded independently that this order needs refunding.\n"
         "  Different workflows, different versions, no shared session -- so there is\n"
         "  no shared graph position to arbitrate.\n\n"
-        "  What they share is a coordination domain they each name."
+        "  They also disagree about the amount, because they reasoned separately.\n"
+        "  What they share is a coordination domain they each name, and a\n"
+        "  declaration of which argument identifies the work."
     )
 
     gateway.reset_ledger()
@@ -227,9 +229,15 @@ def scenario_heterogeneous(n_agents: int) -> tuple[int, int]:
         ("csat-followup", "close_the_loop", "1.2.0"),
         ("ops-sweeper", "sweep_stuck_orders", "0.9.0"),
     ]
+    # Each agent reasoned its own amount. Five agents that independently
+    # concluded this order needs refunding will not have concluded the same
+    # number -- that is what makes them independent. Handing them an identical
+    # amount would test a weaker version of this scenario's own premise, and it
+    # is what let a real defect through: the derived key hashed every argument,
+    # so divergent amounts split the key and every agent charged.
     args = [
-        (name, wf, ver, coordination_id, TICKET_ID, AMOUNT_CENTS)
-        for name, wf, ver in roles[:n_agents]
+        (name, wf, ver, coordination_id, TICKET_ID, AMOUNT_CENTS + i)
+        for i, (name, wf, ver) in enumerate(roles[:n_agents])
     ]
     results = _run_swarm(swarm.run_shared_agent, args)
 
@@ -237,17 +245,22 @@ def scenario_heterogeneous(n_agents: int) -> tuple[int, int]:
     charged_now = {(c["confirmation_id"], c["charged_by"]) for c in charges}
 
     print(f"\n  coordination_id = {coordination_id}\n")
-    print(f"  {'agent':<16} {'workflow':<24} {'ver':<7} {'outcome':<22}")
+    print(f"  {'agent':<16} {'workflow':<20} {'proposed':>9}  {'outcome':<22}")
     print(f"  {'-' * 72}")
     for r in results:
         role = next((x for x in roles if x[0] == r["agent_id"]), None)
-        wf, ver = (role[1], role[2]) if role else ("?", "?")
+        wf = role[1] if role else "?"
+        proposed = next(
+            (a[5] for a in args if a[0] == r["agent_id"]), AMOUNT_CENTS
+        )
         if not r["ok"]:
             outcome = f"FAILED: {r['error'][:14]}"
         else:
             mine = (r["confirmation_id"], r["agent_id"]) in charged_now
-            outcome = "charged the customer" if mine else "reused shared charge"
-        print(f"  {r['agent_id']:<16} {wf:<24} {ver:<7} {outcome:<22}")
+            outcome = "charged the customer" if mine else "adopted the winner's"
+        print(
+            f"  {r['agent_id']:<16} {wf:<20} {proposed / 100:>8.2f}  {outcome:<22}"
+        )
 
     print(f"  {'-' * 72}")
     print(f"  REAL CHARGES ON THE LEDGER: {len(charges)}")
@@ -255,6 +268,28 @@ def scenario_heterogeneous(n_agents: int) -> tuple[int, int]:
     confirmations = {r["confirmation_id"] for r in succeeded}
     if len(confirmations) == 1:
         print(f"  All {len(succeeded)} agents hold the same confirmation id.")
+
+    # The part that is easy to leave out, and should not be. `shared_on` says
+    # the ticket identifies the work and the amount does not -- so the agents
+    # that lost are holding a confirmation for a number they never proposed.
+    # That is the trade-off convergence buys, not a free win, and a demo that
+    # prints only "1 charge" is hiding it.
+    if charges:
+        won = charges[0]["amount_cents"]
+        adopted = [
+            a[0] for a in args if a[5] != won and a[0] != charges[0]["charged_by"]
+        ]
+        if adopted:
+            print(
+                f"\n  {len(adopted)} agent(s) proposed a different amount and adopted "
+                f"${won / 100:,.2f}:"
+            )
+            print(f"    {', '.join(adopted)}")
+            print(
+                "  Convergence means they accept a result computed from arguments\n"
+                "  they did not supply. If that is wrong for your workflow, make the\n"
+                "  disputed value its own leased step so they agree before spending."
+            )
     return len(charges), 1
 
 

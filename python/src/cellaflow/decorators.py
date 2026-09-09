@@ -4,7 +4,7 @@ import uuid
 import asyncio
 import time
 import logging
-from typing import Any, Callable, TypeVar, cast, Optional
+from typing import Any, Callable, Optional, Sequence, TypeVar, cast
 
 import grpc
 
@@ -189,6 +189,49 @@ def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
     return payload.get("result")
 
 
+def _validate_shared_scope(
+    func: Callable[..., Any],
+    scope: IdempotencyScope,
+    shared_on: Optional[Sequence[str]],
+    idempotency_key: Optional[str],
+) -> None:
+    """Refuses a SCOPE_SHARED tool that has not said what identifies its work.
+
+    Every other scope can derive a safe key on its own. This one cannot, and the
+    failure is silent: heterogeneous agents converge on a shared side effect
+    exactly when they disagree about their arguments, so hashing all of them
+    splits the key and every agent performs the side effect. Measured at five
+    agents, five charges.
+
+    An agent cannot detect the divergence locally either -- it sees only its own
+    arguments -- so this has to be the caller's decision, made once, at import.
+    """
+    if shared_on is not None:
+        params = inspect.signature(func).parameters
+        unknown = [n for n in shared_on if n not in params]
+        if unknown:
+            raise ValueError(
+                f"shared_on names {unknown} which are not parameters of "
+                f"{func.__name__}(). Known parameters: {list(params)}."
+            )
+        return
+
+    if scope == IdempotencyScope.SCOPE_SHARED and not idempotency_key:
+        raise ValueError(
+            f"{func.__name__}() uses SCOPE_SHARED without saying which of its "
+            f"arguments identify the shared work.\n\n"
+            f"Agents sharing a side effect will not agree on every argument -- "
+            f"that is what makes them different agents -- and hashing all of "
+            f"them gives each one its own key, so each performs the side "
+            f"effect. Name the identifying arguments instead:\n\n"
+            f"    @tool(tool_name=..., scope=IdempotencyScope.SCOPE_SHARED,\n"
+            f'          shared_on=["ticket_id"])\n\n'
+            f"Agents may then disagree about everything else and still converge "
+            f"on one execution. Note the trade-off this accepts: the agents that "
+            f"lose receive a result computed from arguments they did not supply."
+        )
+
+
 def step(
     func: Optional[F] = None,
     *,
@@ -196,6 +239,7 @@ def step(
     agent_id: str = "default",
     tool_name: Optional[str] = None,
     scope: IdempotencyScope = IdempotencyScope.SCOPE_SESSION_WIDE,
+    shared_on: Optional[Sequence[str]] = None,
 ) -> Any:
     if func is None:
         return functools.partial(
@@ -204,9 +248,11 @@ def step(
             agent_id=agent_id,
             tool_name=tool_name,
             scope=scope,
+            shared_on=shared_on,
         )
 
     actual_tool_name = tool_name or func.__name__
+    _validate_shared_scope(func, scope, shared_on, idempotency_key)
 
     @functools.wraps(func)
     async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -226,17 +272,34 @@ def step(
         # Derive idempotency key
         ikey = idempotency_key
         if not ikey:
-            ikey = derive_idempotency_key(
-                ctx.session_id,
-                ctx.workflow_version,
-                seq,
-                agent_id,
-                actual_tool_name,
-                scope,
-                ctx.coordination_id,
-                *args,
-                **kwargs,
-            )
+            if shared_on is not None:
+                # Bind first: the caller may have passed the identifying
+                # arguments positionally, and only names can select them.
+                bound = inspect.signature(func).bind_partial(*args, **kwargs)
+                bound.apply_defaults()
+                ikey = derive_idempotency_key(
+                    ctx.session_id,
+                    ctx.workflow_version,
+                    seq,
+                    agent_id,
+                    actual_tool_name,
+                    scope,
+                    ctx.coordination_id,
+                    _shared_on=shared_on,
+                    **bound.arguments,
+                )
+            else:
+                ikey = derive_idempotency_key(
+                    ctx.session_id,
+                    ctx.workflow_version,
+                    seq,
+                    agent_id,
+                    actual_tool_name,
+                    scope,
+                    ctx.coordination_id,
+                    *args,
+                    **kwargs,
+                )
 
         fencing_token = 0
         hb: Optional[LeaseHeartbeat] = None
@@ -334,17 +397,34 @@ def step(
         # Derive idempotency key
         ikey = idempotency_key
         if not ikey:
-            ikey = derive_idempotency_key(
-                ctx.session_id,
-                ctx.workflow_version,
-                seq,
-                agent_id,
-                actual_tool_name,
-                scope,
-                ctx.coordination_id,
-                *args,
-                **kwargs,
-            )
+            if shared_on is not None:
+                # Bind first: the caller may have passed the identifying
+                # arguments positionally, and only names can select them.
+                bound = inspect.signature(func).bind_partial(*args, **kwargs)
+                bound.apply_defaults()
+                ikey = derive_idempotency_key(
+                    ctx.session_id,
+                    ctx.workflow_version,
+                    seq,
+                    agent_id,
+                    actual_tool_name,
+                    scope,
+                    ctx.coordination_id,
+                    _shared_on=shared_on,
+                    **bound.arguments,
+                )
+            else:
+                ikey = derive_idempotency_key(
+                    ctx.session_id,
+                    ctx.workflow_version,
+                    seq,
+                    agent_id,
+                    actual_tool_name,
+                    scope,
+                    ctx.coordination_id,
+                    *args,
+                    **kwargs,
+                )
 
         fencing_token = 0
         hb: Optional[LeaseHeartbeat] = None
@@ -436,6 +516,7 @@ def tool(
     agent_id: str = "default",
     tool_name: Optional[str] = None,
     scope: IdempotencyScope = IdempotencyScope.SCOPE_SESSION_WIDE,
+    shared_on: Optional[Sequence[str]] = None,
 ) -> Any:
     """
     Decorator for tool steps that require idempotency tracking.
@@ -447,4 +528,5 @@ def tool(
         agent_id=agent_id,
         tool_name=tool_name,
         scope=scope,
+        shared_on=shared_on,
     )
