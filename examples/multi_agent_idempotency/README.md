@@ -107,7 +107,7 @@ that spends it.
 
 ### When the agents are not replicas at all (scenario 4)
 
-Five different agents in five different sessions share no position, so none of that applies.
+Five different agents in five different sessions share no position, so none of that applies — and that is a warning, not reassurance. The graph-position check in scenario 3 is session-scoped, so it is not a backstop here. Across sessions the derived key is the *only* thing standing between five agents and five charges, which is why what goes into it has to be declared rather than guessed.
 `SCOPE_SHARED` derives a key from a domain the caller names instead — dropping both the session
 and the workflow version, since these agents agree on neither, and hashing only the arguments
 named in `shared_on`:
