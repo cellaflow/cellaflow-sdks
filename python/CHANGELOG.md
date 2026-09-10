@@ -2,6 +2,41 @@
 
 All notable changes to the CellaFlow Python SDK.
 
+## 0.5.0
+
+### Added
+
+- **`shared_on` for cross-session convergence (`CEL-145`)**:
+  When heterogeneous agents across different sessions or workflows converge on a shared side effect (such as issuing a refund for a customer ticket), they frequently reason their way to different secondary arguments (e.g. diverging refund amounts, notes, or metadata). Previously, `SCOPE_SHARED` hashed all arguments into the idempotency key, causing each agent to derive a distinct key and execute duplicate side effects.
+
+  The `@tool` and `@step` decorators now accept `shared_on: Optional[Sequence[str]] = None`. When specified, only the named arguments contribute to the derived idempotency key:
+
+  ```python
+  @tool(
+      tool_name="issue_refund",
+      scope=IdempotencyScope.SCOPE_SHARED,
+      shared_on=["ticket_id"],
+  )
+  def issue_refund(ticket_id: str, amount_cents: int) -> dict: ...
+  ```
+
+  Positional arguments are bound and default parameter values are applied before extracting the target values. Arguments not named in `shared_on` can diverge freely across callers without splitting the key.
+
+### Breaking changes
+
+- **`SCOPE_SHARED` requires explicit identification of shared work**: Decorating a tool or step with `IdempotencyScope.SCOPE_SHARED` without declaring `shared_on=[...]` (or an explicit static `idempotency_key`) now raises `ValueError` at decoration time rather than failing in production or silently deriving colliding/divergent keys.
+- **Signature validation for `shared_on`**: Parameter names passed to `shared_on` are validated against the function's signature at decoration time; any parameter names not present in the signature raise `ValueError` immediately to catch typos at import.
+
+### Behaviour changes
+
+- **Deliberate key collapse across heterogeneous agents**: Declaring `shared_on` intentionally collapses keys. The winning agent executes the side effect with its arguments; losing agents receive the winning execution's result computed from arguments they did not supply. If callers must agree on disputed values, compute the disputed value in its own leased step before executing the shared tool.
+
+### Documentation & Examples
+
+- **At-Most-Once Proof (`examples/at_most_once_proof`)**: Added an automated, runnable two-arm harness demonstrating that while LangGraph checkpointers protect workflow state, tool-level side effects require leases (`durable_tools`) to prevent duplicate execution during process crashes.
+- **Runnable Quickstart Agent (`examples/quickstart`)**: Added a verified, runnable `research_agent.py` CLI script and append-only ledger demonstration showing durable replay and side-effect suppression against a live engine.
+- **Swarm Demo Convergence (`examples/multi_agent_idempotency`)**: Updated scenario 4 with divergent agent refund amounts to showcase multi-agent `shared_on` convergence and trade-off disclosure.
+
 ## 0.4.0
 
 ### Fixed
