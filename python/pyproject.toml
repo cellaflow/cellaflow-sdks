@@ -10,7 +10,10 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "grpcio>=1.60.0",
-    "protobuf>=4.25.0",
+    # Floor must match the gencode version the pinned grpcio-tools emits --
+    # the generated stubs assert it at import, so a lower runtime does not fail
+    # at first use, it fails at `import cellaflow`. See the dev pin below.
+    "protobuf>=5.29.0",
     "msgpack>=1.0.7",
     "rfc8785>=0.1.4",
 ]
@@ -41,8 +44,18 @@ dev = [
     "black>=24.0.0",
     "flake8>=7.0.0",
     "mypy>=1.8.0",
-    "grpcio-tools>=1.60.0",
-    "mypy-protobuf>=3.5.0",
+    # Pinned, not floored. protoc bakes its own version into every generated
+    # module as a runtime assertion, so whichever grpcio-tools happens to
+    # resolve silently sets the protobuf floor for everyone installing us.
+    # 1.71.0 emits gencode 5.29.0, which is inside the range CrewAI allows
+    # (<6.0, via opentelemetry-proto) and AutoGen requires (~=5.29.3). A newer
+    # toolchain emitted 7.35.1 and made us uninstallable alongside both.
+    "grpcio-tools==1.71.0",
+    # Pinned for the same reason as grpcio-tools: its own bundled
+    # extensions.proto carries a gencode guard, and recent releases are built
+    # against protobuf 6.x, which makes protoc refuse to run the plugin under
+    # the 5.x runtime the pin above targets. 3.6.0 carries no guard.
+    "mypy-protobuf==3.6.0",
     "langgraph-checkpoint>=2.0.0",
     "langgraph>=0.2.0",
 ]
