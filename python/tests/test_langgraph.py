@@ -1027,7 +1027,7 @@ def test_tool_inside_a_node_resolves_the_enclosing_context() -> None:
     )
 
     cfg: RunnableConfig = {"configurable": {"thread_id": "t-ctx"}}
-    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+    with patch("cellaflow.durable.CellaflowClient", return_value=client):
         with durable_tools(cfg):
             app.invoke(PaymentState(amount=2499), cfg)
 
@@ -1092,7 +1092,7 @@ def test_durable_tools_does_not_seed_positional_replay() -> None:
         for i in range(1, 131)
     ]
 
-    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+    with patch("cellaflow.durable.CellaflowClient", return_value=client):
         with patch.object(client, "start_session") as start:
             start.return_value = MagicMock(
                 session_id=session, version="1.0.0", is_recovered=True
@@ -1173,7 +1173,7 @@ def test_durable_tools_accepts_a_config_or_a_bare_thread_id() -> None:
     client = LeasingMockClient()
     seen = []
 
-    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+    with patch("cellaflow.durable.CellaflowClient", return_value=client):
         cfg: RunnableConfig = {"configurable": {"thread_id": "t-forms"}}
         with durable_tools(cfg) as a:
             seen.append(a.session_id)
@@ -1256,7 +1256,7 @@ def test_durable_tools_does_not_require_the_cellaflow_checkpointer() -> None:
     app = graph.compile(checkpointer=MemorySaver())
 
     cfg: RunnableConfig = {"configurable": {"thread_id": "tenant:acme/u-1"}}
-    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+    with patch("cellaflow.durable.CellaflowClient", return_value=client):
         with durable_tools(cfg):
             app.invoke(PaymentState(amount=2499), cfg)
 
@@ -1319,7 +1319,7 @@ def test_tool_resolves_however_the_framework_dispatches_it(dispatch: Any) -> Non
     from cellaflow.context import get_context
 
     client = LeasingMockClient()
-    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+    with patch("cellaflow.durable.CellaflowClient", return_value=client):
         with durable_tools("t-dispatch") as session:
             seen = dispatch(lambda: get_context().session_id)
 
@@ -1333,7 +1333,7 @@ def test_two_open_sessions_refuse_to_guess_rather_than_pick_one() -> None:
     from cellaflow.context import get_context
 
     client = LeasingMockClient()
-    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+    with patch("cellaflow.durable.CellaflowClient", return_value=client):
         with durable_tools("t-one") as a, durable_tools("t-two") as b:
             with pytest.raises(RuntimeError) as excinfo:
                 _dispatch_bare_executor(lambda: get_context().session_id)
@@ -1350,7 +1350,7 @@ def test_bind_resolves_the_ambiguity_the_fallback_refuses() -> None:
     from cellaflow.context import get_context
 
     client = LeasingMockClient()
-    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+    with patch("cellaflow.durable.CellaflowClient", return_value=client):
         with durable_tools("t-one") as a, durable_tools("t-two") as b:
             def _in_tool() -> str:
                 with b.bind():
@@ -1368,7 +1368,7 @@ def test_contextvar_still_wins_when_it_survives() -> None:
     from cellaflow.context import get_context
 
     client = LeasingMockClient()
-    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+    with patch("cellaflow.durable.CellaflowClient", return_value=client):
         with durable_tools("t-one") as a:
             inner_a = get_context().session_id
             with durable_tools("t-two") as b:
@@ -1386,7 +1386,7 @@ def test_sessions_are_deregistered_on_exit() -> None:
     from cellaflow.context import get_context
 
     client = LeasingMockClient()
-    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+    with patch("cellaflow.durable.CellaflowClient", return_value=client):
         with durable_tools("t-closed"):
             pass
 
