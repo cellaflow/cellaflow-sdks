@@ -1262,3 +1262,133 @@ def test_durable_tools_does_not_require_the_cellaflow_checkpointer() -> None:
 
     assert seen["session"] == tool_session_id("tenant:acme/u-1")
     assert client.granted, "the tool never took a lease"
+
+
+# ---------------------------------------------------------------------------
+# Context recovery when a framework dispatches a tool off the calling context
+# ---------------------------------------------------------------------------
+#
+# Agent frameworks do not agree on how they invoke a tool. Measured against
+# installed versions: LlamaIndex 0.14.24 and the OpenAI Agents SDK 0.22.2 use
+# `asyncio.to_thread`, which copies contextvars; CrewAI 1.9.3 does so on its
+# sync path but uses `loop.run_in_executor` on its async one; AutoGen 0.7.5 uses
+# `run_in_executor` for every sync tool. `run_in_executor` does not copy the
+# context, so a `@tool` reached that way cannot see the session.
+#
+# These tests reproduce each dispatch shape directly rather than importing four
+# agent frameworks into CI.
+
+
+def _dispatch_direct(fn: Any) -> Any:
+    return fn()
+
+
+def _dispatch_bare_executor(fn: Any) -> Any:
+    """The shape that loses the context: CrewAI async, AutoGen."""
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(fn).result()
+
+
+def _dispatch_run_in_executor(fn: Any) -> Any:
+    """`loop.run_in_executor(None, fn)`, verbatim what those frameworks call."""
+    import asyncio
+
+    async def _run() -> Any:
+        return await asyncio.get_event_loop().run_in_executor(None, fn)
+
+    return asyncio.run(_run())
+
+
+def _dispatch_to_thread(fn: Any) -> Any:
+    """The shape that keeps it: LlamaIndex, OpenAI Agents SDK, CrewAI sync."""
+    import asyncio
+
+    return asyncio.run(asyncio.to_thread(fn))
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [_dispatch_direct, _dispatch_bare_executor, _dispatch_run_in_executor,
+     _dispatch_to_thread],
+    ids=["direct", "bare-executor", "run_in_executor", "to_thread"],
+)
+def test_tool_resolves_however_the_framework_dispatches_it(dispatch: Any) -> None:
+    """A single open session is unambiguous, so every dispatch shape resolves."""
+    from cellaflow.context import get_context
+
+    client = LeasingMockClient()
+    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+        with durable_tools("t-dispatch") as session:
+            seen = dispatch(lambda: get_context().session_id)
+
+    assert seen == session.session_id
+
+
+def test_two_open_sessions_refuse_to_guess_rather_than_pick_one() -> None:
+    """With the context lost and several sessions open, nothing identifies the
+    owner. Guessing would attribute a side effect, and its lease, to the wrong
+    session -- so this must raise rather than resolve."""
+    from cellaflow.context import get_context
+
+    client = LeasingMockClient()
+    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+        with durable_tools("t-one") as a, durable_tools("t-two") as b:
+            with pytest.raises(RuntimeError) as excinfo:
+                _dispatch_bare_executor(lambda: get_context().session_id)
+
+    message = str(excinfo.value)
+    assert "Ambiguous workflow context" in message
+    # Both are named, so the reader can tell which two collided.
+    assert a.session_id in message and b.session_id in message
+    assert "session.bind()" in message
+
+
+def test_bind_resolves_the_ambiguity_the_fallback_refuses() -> None:
+    """The escape hatch for concurrent sessions: say which one explicitly."""
+    from cellaflow.context import get_context
+
+    client = LeasingMockClient()
+    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+        with durable_tools("t-one") as a, durable_tools("t-two") as b:
+            def _in_tool() -> str:
+                with b.bind():
+                    return get_context().session_id
+
+            seen = _dispatch_bare_executor(_in_tool)
+
+    assert seen == b.session_id
+    assert seen != a.session_id
+
+
+def test_contextvar_still_wins_when_it_survives() -> None:
+    """The fallback must not weaken the primary mechanism: where the context
+    does propagate, each session resolves to itself even with several open."""
+    from cellaflow.context import get_context
+
+    client = LeasingMockClient()
+    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+        with durable_tools("t-one") as a:
+            inner_a = get_context().session_id
+            with durable_tools("t-two") as b:
+                inner_b = get_context().session_id
+            after_b = get_context().session_id
+
+    assert inner_a == a.session_id
+    assert inner_b == b.session_id
+    assert after_b == a.session_id
+
+
+def test_sessions_are_deregistered_on_exit() -> None:
+    """A closed session must not be resolvable, or a later stray call would be
+    attributed to work that already finished."""
+    from cellaflow.context import get_context
+
+    client = LeasingMockClient()
+    with patch("cellaflow.langgraph.CellaflowClient", return_value=client):
+        with durable_tools("t-closed"):
+            pass
+
+    with pytest.raises(RuntimeError, match="No active workflow context"):
+        _dispatch_bare_executor(lambda: get_context().session_id)
