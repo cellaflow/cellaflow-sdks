@@ -2,6 +2,44 @@
 
 All notable changes to the CellaFlow Python SDK.
 
+## 0.6.0
+
+### Added & Changed
+
+- **Framework-agnostic `durable_tools` and top-level export**:
+  `durable_tools` and `tool_session_id` have moved from `cellaflow.langgraph` to `cellaflow.durable` and are now exported directly from the top-level `cellaflow` package:
+
+  ```python
+  from cellaflow import durable_tools, tool
+  ```
+
+  `durable_tools` requires only a session identifier and tools invoked within the block; it has no dependency on LangGraph. Moving it decouples CellaFlow's leased-execution primitive from any specific framework, making it natively usable with AutoGen, CrewAI, LlamaIndex, the OpenAI Agents SDK, or standalone Python applications.
+  - Backward compatibility is preserved: `cellaflow.langgraph` continues to re-export `durable_tools` and `tool_session_id`.
+  - `CellaflowSaver` remains in `cellaflow.langgraph` and is now lazily imported on first access via module `__getattr__` (with a `TYPE_CHECKING` guard). Importing `cellaflow` no longer eagerly loads LangGraph and its serialization machinery into environments that do not use it.
+
+- **Off-context executor dispatch recovery**:
+  Frameworks that dispatch tool execution via thread-pool executors such as `loop.run_in_executor` (including AutoGen 0.7.5 and CrewAI 1.9.3's async path) do not propagate Python `contextvars.ContextVar` across the thread boundary, which previously caused wrapped `@tool` calls to fail with `RuntimeError: No active workflow context found`.
+  - The SDK now maintains a thread-safe registry of active `durable_tools` blocks. When `get_context()` detects an unset `ContextVar`:
+    - Exactly one active session in the process: automatically resolves and rebinds the workflow context.
+    - Zero active sessions: raises `RuntimeError` as before.
+    - Two or more concurrent active sessions: raises `AmbiguousContextError` identifying the conflicting sessions rather than erroneously attributing side effects or leases across session boundaries.
+  - Added `WorkflowContext.bind()` as an explicit escape hatch for concurrent multi-session applications requiring manual context propagation.
+
+### Fixed
+
+- **Protobuf runtime mismatch & toolchain pinning (`CEL-148`)**:
+  Fixed an issue where `cellaflow==0.5.0` declared `protobuf>=4.25.0` while its generated gRPC stubs asserted a runtime of at least `7.35.1` at import, causing resolver confusion and immediate runtime crashes on `import cellaflow`.
+  - Pinned development tools to `grpcio-tools==1.71.0` (emitting gencode `5.29.0`) and `mypy-protobuf==3.6.0` (avoiding bundled protobuf 6.x gencode guards).
+  - Aligned the declared runtime floor in `pyproject.toml` to `protobuf>=5.29.0`.
+  - Restored co-installation compatibility with agent frameworks restricted to protobuf 5.x, such as `autogen-core 0.7.5` (`protobuf~=5.29.3`) and `crewai 1.9.3` (`protobuf<6.0`).
+  - Fixed `.github/workflows/publish-python-sdk.yml` to build wheels using the pinned dev toolchain instead of unpinned packages, eliminating release drift from CI.
+  - Added `tests/test_protobuf_floor.py` to continuously validate that the declared floor covers the gencode assertions in every generated protobuf stub.
+
+### Documentation & Examples
+
+- **Irreversible Tool Crash Benchmark (`examples/crash_benchmark`)**:
+  Added an automated, ledger-adjudicated benchmark harness comparing four side-effect mitigation guards (`no-guard`, `pg_advisory_lock`, `claim-first` idempotency keys, and CellaFlow leased tools) under six real-world failure injection scenarios: invocation redelivery, crash before checkpoint, crash between side effect and checkpoint, stalled owner / lease expiration, multi-agent convergence, and owner worker death.
+
 ## 0.5.0
 
 ### Added
