@@ -205,12 +205,29 @@ def durable_tools(
     secure: bool = False,
     coordination_id: Optional[str] = None,
 ) -> Iterator[Any]:
-    """Runs a LangGraph invocation so `@tool` calls inside nodes are leased.
+    """Leases the `@tool` calls made inside this block.
 
-    A `@tool` resolves its context from a `ContextVar`, and LangGraph copies the
-    calling context into its executor, so a tool inside a node body reaches
-    whatever context is active around `invoke`. This establishes one bound to
-    the graph's own thread:
+    Not LangGraph-specific, despite living here. The contract is a session id --
+    a LangGraph config, or a bare string -- and tools invoked while the block is
+    open. Verified against LangGraph, LlamaIndex, the OpenAI Agents SDK, CrewAI
+    (both paths) and AutoGen.
+
+    Frameworks differ in where they run a tool. Some call it on the caller's
+    context; some use `asyncio.to_thread`, which copies it; and some use
+    `loop.run_in_executor`, which does not. Where the context is lost and exactly
+    one session is open, it is recovered from the open-session registry. Where
+    several are open there is nothing to disambiguate them, so the call raises
+    and the caller should bind explicitly:
+
+        with durable_tools(config) as session:
+            ...
+        # inside a tool the framework dispatched off-context:
+        with session.bind():
+            charge(order_id)
+
+
+    LangGraph copies the calling context into its executor, so a tool inside a
+    node body reaches whatever context is active around `invoke`:
 
         with durable_tools(config):
             app.invoke({"ticket": "T-4417"}, config)
@@ -234,7 +251,13 @@ def durable_tools(
     `configurable.thread_id` is read from it. A bare thread id string is
     accepted too, for callers who have no config to hand.
     """
-    from cellaflow.context import WorkflowContext, set_context, reset_context
+    from cellaflow.context import (
+        WorkflowContext,
+        set_context,
+        reset_context,
+        _register_session,
+        _deregister_session,
+    )
 
     thread_id = _thread_id_from(config)
     session_id = tool_session_id(thread_id)
@@ -274,10 +297,15 @@ def durable_tools(
         sequence=0,
         coordination_id=coordination_id,
     )
+    # Registered as well as set: the ContextVar covers frameworks that dispatch
+    # tools on the calling context, and the registry covers those that do not.
+    # See `cellaflow.context.get_context`.
     token = set_context(ctx)
+    _register_session(ctx)
     try:
         yield ctx
     finally:
+        _deregister_session(ctx)
         reset_context(token)
 
 
