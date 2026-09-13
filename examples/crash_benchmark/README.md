@@ -310,8 +310,9 @@ invocation, and `@tool` on the function, shown at the top of this file. The engi
 records the operation, its owner, and a fencing token before the gateway is called.
 Nothing is hand-rolled: the three states, the bounded wait, the stored response, the
 reclaim after a holder dies, and the refusal of a superseded worker are the engine's
-behaviour, not code in the example. That is the whole of the guard's implementation , 
-compare it against `claim`'s claim, poll, complete and its `UniqueViolation` path.
+behaviour, not code in the example. That is the whole of the guard's implementation.
+Compare it against `claim`, where the claim, the poll, the stored response and the
+completing `UPDATE` are all yours to write and yours to get right.
 
 ## What the lock costs, measured
 
@@ -340,7 +341,7 @@ land.
 ## When the holder is slow, not dead
 Two findings the columns above do not carry, both about a holder that is *slow*
 rather than dead, the case a crash test cannot reach.
-**The others wait.** At an 8-second stall, a lock and a lease behave identically , 
+**The others wait.** At an 8-second stall, a lock and a lease behave identically:
 both make the other agents wait the full 8 seconds. CellaFlow's lease ceiling defaults
 to one hour, and below the ceiling a lease waits exactly like a lock. That is
 deliberate: reclaiming a merely slow worker trades a starvation bug for a double
@@ -348,11 +349,13 @@ charge, which is the worse trade. The real difference is **bounded versus unboun
 waiting, a lock has no ceiling to reach at all. This harness does not lower ours to
 manufacture a favourable number.
 
-**And the staller is refused when it wakes.** Stall the holder, supersede it, then let it wake and try to commit. A
-hand-rolled guard refuses with a `UniqueViolation` from its primary key; CellaFlow
-refuses with `Fenced out: stale lease`. Both refuse. The difference is that one
-refuses by way of an unhandled database exception from a line that looks like
-bookkeeping, which most implementations do not catch.
+**And neither can take the work away.** `claim` cannot supersede a slow holder because
+it has no TTL. CellaFlow does not because the holder is still heartbeating. Same
+outcome, different reason, and the reason decides what happens when a holder *stops*
+rather than slows. `claim` has no way to tell those apart, so it waits forever; the
+engine stops seeing heartbeats and reclaims. That is the separation in *Then the agent
+holding the work dies*, and it is why a TTL alone is not the fix: it buys takeover from
+a dead holder by also permitting takeover from a slow one.
 
 ## Where each one breaks
 
@@ -452,7 +455,7 @@ variables:
 
 Both approaches land on 1 in the right-hand column, and both get there the same way:
 by deriving the key from the work rather than from whoever is doing it. For `claim`
-the developer writes that key. For `cellaflow` it is a declaration , 
+the developer writes that key. For `cellaflow` it is a declaration:
 `shared_on=["ticket_id"]`, and the declaration is what the rest of this section is
 about.
 
@@ -572,7 +575,7 @@ This is the same trade as `crash: during` in the main table, but the blast radiu
 what makes it a different question. There, one retry is blocked. Here one dead process
 blocks the entire fleet, permanently.
 
-Two things worth knowing before quoting this. The recovery takes about 20 seconds , 
+Two things worth knowing before quoting this. The recovery takes about 20 seconds:
 the lease TTL, during which the other agents are waiting, and they wait on an
 unbounded retry, so it is the lease ceiling rather than the caller that bounds them.
 And `claim` is deliberately TTL-less here: adding one is the obvious fix, and
