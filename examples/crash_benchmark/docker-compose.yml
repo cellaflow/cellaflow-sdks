@@ -3,6 +3,14 @@
 services:
   postgres:
     image: postgres:16-alpine
+    # max_connections defaults to 100. At high writer counts `lock` and `claim`
+    # each hold a second connection alongside PostgresSaver, so they would hit
+    # that ceiling before they hit contention -- and `cellaflow`, which holds no
+    # Postgres connection of its own, would appear to win a race that was
+    # actually decided by `FATAL: sorry, too many clients already`. Raised so the
+    # pool is not the variable. The real cost of holding a connection across a
+    # side effect is measured separately, in "What the lock costs, measured".
+    command: ["postgres", "-c", "max_connections=500"]
     environment:
       POSTGRES_PASSWORD: bench
       POSTGRES_DB: bench

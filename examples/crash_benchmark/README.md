@@ -666,6 +666,34 @@ python benchmark.py --writers 1,5,10,25,50,100
 python benchmark.py --guards no-guard,cellaflow --skip-contention
 ```
 
+**Swept to 100, and nothing changes.** The race column is linear for the unguarded
+arms and flat for the guarded ones, all the way up:
+
+| workers | `no-guard` | `lock` | `claim` | `cellaflow` |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 1 | 1 | 1 |
+| 50 | 50 | 50 | **1** | **1** |
+| 100 | 100 | 100 | **1** | **1** |
+
+Zero failed commits at any level, and one hundred workers contending on a single
+session still resolve to one charge.
+
+**There is no crossover to find, and that is the useful part.** A lock is mutual
+exclusion, so each of the hundred workers takes it *in turn* and charges in turn: it
+does not fail at scale, it never deduplicated at all. The curves separate at two
+workers and stay separated, so a sweep cannot show a point where a lock stops being
+good enough, because there was no point at which it was.
+
+If you are choosing between these, the writer count is not the variable. What the
+guard records before acting is.
+
+**One config note if you repeat this.** `docker-compose.yml` raises Postgres
+`max_connections` to 500. At the default of 100 the `lock` and `claim` arms, which each
+hold a second connection alongside `PostgresSaver`, hit `FATAL: sorry, too many clients`
+before they hit contention, while `cellaflow` holds no Postgres connection of its own
+and would appear to win a race that Postgres had actually decided. That is a
+configuration artifact, not a result.
+
 ### If you modify this harness
 
 Three details are load-bearing, and getting any of them wrong produces numbers that
