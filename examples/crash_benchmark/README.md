@@ -639,6 +639,85 @@ actually ship, and its deadlock is the honest consequence of stopping there.
 
 ---
 
+# Check your own system
+
+Everything above is a measurement of a harness. This section is two checks you can run
+against your own guard, in a few minutes, without installing anything.
+
+They are here because **this particular failure is silent**. No exception, no alert, no
+retry storm. A row stays `in_progress` and the work simply stops. You find out when a
+customer asks where their refund went, if anyone connects the two at all. Which means
+*"we have never hit this"* and *"we hit it and never noticed"* look identical from the
+inside, and only one of them is good news.
+
+## Check 1: can you tell a slow holder from a dead one?
+
+This one is about your schema rather than your data, so it returns an answer whether or
+not anything is stuck today. Look at the table your guard writes to.
+
+| your claim row carries | what you can actually distinguish |
+| :--- | :--- |
+| a key and a state | nothing. `in_progress` means *someone started this*, indefinitely |
+| ...plus a timestamp | how long it has been that way, which is not the same as whether anyone is still working on it |
+| ...plus an owner id | who started it, and only if you can still ask whether that process exists |
+| ...plus an expiry the holder keeps extending | **a holder that is alive from one that stopped** |
+
+Only the last row separates the two cases, because a holder that is still saying so is
+the only kind you can tell apart from one that has stopped saying anything. Note that a
+bare expiry is not enough: it takes work away from a slow holder as readily as a dead
+one, which is the trade in
+[*"I would just put a TTL on the claim"*](#i-would-just-put-a-ttl-on-the-claim-and-then-you-are-building-a-lease).
+
+If your rows look like the first two lines of that table, you do not have a *"we have
+never hit this"* result. You have *"we could not have seen it."*
+
+## Check 2: is anything stuck right now?
+
+```sql
+SELECT *
+FROM your_claims_table
+WHERE state NOT IN ('done', 'completed', 'failed')  -- whatever finished means to you
+  AND created_at < now() - interval '1 hour';       -- longer than any real operation
+```
+
+MySQL: `created_at < NOW() - INTERVAL 1 HOUR`. SQLite: `created_at < datetime('now', '-1 hour')`.
+
+Read-only, and it touches one table. Set the interval comfortably longer than your
+slowest legitimate operation; the goal is to exclude work still in flight, not to catch
+it early.
+
+**Every row it returns is an operation that will not finish on its own.** Not a slow one,
+because the interval already excluded those. Something claimed the right to do a piece of
+work and then stopped existing, and the claim outlived the claimer. Until a human clears
+it, no retry and no other worker can take that operation, which is the
+[dead-owner row](#then-the-agent-holding-the-work-dies) in your own database rather than
+in ours.
+
+### Read the result honestly
+
+- **A returned row is not automatically a duplicate or a lost side effect.** It may have
+  claimed and died *before* acting, in which case nothing happened downstream and the row
+  is litter. The ones that matter are where the external system shows the operation did
+  occur, or shows nothing and the work is simply undone.
+- **Zero rows is a weaker result than it looks**, for the reason in check 1. If nothing
+  expires and nothing heartbeats, stuck rows can also be cleared by hand by someone who
+  reasonably assumed they were junk, and the count tells you nothing about how often that
+  has happened.
+- **If retries come from a queue rather than a table**, the equivalent question is whether
+  a message that was claimed and never acked is redelivered, and whether the work it
+  claimed is safe to perform a second time. The first is usually yes. The second is the
+  one worth checking.
+
+## If you run this
+
+If check 2 returns rows, or check 1 puts you in the top two lines of that table, that is
+the failure this benchmark measures, happening in your system rather than a harness.
+We would genuinely like to hear what it looked like, including if the answer turns out to
+be *"we found four and they were all harmless."* Open an issue on this repo.
+
+
+---
+
 # Running it yourself
 
 
