@@ -9,10 +9,16 @@ from cellaflow.decorators import (
     NondeterministicWorkflowError,
 )
 from cellaflow.idempotency import IdempotencyScope
+
 # durable_tools works with any framework, so it does not come through the
 # LangGraph module.
 from cellaflow.durable import durable_tools, tool_session_id
-from cellaflow.execution import execution_lease, async_execution_lease, LeaseNotAcquired
+from cellaflow.execution import (
+    execution_lease,
+    async_execution_lease,
+    LeaseNotAcquired,
+    task_lease,
+)
 
 if TYPE_CHECKING:
     # Imported for type checkers only. At runtime `__getattr__` below loads it
@@ -34,6 +40,7 @@ __all__ = [
     "execution_lease",
     "async_execution_lease",
     "LeaseNotAcquired",
+    "task_lease",
 ]
 
 

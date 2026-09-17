@@ -1310,8 +1310,12 @@ def _dispatch_to_thread(fn: Any) -> Any:
 
 @pytest.mark.parametrize(
     "dispatch",
-    [_dispatch_direct, _dispatch_bare_executor, _dispatch_run_in_executor,
-     _dispatch_to_thread],
+    [
+        _dispatch_direct,
+        _dispatch_bare_executor,
+        _dispatch_run_in_executor,
+        _dispatch_to_thread,
+    ],
     ids=["direct", "bare-executor", "run_in_executor", "to_thread"],
 )
 def test_tool_resolves_however_the_framework_dispatches_it(dispatch: Any) -> None:
@@ -1352,6 +1356,7 @@ def test_bind_resolves_the_ambiguity_the_fallback_refuses() -> None:
     client = LeasingMockClient()
     with patch("cellaflow.durable.CellaflowClient", return_value=client):
         with durable_tools("t-one") as a, durable_tools("t-two") as b:
+
             def _in_tool() -> str:
                 with b.bind():
                     return get_context().session_id

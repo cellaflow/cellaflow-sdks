@@ -45,8 +45,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
+import inspect
 import logging
-from typing import Callable, Iterator, Optional
+from typing import Any, AsyncIterator, Callable, Iterator, Optional
 
 from cellaflow.client import CellaflowClient
 from cellaflow.lease import LeaseHeartbeat
@@ -178,7 +180,7 @@ async def async_execution_lease(
     ttl_ms: int = _DEFAULT_TTL_MS,
     heartbeat_interval_ms: int = _DEFAULT_HEARTBEAT_INTERVAL_MS,
     on_lease_lost: Optional[Callable[[], None]] = None,
-) -> Iterator[int]:  # type: ignore[misc]
+) -> AsyncIterator[int]:
     """Asynchronous distributed lock with liveness heartbeating.
 
     Identical to :func:`execution_lease` but designed for ``asyncio``
@@ -228,6 +230,7 @@ async def async_execution_lease(
         caller_task = asyncio.current_task()
         effective_on_lease_lost = on_lease_lost
         if effective_on_lease_lost is None and caller_task is not None:
+
             def _cancel_caller() -> None:
                 logger.warning(
                     "Lease %s lost; cancelling calling task %s",
@@ -235,6 +238,7 @@ async def async_execution_lease(
                     caller_task.get_name(),
                 )
                 caller_task.cancel()
+
             effective_on_lease_lost = _cancel_caller
 
         hb = LeaseHeartbeat(
@@ -259,3 +263,62 @@ async def async_execution_lease(
     finally:
         with contextlib.suppress(Exception):
             client.close()
+
+
+def task_lease(
+    key: str,
+    *,
+    worker_id: str,
+    target: str = "localhost:50051",
+    secure: bool = False,
+    ttl_ms: int = _DEFAULT_TTL_MS,
+    heartbeat_interval_ms: int = _DEFAULT_HEARTBEAT_INTERVAL_MS,
+    on_lease_lost: Optional[Callable[[], None]] = None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Decorator that wraps a function with an execution lease.
+
+    Provides mutual exclusion with liveness heartbeating for the decorated
+    function. Automatically wraps coroutines with ``async_execution_lease``
+    and synchronous functions with ``execution_lease``.
+
+    Parameters
+    ----------
+    key, worker_id, target, secure, ttl_ms, heartbeat_interval_ms, on_lease_lost:
+        Same as :func:`execution_lease` and :func:`async_execution_lease`.
+    """
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        if inspect.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                async with async_execution_lease(
+                    key=key,
+                    worker_id=worker_id,
+                    target=target,
+                    secure=secure,
+                    ttl_ms=ttl_ms,
+                    heartbeat_interval_ms=heartbeat_interval_ms,
+                    on_lease_lost=on_lease_lost,
+                ):
+                    return await func(*args, **kwargs)
+
+            return async_wrapper
+        else:
+
+            @functools.wraps(func)
+            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                with execution_lease(
+                    key=key,
+                    worker_id=worker_id,
+                    target=target,
+                    secure=secure,
+                    ttl_ms=ttl_ms,
+                    heartbeat_interval_ms=heartbeat_interval_ms,
+                    on_lease_lost=on_lease_lost,
+                ):
+                    return func(*args, **kwargs)
+
+            return sync_wrapper
+
+    return decorator

@@ -11,15 +11,18 @@ from cellaflow.execution import (
     LeaseNotAcquired,
     async_execution_lease,
     execution_lease,
+    task_lease,
 )
 from cellaflow.v1 import idempotency_pb2
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_acquired_response(fencing_token: int = 42, heartbeat_interval_ms: int = 200) -> MagicMock:
+
+def _make_acquired_response(
+    fencing_token: int = 42, heartbeat_interval_ms: int = 200
+) -> MagicMock:
     resp = MagicMock()
     resp.status = idempotency_pb2.CACHE_STATUS_ACQUIRED
     resp.fencing_token = fencing_token
@@ -50,6 +53,7 @@ def _make_renew_failed() -> MagicMock:
 # ---------------------------------------------------------------------------
 # Sync tests
 # ---------------------------------------------------------------------------
+
 
 def test_execution_lease_acquire_and_release() -> None:
     """Happy path: acquires lease, heartbeats, releases on exit."""
@@ -135,7 +139,7 @@ def test_execution_lease_cleans_up_on_exception() -> None:
 
 def test_execution_lease_owns_client() -> None:
     """The context manager creates its own client and closes it on exit."""
-    created_clients: list = []
+    created_clients: list[MagicMock] = []
 
     def fake_client_factory(target: str, secure: bool) -> MagicMock:
         c = MagicMock()
@@ -177,6 +181,7 @@ def test_execution_lease_on_lease_lost_callback_sync() -> None:
 # Async tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 async def test_async_execution_lease_acquire_and_release() -> None:
     """Async happy path: acquires, heartbeats, releases on exit."""
@@ -185,6 +190,7 @@ async def test_async_execution_lease_acquire_and_release() -> None:
     mock_client.renew_lease.return_value = _make_renew_ok()
 
     with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
+        token: int
         async with async_execution_lease("task:123", worker_id="w-1") as token:
             assert token == 42
             await asyncio.sleep(0.05)
@@ -221,3 +227,47 @@ async def test_async_execution_lease_preemption() -> None:
     await asyncio.wait_for(task, timeout=3.0)
 
     assert cancelled, "CancelledError should have been raised when lease was lost"
+
+
+# ---------------------------------------------------------------------------
+# Decorator tests
+# ---------------------------------------------------------------------------
+
+
+def test_task_lease_decorator_sync() -> None:
+    """Verifies @task_lease wraps a synchronous function correctly."""
+    mock_client = MagicMock()
+    mock_client.check_idempotency_cache.return_value = _make_acquired_response()
+    mock_client.renew_lease.return_value = _make_renew_ok()
+
+    @task_lease("task:sync-deco", worker_id="w-deco")
+    def sync_work() -> str:
+        return "sync-done"
+
+    with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
+        result = sync_work()
+
+    assert result == "sync-done"
+    mock_client.check_idempotency_cache.assert_called_once()
+    mock_client.release_lease.assert_called_once()
+    mock_client.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_task_lease_decorator_async() -> None:
+    """Verifies @task_lease wraps an async function correctly."""
+    mock_client = MagicMock()
+    mock_client.check_idempotency_cache.return_value = _make_acquired_response()
+    mock_client.renew_lease.return_value = _make_renew_ok()
+
+    @task_lease("task:async-deco", worker_id="w-deco-async")
+    async def async_work() -> str:
+        return "async-done"
+
+    with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
+        result = await async_work()
+
+    assert result == "async-done"
+    mock_client.check_idempotency_cache.assert_called_once()
+    mock_client.release_lease.assert_called_once()
+    mock_client.close.assert_called_once()
