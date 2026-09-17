@@ -148,7 +148,14 @@ class CellaflowClient:
         idempotency_key: str,
         fencing_token: int,
         extend_ms: int,
+        timeout: Optional[float] = None,
     ) -> idempotency_pb2.RenewLeaseResponse:
+        """Renews a held lease.
+
+        `timeout` bounds the RPC in seconds. Heartbeat callers must supply one:
+        without a deadline a black-holed connection parks the calling thread
+        indefinitely, and the shutdown path that joins that thread parks with it.
+        """
         req = idempotency_pb2.RenewLeaseRequest(
             agent_id=agent_id,
             idempotency_key=idempotency_key,
@@ -158,7 +165,7 @@ class CellaflowClient:
 
         return cast(
             idempotency_pb2.RenewLeaseResponse,
-            self.stub.RenewLease(req),
+            self.stub.RenewLease(req, timeout=timeout),
         )
 
     def release_lease(
@@ -167,7 +174,9 @@ class CellaflowClient:
         idempotency_key: str,
         fencing_token: int,
         reason: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> idempotency_pb2.ReleaseLeaseResponse:
+        """Releases a held lease. `timeout` bounds the RPC in seconds."""
         req = idempotency_pb2.ReleaseLeaseRequest(
             agent_id=agent_id,
             idempotency_key=idempotency_key,
@@ -178,7 +187,7 @@ class CellaflowClient:
 
         return cast(
             idempotency_pb2.ReleaseLeaseResponse,
-            self.stub.ReleaseLease(req),
+            self.stub.ReleaseLease(req, timeout=timeout),
         )
 
     def close(self) -> None:
