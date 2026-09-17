@@ -2,6 +2,17 @@
 
 All notable changes to the CellaFlow Python SDK.
 
+## 0.7.0
+
+### Added & Changed
+
+- **Distributed Execution Lease Primitive (`CEL-157`)**:
+  Added native Python SDK support for the `task_execution_lease` primitive, which acts as a distributed lock with liveness heartbeating.
+  - Added synchronous `execution_lease` and asynchronous `async_execution_lease` context managers.
+  - Added a first-class `@task_lease` decorator for wrapping execution entry points.
+  - Implements lease loss preemption: if the heartbeat fails and the lease expires while the main thread/task is running, it aborts execution (e.g., by injecting `asyncio.CancelledError` or invoking a callback).
+  - Yields a fencing token accessible downstream to enforce the lock.
+
 ## 0.6.0
 
 ### Added & Changed
