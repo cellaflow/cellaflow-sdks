@@ -16,6 +16,9 @@ from cellaflow.durable import durable_tools, tool_session_id
 from cellaflow.execution import (
     execution_lease,
     async_execution_lease,
+    task_lease,
+    current_lease,
+    LeaseHandle,
     LeaseNotAcquired,
     LeaseLostError,
 )
@@ -39,6 +42,9 @@ __all__ = [
     "CellaflowSaver",
     "execution_lease",
     "async_execution_lease",
+    "task_lease",
+    "current_lease",
+    "LeaseHandle",
     "LeaseNotAcquired",
     "LeaseLostError",
 ]
