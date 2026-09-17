@@ -1,7 +1,7 @@
 import asyncio
 import threading
 import logging
-from typing import Optional, Any
+from typing import Callable, Optional, Any
 from cellaflow.client import CellaflowClient
 
 logger = logging.getLogger(__name__)
@@ -48,11 +48,13 @@ class LeaseHeartbeat:
         idempotency_key: str,
         fencing_token: int,
         heartbeat_interval_ms: int,
+        on_lease_lost: Optional[Callable[[], None]] = None,
     ) -> None:
         self.client = client
         self.agent_id = agent_id
         self.idempotency_key = idempotency_key
         self.fencing_token = fencing_token
+        self.on_lease_lost = on_lease_lost
         # Renew slightly before expiration
         self.interval_sec = max(0.1, (heartbeat_interval_ms - 100) / 1000.0)
         self.extend_ms = (
@@ -95,9 +97,18 @@ class LeaseHeartbeat:
                         self.idempotency_key,
                         _renew_failure_detail(resp.failure_reason),
                     )
+                    if self.on_lease_lost is not None:
+                        self.on_lease_lost()
                     break
             except Exception as e:
-                logger.error(f"Lease renewal error: {e}")
+                # Any network or RPC error means we can no longer confirm the
+                # lease is live. Treat it as lost immediately — continuing
+                # without a confirmed heartbeat risks two workers acting on the
+                # same task once the TTL elapses.
+                logger.error("Lease renewal error for %s: %s", self.idempotency_key, e)
+                if self.on_lease_lost is not None:
+                    self.on_lease_lost()
+                break
 
     def start_async(self) -> None:
         """Starts an asyncio task for asynchronous execution."""
@@ -120,16 +131,15 @@ class LeaseHeartbeat:
         if not self._stop_event_async:
             return
 
-        # We use asyncio.wait_for to wait for the stop event, with a timeout
         while True:
             try:
                 await asyncio.wait_for(
                     self._stop_event_async.wait(), timeout=self.interval_sec
                 )
-                # If we get here, the stop event was set
+                # Stop event was set — clean shutdown.
                 break
             except asyncio.TimeoutError:
-                # Timeout means interval elapsed, do heartbeat
+                # Interval elapsed — do heartbeat.
                 try:
                     resp = self.client.renew_lease(
                         agent_id=self.agent_id,
@@ -143,8 +153,17 @@ class LeaseHeartbeat:
                             self.idempotency_key,
                             _renew_failure_detail(resp.failure_reason),
                         )
+                        if self.on_lease_lost is not None:
+                            self.on_lease_lost()
                         break
                 except Exception as e:
-                    logger.error(f"Lease renewal error: {e}")
+                    # Any network or RPC error means we can no longer confirm
+                    # the lease is live. Treat it as lost immediately.
+                    logger.error(
+                        "Lease renewal error for %s: %s", self.idempotency_key, e
+                    )
+                    if self.on_lease_lost is not None:
+                        self.on_lease_lost()
+                    break
             except asyncio.CancelledError:
                 break

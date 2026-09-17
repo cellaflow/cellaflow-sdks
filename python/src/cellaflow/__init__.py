@@ -12,6 +12,7 @@ from cellaflow.idempotency import IdempotencyScope
 # durable_tools works with any framework, so it does not come through the
 # LangGraph module.
 from cellaflow.durable import durable_tools, tool_session_id
+from cellaflow.execution import execution_lease, async_execution_lease, LeaseNotAcquired
 
 if TYPE_CHECKING:
     # Imported for type checkers only. At runtime `__getattr__` below loads it
@@ -30,6 +31,9 @@ __all__ = [
     "tool",
     "IdempotencyScope",
     "CellaflowSaver",
+    "execution_lease",
+    "async_execution_lease",
+    "LeaseNotAcquired",
 ]
 
 
