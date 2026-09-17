@@ -17,7 +17,7 @@ from cellaflow.execution import (
     execution_lease,
     async_execution_lease,
     LeaseNotAcquired,
-    task_lease,
+    LeaseLostError,
 )
 
 if TYPE_CHECKING:
@@ -40,7 +40,7 @@ __all__ = [
     "execution_lease",
     "async_execution_lease",
     "LeaseNotAcquired",
-    "task_lease",
+    "LeaseLostError",
 ]
 
 

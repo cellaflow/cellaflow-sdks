@@ -11,16 +11,20 @@ Typical usage::
     from cellaflow import execution_lease, LeaseNotAcquired
 
     try:
-        with execution_lease("task:123", worker_id="w-1") as token:
-            do_work()           # only one worker enters this block at a time
+        with execution_lease("task:123", worker_id="w-1") as lease:
+            do_work_item(1)
+            lease.check()  # raises LeaseLostError if the lease was lost
+            do_work_item(2)
     except LeaseNotAcquired:
         print("Another live worker holds this task")
+    except LeaseLostError:
+        print("Lease lost mid-execution")
 
     # Asynchronous — lease loss injects CancelledError into the caller
     from cellaflow import async_execution_lease
 
     try:
-        async with async_execution_lease("task:123", worker_id="w-1") as token:
+        async with async_execution_lease("task:123", worker_id="w-1") as lease:
             await do_work()
     except LeaseNotAcquired:
         print("Another live worker holds this task")
@@ -45,10 +49,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import functools
-import inspect
 import logging
-from typing import Any, AsyncIterator, Callable, Iterator, Optional
+import warnings
+from typing import Callable, Iterator, Optional, AsyncIterator
 
 from cellaflow.client import CellaflowClient
 from cellaflow.lease import LeaseHeartbeat
@@ -64,13 +67,37 @@ _DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000
 
 
 class LeaseNotAcquired(RuntimeError):
-    """Raised when another live worker holds the requested execution lease.
+    """Raised when the requested execution lease cannot be acquired."""
 
-    A status column in a database reports a held lease and a dead one
-    identically; a heartbeated lease distinguishes them. If you see this
-    exception the engine confirmed that a holder is actively renewing —
-    it is not a stale record from a crashed process.
+
+class LeaseLostError(RuntimeError):
+    """Raised by LeaseHandle.check() if the lease was lost."""
+
+
+class LeaseHandle:
+    """Handle to an active execution lease.
+    
+    Provides access to the fencing token and a check() method for cooperative
+    cancellation in synchronous code.
     """
+    
+    def __init__(self, fencing_token: int) -> None:
+        self.fencing_token = fencing_token
+        self.is_lost = False
+        self._checked_after_loss = False
+
+    def check(self) -> None:
+        """Checks if the lease is still held.
+        
+        Raises
+        ------
+        LeaseLostError
+            If the lease has been lost (e.g., server denied renewal, or network
+            partition).
+        """
+        if self.is_lost:
+            self._checked_after_loss = True
+            raise LeaseLostError("Execution lease was lost")
 
 
 @contextlib.contextmanager
@@ -83,7 +110,7 @@ def execution_lease(
     ttl_ms: int = _DEFAULT_TTL_MS,
     heartbeat_interval_ms: int = _DEFAULT_HEARTBEAT_INTERVAL_MS,
     on_lease_lost: Optional[Callable[[], None]] = None,
-) -> Iterator[int]:
+) -> Iterator[LeaseHandle]:
     """Synchronous distributed lock with liveness heartbeating.
 
     Acquires an exclusive lease on ``key`` for ``worker_id``. While the block
@@ -92,19 +119,18 @@ def execution_lease(
     after ``ttl_ms`` milliseconds — making the task reclaimable by another
     worker without any manual cleanup.
 
-    Yields the fencing token, which can be passed downstream (e.g. to a
-    database write) to guard against stale writes from fenced-out workers.
+    Yields a ``LeaseHandle``. In synchronous code, you should periodically
+    call ``lease.check()`` to cooperatively abort if the lease is lost. If the
+    lease is lost and the block exits without ever calling ``check()``, a
+    ``RuntimeWarning`` is emitted.
 
     Parameters
     ----------
     key:
         Idempotency key that identifies the resource being locked.  Must be a
         stable, human-readable business identifier, e.g. ``"task:abc-123"``.
-        Do **not** hash function arguments here — the whole point is that
-        different workers converge on the same key for the same resource.
     worker_id:
         Identifies this worker. Used as ``agent_id`` in the engine API.
-        A process-scoped value (e.g. ``f"worker-{os.getpid()}"``) is typical.
     target:
         CellaFlow engine address. Defaults to ``localhost:50051``.
     secure:
@@ -117,17 +143,12 @@ def execution_lease(
         ``ttl_ms``; the default (5 s) is one-third of the default TTL.
     on_lease_lost:
         Optional callback invoked by the heartbeat thread if the lease cannot
-        be renewed (server denied renewal or three consecutive network errors).
-        Use this to signal the main thread to abort, e.g. by setting an
-        ``threading.Event``. If ``None``, a warning is logged and the heartbeat
-        thread exits silently — the main thread continues until it finishes,
-        at which point the release will fail.
+        be renewed (server denied renewal or network partition).
 
     Raises
     ------
     LeaseNotAcquired
-        If the engine returns any status other than ``CACHE_STATUS_ACQUIRED``
-        (i.e. another live worker holds the lease).
+        If the lease cannot be acquired.
     """
     client = CellaflowClient(target=target, secure=secure)
     try:
@@ -136,15 +157,24 @@ def execution_lease(
             idempotency_key=key,
             lease_ttl_ms=ttl_ms,
         )
-        if resp.status != idempotency_pb2.CACHE_STATUS_ACQUIRED:
+        if resp.status == idempotency_pb2.CACHE_STATUS_IN_PROGRESS:
             raise LeaseNotAcquired(
-                f"Lease {key!r} is held by a live worker "
-                f"(status={resp.status}). Another worker is actively "
-                f"heartbeating this task."
+                f"Lease {key!r} is held by a live worker. Another worker is "
+                f"actively heartbeating this task."
             )
+        elif resp.status == idempotency_pb2.CACHE_STATUS_HIT:
+            raise LeaseNotAcquired(f"Lease {key!r} was already completed.")
+        elif resp.status != idempotency_pb2.CACHE_STATUS_ACQUIRED:
+            raise LeaseNotAcquired(f"Lease {key!r} could not be acquired (status={resp.status}).")
 
         token = resp.fencing_token
         interval_ms = resp.heartbeat_interval_ms or heartbeat_interval_ms
+        handle = LeaseHandle(token)
+
+        def _on_lost() -> None:
+            handle.is_lost = True
+            if on_lease_lost is not None:
+                on_lease_lost()
 
         hb = LeaseHeartbeat(
             client=client,
@@ -152,13 +182,25 @@ def execution_lease(
             idempotency_key=key,
             fencing_token=token,
             heartbeat_interval_ms=interval_ms,
-            on_lease_lost=on_lease_lost,
+            on_lease_lost=_on_lost,
+            max_network_errors=1, # Fail fast for execution leases
         )
         hb.start_sync()
         try:
-            yield token
+            yield handle
         finally:
             hb.stop_sync()
+            
+            # If the lease was lost and the user never checked it, warn them.
+            if handle.is_lost and not handle._checked_after_loss:
+                warnings.warn(
+                    f"Execution lease {key!r} was lost during execution, but "
+                    f"lease.check() was never called. The block ran to completion "
+                    f"without a live lease.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                
             with contextlib.suppress(Exception):
                 client.release_lease(
                     agent_id=worker_id,
@@ -180,17 +222,17 @@ async def async_execution_lease(
     ttl_ms: int = _DEFAULT_TTL_MS,
     heartbeat_interval_ms: int = _DEFAULT_HEARTBEAT_INTERVAL_MS,
     on_lease_lost: Optional[Callable[[], None]] = None,
-) -> AsyncIterator[int]:
+) -> AsyncIterator[LeaseHandle]:  # type: ignore[misc]
     """Asynchronous distributed lock with liveness heartbeating.
 
     Identical to :func:`execution_lease` but designed for ``asyncio``
     environments. The heartbeat runs as an ``asyncio.Task`` rather than a
     daemon thread.
 
-    If the lease is lost (renewal denied or three consecutive network errors),
-    the calling task is cancelled by default — ``asyncio.CancelledError`` is
-    injected at the next ``await`` point, aborting the work cleanly. Supply
-    ``on_lease_lost`` to override this behaviour.
+    If the lease is lost (renewal denied or network error), the calling task
+    is cancelled by default — ``asyncio.CancelledError`` is injected at the next
+    ``await`` point, cooperatively aborting the work. Supply ``on_lease_lost``
+    to override this behaviour.
 
     Parameters
     ----------
@@ -204,33 +246,37 @@ async def async_execution_lease(
     Raises
     ------
     LeaseNotAcquired
-        If another live worker holds the lease.
+        If the lease cannot be acquired.
     asyncio.CancelledError
-        If the lease is lost mid-execution (default ``on_lease_lost``
-        behaviour).
+        If the lease is lost mid-execution (default ``on_lease_lost`` behaviour).
     """
     client = CellaflowClient(target=target, secure=secure)
     try:
-        resp = client.check_idempotency_cache(
+        # Offload sync gRPC call to a thread
+        resp = await asyncio.to_thread(
+            client.check_idempotency_cache,
             agent_id=worker_id,
             idempotency_key=key,
             lease_ttl_ms=ttl_ms,
         )
-        if resp.status != idempotency_pb2.CACHE_STATUS_ACQUIRED:
+        if resp.status == idempotency_pb2.CACHE_STATUS_IN_PROGRESS:
             raise LeaseNotAcquired(
-                f"Lease {key!r} is held by a live worker "
-                f"(status={resp.status}). Another worker is actively "
-                f"heartbeating this task."
+                f"Lease {key!r} is held by a live worker. Another worker is "
+                f"actively heartbeating this task."
             )
+        elif resp.status == idempotency_pb2.CACHE_STATUS_HIT:
+            raise LeaseNotAcquired(f"Lease {key!r} was already completed.")
+        elif resp.status != idempotency_pb2.CACHE_STATUS_ACQUIRED:
+            raise LeaseNotAcquired(f"Lease {key!r} could not be acquired (status={resp.status}).")
 
         token = resp.fencing_token
         interval_ms = resp.heartbeat_interval_ms or heartbeat_interval_ms
+        handle = LeaseHandle(token)
 
-        # Default: cancel the calling task so the body gets CancelledError.
         caller_task = asyncio.current_task()
         effective_on_lease_lost = on_lease_lost
+        
         if effective_on_lease_lost is None and caller_task is not None:
-
             def _cancel_caller() -> None:
                 logger.warning(
                     "Lease %s lost; cancelling calling task %s",
@@ -238,8 +284,12 @@ async def async_execution_lease(
                     caller_task.get_name(),
                 )
                 caller_task.cancel()
-
             effective_on_lease_lost = _cancel_caller
+
+        def _on_lost() -> None:
+            handle.is_lost = True
+            if effective_on_lease_lost is not None:
+                effective_on_lease_lost()
 
         hb = LeaseHeartbeat(
             client=client,
@@ -247,78 +297,25 @@ async def async_execution_lease(
             idempotency_key=key,
             fencing_token=token,
             heartbeat_interval_ms=interval_ms,
-            on_lease_lost=effective_on_lease_lost,
+            on_lease_lost=_on_lost,
+            max_network_errors=1, # Fail fast for execution leases
         )
         hb.start_async()
         try:
-            yield token
+            yield handle
         finally:
-            await hb.stop_async()
-            with contextlib.suppress(Exception):
-                client.release_lease(
-                    agent_id=worker_id,
-                    idempotency_key=key,
-                    fencing_token=token,
-                )
+            # We use shield so that if the caller task is cancelled (e.g. by our 
+            # own _cancel_caller or external), the cleanup still runs properly.
+            async def _cleanup() -> None:
+                await hb.stop_async()
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        client.release_lease,
+                        agent_id=worker_id,
+                        idempotency_key=key,
+                        fencing_token=token,
+                    )
+            await asyncio.shield(_cleanup())
     finally:
         with contextlib.suppress(Exception):
             client.close()
-
-
-def task_lease(
-    key: str,
-    *,
-    worker_id: str,
-    target: str = "localhost:50051",
-    secure: bool = False,
-    ttl_ms: int = _DEFAULT_TTL_MS,
-    heartbeat_interval_ms: int = _DEFAULT_HEARTBEAT_INTERVAL_MS,
-    on_lease_lost: Optional[Callable[[], None]] = None,
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Decorator that wraps a function with an execution lease.
-
-    Provides mutual exclusion with liveness heartbeating for the decorated
-    function. Automatically wraps coroutines with ``async_execution_lease``
-    and synchronous functions with ``execution_lease``.
-
-    Parameters
-    ----------
-    key, worker_id, target, secure, ttl_ms, heartbeat_interval_ms, on_lease_lost:
-        Same as :func:`execution_lease` and :func:`async_execution_lease`.
-    """
-
-    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-        if inspect.iscoroutinefunction(func):
-
-            @functools.wraps(func)
-            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-                async with async_execution_lease(
-                    key=key,
-                    worker_id=worker_id,
-                    target=target,
-                    secure=secure,
-                    ttl_ms=ttl_ms,
-                    heartbeat_interval_ms=heartbeat_interval_ms,
-                    on_lease_lost=on_lease_lost,
-                ):
-                    return await func(*args, **kwargs)
-
-            return async_wrapper
-        else:
-
-            @functools.wraps(func)
-            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-                with execution_lease(
-                    key=key,
-                    worker_id=worker_id,
-                    target=target,
-                    secure=secure,
-                    ttl_ms=ttl_ms,
-                    heartbeat_interval_ms=heartbeat_interval_ms,
-                    on_lease_lost=on_lease_lost,
-                ):
-                    return func(*args, **kwargs)
-
-            return sync_wrapper
-
-    return decorator

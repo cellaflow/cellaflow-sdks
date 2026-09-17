@@ -3,26 +3,25 @@
 import asyncio
 import threading
 import time
+import warnings
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from cellaflow.execution import (
+    LeaseLostError,
     LeaseNotAcquired,
     async_execution_lease,
     execution_lease,
-    task_lease,
 )
 from cellaflow.v1 import idempotency_pb2
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-
-def _make_acquired_response(
-    fencing_token: int = 42, heartbeat_interval_ms: int = 200
-) -> MagicMock:
+def _make_acquired_response(fencing_token: int = 42, heartbeat_interval_ms: int = 100) -> MagicMock:
     resp = MagicMock()
     resp.status = idempotency_pb2.CACHE_STATUS_ACQUIRED
     resp.fencing_token = fencing_token
@@ -30,9 +29,9 @@ def _make_acquired_response(
     return resp
 
 
-def _make_not_acquired_response() -> MagicMock:
+def _make_not_acquired_response(status=idempotency_pb2.CACHE_STATUS_IN_PROGRESS) -> MagicMock:
     resp = MagicMock()
-    resp.status = idempotency_pb2.CACHE_STATUS_IN_PROGRESS
+    resp.status = status
     return resp
 
 
@@ -54,22 +53,24 @@ def _make_renew_failed() -> MagicMock:
 # Sync tests
 # ---------------------------------------------------------------------------
 
-
 def test_execution_lease_acquire_and_release() -> None:
     """Happy path: acquires lease, heartbeats, releases on exit."""
     mock_client = MagicMock()
-    mock_client.check_idempotency_cache.return_value = _make_acquired_response()
+    mock_client.check_idempotency_cache.return_value = _make_acquired_response(heartbeat_interval_ms=50)
     mock_client.renew_lease.return_value = _make_renew_ok()
 
     with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
-        with execution_lease("task:123", worker_id="w-1") as token:
-            assert token == 42
-            time.sleep(0.05)  # let heartbeat tick
+        with execution_lease("task:123", worker_id="w-1") as lease:
+            assert lease.fencing_token == 42
+            time.sleep(0.15)  # wait longer than heartbeat_interval_ms to guarantee a tick
+            lease.check() # Should not raise
 
     mock_client.check_idempotency_cache.assert_called_once()
     call_kwargs = mock_client.check_idempotency_cache.call_args[1]
     assert call_kwargs["agent_id"] == "w-1"
     assert call_kwargs["idempotency_key"] == "task:123"
+
+    assert mock_client.renew_lease.call_count > 0, "Heartbeat should have fired"
 
     mock_client.release_lease.assert_called_once()
     release_kwargs = mock_client.release_lease.call_args[1]
@@ -78,20 +79,26 @@ def test_execution_lease_acquire_and_release() -> None:
     mock_client.close.assert_called_once()
 
 
-def test_execution_lease_not_acquired() -> None:
-    """Raises LeaseNotAcquired immediately when engine returns non-acquired."""
+def test_execution_lease_not_acquired_in_progress() -> None:
+    """Raises LeaseNotAcquired immediately when engine returns IN_PROGRESS."""
     mock_client = MagicMock()
-    mock_client.check_idempotency_cache.return_value = _make_not_acquired_response()
+    mock_client.check_idempotency_cache.return_value = _make_not_acquired_response(idempotency_pb2.CACHE_STATUS_IN_PROGRESS)
 
     with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
-        with pytest.raises(LeaseNotAcquired):
+        with pytest.raises(LeaseNotAcquired, match="held by a live worker"):
             with execution_lease("task:123", worker_id="w-1"):
                 pass  # should not be reached
 
-    # Release should NOT be called — we never held the lease.
-    mock_client.release_lease.assert_not_called()
-    # Client must still be closed.
-    mock_client.close.assert_called_once()
+
+def test_execution_lease_not_acquired_hit() -> None:
+    """Raises LeaseNotAcquired with specific message when engine returns HIT."""
+    mock_client = MagicMock()
+    mock_client.check_idempotency_cache.return_value = _make_not_acquired_response(idempotency_pb2.CACHE_STATUS_HIT)
+
+    with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
+        with pytest.raises(LeaseNotAcquired, match="already completed"):
+            with execution_lease("task:123", worker_id="w-1"):
+                pass  # should not be reached
 
 
 def test_execution_lease_heartbeat_starts() -> None:
@@ -107,17 +114,18 @@ def test_execution_lease_heartbeat_starts() -> None:
             mock_hb_instance = MagicMock()
             MockHB.return_value = mock_hb_instance
 
-            with execution_lease("task:abc", worker_id="w-2") as token:
-                assert token == 99
+            with execution_lease("task:abc", worker_id="w-2") as lease:
+                assert lease.fencing_token == 99
 
-            MockHB.assert_called_once_with(
-                client=mock_client,
-                agent_id="w-2",
-                idempotency_key="task:abc",
-                fencing_token=99,
-                heartbeat_interval_ms=300,
-                on_lease_lost=None,
-            )
+            MockHB.assert_called_once()
+            kwargs = MockHB.call_args[1]
+            assert kwargs["client"] == mock_client
+            assert kwargs["agent_id"] == "w-2"
+            assert kwargs["idempotency_key"] == "task:abc"
+            assert kwargs["fencing_token"] == 99
+            assert kwargs["heartbeat_interval_ms"] == 300
+            assert kwargs["max_network_errors"] == 1 # Execution leases fail fast
+            
             mock_hb_instance.start_sync.assert_called_once()
             mock_hb_instance.stop_sync.assert_called_once()
 
@@ -137,64 +145,73 @@ def test_execution_lease_cleans_up_on_exception() -> None:
     mock_client.close.assert_called_once()
 
 
-def test_execution_lease_owns_client() -> None:
-    """The context manager creates its own client and closes it on exit."""
-    created_clients: list[MagicMock] = []
-
-    def fake_client_factory(target: str, secure: bool) -> MagicMock:
-        c = MagicMock()
-        c.check_idempotency_cache.return_value = _make_acquired_response()
-        c.renew_lease.return_value = _make_renew_ok()
-        created_clients.append(c)
-        return c
-
-    with patch("cellaflow.execution.CellaflowClient", side_effect=fake_client_factory):
-        with execution_lease("task:123", worker_id="w-1", target="myhost:50051"):
-            pass
-
-    assert len(created_clients) == 1, "Expected exactly one client to be created"
-    created_clients[0].close.assert_called_once()
-
-
-def test_execution_lease_on_lease_lost_callback_sync() -> None:
-    """on_lease_lost is invoked when heartbeat renewal is denied."""
+def test_sync_lease_check_raises() -> None:
+    """LeaseHandle.check() raises LeaseLostError if the lease is lost."""
     mock_client = MagicMock()
-    mock_client.check_idempotency_cache.return_value = _make_acquired_response(
-        heartbeat_interval_ms=150
-    )
+    mock_client.check_idempotency_cache.return_value = _make_acquired_response(heartbeat_interval_ms=50)
     mock_client.renew_lease.return_value = _make_renew_failed()
 
-    lost_event = threading.Event()
+    with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
+        with pytest.raises(LeaseLostError, match="Execution lease was lost"):
+            with execution_lease("task:123", worker_id="w-1") as lease:
+                time.sleep(0.15) # wait for heartbeat to fail
+                lease.check()
+
+
+def test_sync_lease_warns_if_unchecked() -> None:
+    """Emits RuntimeWarning if the lease was lost but check() was never called."""
+    mock_client = MagicMock()
+    mock_client.check_idempotency_cache.return_value = _make_acquired_response(heartbeat_interval_ms=50)
+    mock_client.renew_lease.return_value = _make_renew_failed()
 
     with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
-        with execution_lease(
-            "task:123",
-            worker_id="w-1",
-            on_lease_lost=lost_event.set,
-        ):
-            lost_event.wait(timeout=1.0)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            with execution_lease("task:123", worker_id="w-1") as lease:
+                time.sleep(0.15) # wait for heartbeat to fail
+                # Intentionally not calling lease.check()
 
-    assert lost_event.is_set(), "on_lease_lost should have been called"
+            assert len(w) == 1
+            assert issubclass(w[-1].category, RuntimeWarning)
+            assert "was lost during execution, but lease.check() was never called" in str(w[-1].message)
+
+
+def test_sync_lease_no_warn_if_checked() -> None:
+    """Does not emit RuntimeWarning if check() was called."""
+    mock_client = MagicMock()
+    mock_client.check_idempotency_cache.return_value = _make_acquired_response(heartbeat_interval_ms=50)
+    mock_client.renew_lease.return_value = _make_renew_failed()
+
+    with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            with pytest.raises(LeaseLostError):
+                with execution_lease("task:123", worker_id="w-1") as lease:
+                    time.sleep(0.15)
+                    lease.check() # Calls check(), raises exception
+
+            # No warning should be emitted because they checked it
+            assert len(w) == 0
 
 
 # ---------------------------------------------------------------------------
 # Async tests
 # ---------------------------------------------------------------------------
 
-
 @pytest.mark.asyncio
 async def test_async_execution_lease_acquire_and_release() -> None:
     """Async happy path: acquires, heartbeats, releases on exit."""
     mock_client = MagicMock()
-    mock_client.check_idempotency_cache.return_value = _make_acquired_response()
+    mock_client.check_idempotency_cache.return_value = _make_acquired_response(heartbeat_interval_ms=50)
     mock_client.renew_lease.return_value = _make_renew_ok()
 
     with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
-        token: int
-        async with async_execution_lease("task:123", worker_id="w-1") as token:
-            assert token == 42
-            await asyncio.sleep(0.05)
+        async with async_execution_lease("task:123", worker_id="w-1") as lease:
+            assert lease.fencing_token == 42
+            await asyncio.sleep(0.15)
+            lease.check()
 
+    assert mock_client.renew_lease.call_count > 0, "Heartbeat should have fired"
     mock_client.release_lease.assert_called_once()
     mock_client.close.assert_called_once()
 
@@ -204,7 +221,7 @@ async def test_async_execution_lease_preemption() -> None:
     """Lease loss mid-execution cancels the calling task (CancelledError)."""
     mock_client = MagicMock()
     mock_client.check_idempotency_cache.return_value = _make_acquired_response(
-        heartbeat_interval_ms=150
+        heartbeat_interval_ms=50
     )
     # First renewal succeeds; subsequent ones fail.
     mock_client.renew_lease.side_effect = [
@@ -218,8 +235,8 @@ async def test_async_execution_lease_preemption() -> None:
         nonlocal cancelled
         with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
             try:
-                async with async_execution_lease("task:123", worker_id="w-1"):
-                    await asyncio.sleep(5)  # will be cancelled
+                async with async_execution_lease("task:123", worker_id="w-1") as lease:
+                    await asyncio.sleep(5)  # will be cancelled at an await point
             except asyncio.CancelledError:
                 cancelled = True
 
@@ -229,45 +246,26 @@ async def test_async_execution_lease_preemption() -> None:
     assert cancelled, "CancelledError should have been raised when lease was lost"
 
 
-# ---------------------------------------------------------------------------
-# Decorator tests
-# ---------------------------------------------------------------------------
-
-
-def test_task_lease_decorator_sync() -> None:
-    """Verifies @task_lease wraps a synchronous function correctly."""
-    mock_client = MagicMock()
-    mock_client.check_idempotency_cache.return_value = _make_acquired_response()
-    mock_client.renew_lease.return_value = _make_renew_ok()
-
-    @task_lease("task:sync-deco", worker_id="w-deco")
-    def sync_work() -> str:
-        return "sync-done"
-
-    with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
-        result = sync_work()
-
-    assert result == "sync-done"
-    mock_client.check_idempotency_cache.assert_called_once()
-    mock_client.release_lease.assert_called_once()
-    mock_client.close.assert_called_once()
-
-
 @pytest.mark.asyncio
-async def test_task_lease_decorator_async() -> None:
-    """Verifies @task_lease wraps an async function correctly."""
+async def test_async_cleanup_runs_on_cancel() -> None:
+    """If the body is cancelled (externally or by lease loss), cleanup still runs."""
     mock_client = MagicMock()
     mock_client.check_idempotency_cache.return_value = _make_acquired_response()
     mock_client.renew_lease.return_value = _make_renew_ok()
 
-    @task_lease("task:async-deco", worker_id="w-deco-async")
-    async def async_work() -> str:
-        return "async-done"
+    async def run() -> None:
+        with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
+            async with async_execution_lease("task:123", worker_id="w-1"):
+                await asyncio.sleep(5) # will be externally cancelled
 
-    with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
-        result = await async_work()
-
-    assert result == "async-done"
-    mock_client.check_idempotency_cache.assert_called_once()
+    task = asyncio.create_task(run())
+    
+    # Wait for context manager to enter
+    await asyncio.sleep(0.05)
+    task.cancel()
+    
+    with pytest.raises(asyncio.CancelledError):
+        await task
+        
     mock_client.release_lease.assert_called_once()
     mock_client.close.assert_called_once()

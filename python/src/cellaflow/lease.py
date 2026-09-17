@@ -8,12 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 def _renew_failure_detail(reason: int) -> str:
-    """Explains a renewal denial in terms of what the holder should do.
-
-    The raw enum value alone is close to useless in a log: the step body is still
-    running at this point and is about to attempt a commit that will be rejected,
-    so the message has to say why the lease is gone.
-    """
+    """Explains a renewal denial in terms of what the holder should do."""
     from cellaflow.v1 import idempotency_pb2 as _idem
 
     if reason == _idem.RENEW_FAILURE_REASON_MAX_LIFETIME_EXCEEDED:
@@ -49,12 +44,14 @@ class LeaseHeartbeat:
         fencing_token: int,
         heartbeat_interval_ms: int,
         on_lease_lost: Optional[Callable[[], None]] = None,
+        max_network_errors: int = 3,
     ) -> None:
         self.client = client
         self.agent_id = agent_id
         self.idempotency_key = idempotency_key
         self.fencing_token = fencing_token
         self.on_lease_lost = on_lease_lost
+        self.max_network_errors = max_network_errors
         # Renew slightly before expiration
         self.interval_sec = max(0.1, (heartbeat_interval_ms - 100) / 1000.0)
         self.extend_ms = (
@@ -80,9 +77,13 @@ class LeaseHeartbeat:
         """Stops the daemon thread cleanly."""
         self._stop_event_sync.set()
         if self._sync_thread and self._sync_thread.is_alive():
-            self._sync_thread.join(timeout=1.0)
+            # Join without timeout because closing the client while a 
+            # renew_lease RPC is still in flight will cause a gRPC panic.
+            # The daemon thread will exit once the RPC times out or finishes.
+            self._sync_thread.join()
 
     def _sync_loop(self) -> None:
+        consecutive_errors = 0
         while not self._stop_event_sync.wait(timeout=self.interval_sec):
             try:
                 resp = self.client.renew_lease(
@@ -91,6 +92,7 @@ class LeaseHeartbeat:
                     fencing_token=self.fencing_token,
                     extend_ms=self.extend_ms,
                 )
+                consecutive_errors = 0
                 if not resp.renewed:
                     logger.warning(
                         "Lease %s failed to renew: %s",
@@ -98,17 +100,21 @@ class LeaseHeartbeat:
                         _renew_failure_detail(resp.failure_reason),
                     )
                     if self.on_lease_lost is not None:
-                        self.on_lease_lost()
+                        try:
+                            self.on_lease_lost()
+                        except Exception as e:
+                            logger.error("on_lease_lost callback raised an error: %s", e)
                     break
             except Exception as e:
-                # Any network or RPC error means we can no longer confirm the
-                # lease is live. Treat it as lost immediately — continuing
-                # without a confirmed heartbeat risks two workers acting on the
-                # same task once the TTL elapses.
+                consecutive_errors += 1
                 logger.error("Lease renewal error for %s: %s", self.idempotency_key, e)
-                if self.on_lease_lost is not None:
-                    self.on_lease_lost()
-                break
+                if consecutive_errors >= self.max_network_errors:
+                    if self.on_lease_lost is not None:
+                        try:
+                            self.on_lease_lost()
+                        except Exception as e:
+                            logger.error("on_lease_lost callback raised an error: %s", e)
+                    break
 
     def start_async(self) -> None:
         """Starts an asyncio task for asynchronous execution."""
@@ -131,6 +137,7 @@ class LeaseHeartbeat:
         if not self._stop_event_async:
             return
 
+        consecutive_errors = 0
         while True:
             try:
                 await asyncio.wait_for(
@@ -141,12 +148,15 @@ class LeaseHeartbeat:
             except asyncio.TimeoutError:
                 # Interval elapsed — do heartbeat.
                 try:
-                    resp = self.client.renew_lease(
+                    # Offload sync gRPC call to a thread so it doesn't block the event loop
+                    resp = await asyncio.to_thread(
+                        self.client.renew_lease,
                         agent_id=self.agent_id,
                         idempotency_key=self.idempotency_key,
                         fencing_token=self.fencing_token,
                         extend_ms=self.extend_ms,
                     )
+                    consecutive_errors = 0
                     if not resp.renewed:
                         logger.warning(
                             "Lease %s failed to renew: %s",
@@ -154,16 +164,20 @@ class LeaseHeartbeat:
                             _renew_failure_detail(resp.failure_reason),
                         )
                         if self.on_lease_lost is not None:
-                            self.on_lease_lost()
+                            try:
+                                self.on_lease_lost()
+                            except Exception as e:
+                                logger.error("on_lease_lost callback raised an error: %s", e)
                         break
                 except Exception as e:
-                    # Any network or RPC error means we can no longer confirm
-                    # the lease is live. Treat it as lost immediately.
-                    logger.error(
-                        "Lease renewal error for %s: %s", self.idempotency_key, e
-                    )
-                    if self.on_lease_lost is not None:
-                        self.on_lease_lost()
-                    break
+                    consecutive_errors += 1
+                    logger.error("Lease renewal error for %s: %s", self.idempotency_key, e)
+                    if consecutive_errors >= self.max_network_errors:
+                        if self.on_lease_lost is not None:
+                            try:
+                                self.on_lease_lost()
+                            except Exception as cb_e:
+                                logger.error("on_lease_lost callback raised an error: %s", cb_e)
+                        break
             except asyncio.CancelledError:
                 break
