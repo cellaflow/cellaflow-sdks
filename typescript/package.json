@@ -1,6 +1,6 @@
 {
   "name": "@cellaflow/sdk",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "TypeScript/Node.js SDK for the Cellaflow workflow engine",
   "type": "module",
   "main": "dist/index.js",
