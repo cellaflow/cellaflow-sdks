@@ -14,7 +14,7 @@ Official client SDKs and protocol definitions for the [CellaFlow Engine](https:/
 | Language | Package | Status | Documentation |
 | :--- | :--- | :--- | :--- |
 | **Python** | [`cellaflow`](https://pypi.org/project/cellaflow/) | ✅ **v0.7.0** (Released) | [Python SDK Guide](python/README.md) |
-| **TypeScript** | `@cellaflow/sdk` | 🚧 *In Development* | Coming Soon |
+| **TypeScript** | [`@cellaflow/sdk`](https://www.npmjs.com/package/@cellaflow/sdk) | ✅ **v0.7.0** (Released) | [TypeScript SDK Guide](typescript/README.md) |
 
 ---
 
@@ -28,6 +28,9 @@ cellaflow-sdks/
 │   ├── src/cellaflow/  # Decorators, contextvars isolation, gRPC client, MessagePack
 │   ├── tests/          # Comprehensive test suite (pytest)
 │   └── README.md       # Python SDK documentation & quickstarts
+├── typescript/         # Official TypeScript SDK (npm install @cellaflow/sdk)
+│   ├── src/            # gRPC client, connect-es definitions, MessagePack
+│   └── README.md       # TypeScript SDK documentation & quickstarts
 ├── LICENSE             # Project license (Apache 2.0 or MIT)
 └── buf.gen.yaml        # Buf code generation configuration
 ```
