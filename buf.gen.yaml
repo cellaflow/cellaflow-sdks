@@ -4,3 +4,13 @@ plugins:
     out: python/src
   - plugin: buf.build/grpc/python
     out: python/src
+  - plugin: es
+    out: typescript/src
+    opt: 
+      - target=ts
+      - import_extension=.js
+  - plugin: connect-es
+    out: typescript/src
+    opt: 
+      - target=ts
+      - import_extension=.js
