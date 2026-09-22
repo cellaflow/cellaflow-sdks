@@ -1,0 +1,59 @@
+{
+  "name": "@cellaflow/sdk",
+  "version": "0.7.0",
+  "description": "TypeScript/Node.js SDK for the Cellaflow workflow engine",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist/",
+    "src/",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "cellaflow",
+    "workflow",
+    "grpc",
+    "connect-rpc",
+    "sdk"
+  ],
+  "author": "Cellaflow <hello@cellaflow.com>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cellaflow/cellaflow-sdks.git",
+    "directory": "typescript"
+  },
+  "homepage": "https://github.com/cellaflow/cellaflow-sdks/tree/main/typescript#readme",
+  "bugs": {
+    "url": "https://github.com/cellaflow/cellaflow-sdks/issues"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^1.10.1",
+    "@connectrpc/connect": "^1.7.0",
+    "@connectrpc/connect-node": "^1.7.0",
+    "@msgpack/msgpack": "^3.1.3"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "^1.73.0",
+    "@bufbuild/protoc-gen-es": "^1.10.1",
+    "@connectrpc/protoc-gen-connect-es": "^1.7.0",
+    "@types/node": "^26.6.2",
+    "typescript": "^7.0.2"
+  }
+}
