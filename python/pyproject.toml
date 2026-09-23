@@ -1,5 +1,9 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+# 77.0 is the floor for PEP 639, which is what `license` as an SPDX expression
+# and `license-files` below both need. An older setuptools does not understand
+# either field and drops the license from the built metadata instead of failing,
+# so the floor has to be asserted here rather than left to whatever resolves.
+requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -26,6 +30,11 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 license = "Apache-2.0 OR MIT"
+# Ships the license text inside the sdist and wheel. Without this the artifacts
+# carry the expression above in their metadata and no license file at all, which
+# scanners that read artifact contents rather than registry metadata treat as
+# unlicensed.
+license-files = ["LICENSE"]
 
 [project.urls]
 Homepage = "https://www.cellaflow.com"
