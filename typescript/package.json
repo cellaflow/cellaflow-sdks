@@ -1,7 +1,7 @@
 {
   "name": "@cellaflow/sdk",
   "version": "0.7.1",
-  "description": "TypeScript/Node.js SDK for the Cellaflow workflow engine",
+  "description": "TypeScript/Node.js SDK for Cellaflow: at-most-once tool calls and durable replay for AI agents",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -28,6 +28,12 @@
   },
   "keywords": [
     "cellaflow",
+    "ai-agents",
+    "agents",
+    "llm",
+    "idempotency",
+    "exactly-once",
+    "durable-execution",
     "workflow",
     "grpc",
     "connect-rpc",
@@ -40,7 +46,7 @@
     "url": "git+https://github.com/cellaflow/cellaflow-sdks.git",
     "directory": "typescript"
   },
-  "homepage": "https://github.com/cellaflow/cellaflow-sdks/tree/main/typescript#readme",
+  "homepage": "https://cellaflow.com",
   "bugs": {
     "url": "https://github.com/cellaflow/cellaflow-sdks/issues"
   },
