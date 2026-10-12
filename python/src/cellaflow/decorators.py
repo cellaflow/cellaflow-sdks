@@ -4,13 +4,23 @@ import uuid
 import asyncio
 import time
 import logging
-from typing import Any, Callable, Optional, Sequence, TypeVar, cast
+from typing import Any, Callable, Dict, Optional, Sequence, TypeVar, cast
 
 import grpc
 
 from cellaflow.client import CellaflowClient
-from cellaflow.context import WorkflowContext, set_context, reset_context, get_context
-from cellaflow.idempotency import derive_idempotency_key, IdempotencyScope
+from cellaflow.context import (
+    WorkflowContext,
+    set_context,
+    reset_context,
+    get_context,
+    session_coordination_id,
+)
+from cellaflow.idempotency import (
+    derive_idempotency_key,
+    normalize_coordination_id,
+    IdempotencyScope,
+)
 from cellaflow.lease import LeaseHeartbeat
 from cellaflow.serialization import deserialize
 from cellaflow.v1.common_pb2 import STEP_STATUS_SUCCESS
@@ -35,11 +45,16 @@ def workflow(
             session_id = kwargs.pop("_session_id", str(uuid.uuid4()))
             # Identifies the shared work, not the session. Agents in
             # different sessions pass the same value to converge on one key.
-            coordination_id = kwargs.pop("_coordination_id", None)
+            coordination_id = normalize_coordination_id(
+                kwargs.pop("_coordination_id", None)
+            )
 
             client = CellaflowClient(target=target, secure=secure)
             resp = client.start_session(
-                workflow_id=func.__name__, version=version, session_id=session_id
+                workflow_id=func.__name__,
+                version=version,
+                session_id=session_id,
+                coordination_id=coordination_id,
             )
 
             replayed_steps = {}
@@ -61,7 +76,7 @@ def workflow(
                 workflow_version=resp.version,
                 sequence=0,
                 replayed_steps=replayed_steps,
-                coordination_id=coordination_id,
+                coordination_id=session_coordination_id(resp, coordination_id),
             )
             token = set_context(ctx)
             try:
@@ -74,11 +89,16 @@ def workflow(
             session_id = kwargs.pop("_session_id", str(uuid.uuid4()))
             # Identifies the shared work, not the session. Agents in
             # different sessions pass the same value to converge on one key.
-            coordination_id = kwargs.pop("_coordination_id", None)
+            coordination_id = normalize_coordination_id(
+                kwargs.pop("_coordination_id", None)
+            )
 
             client = CellaflowClient(target=target, secure=secure)
             resp = client.start_session(
-                workflow_id=func.__name__, version=version, session_id=session_id
+                workflow_id=func.__name__,
+                version=version,
+                session_id=session_id,
+                coordination_id=coordination_id,
             )
 
             replayed_steps = {}
@@ -100,7 +120,7 @@ def workflow(
                 workflow_version=resp.version,
                 sequence=0,
                 replayed_steps=replayed_steps,
-                coordination_id=coordination_id,
+                coordination_id=session_coordination_id(resp, coordination_id),
             )
             token = set_context(ctx)
             try:
@@ -189,6 +209,16 @@ def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
     return payload.get("result")
 
 
+def _pop_call_coordination(kwargs: Dict[str, Any]) -> Optional[str]:
+    """Takes a step's own coordination domain out of its call arguments.
+
+    Removed before the step's arguments are hashed or passed to it, and
+    validated before the sequence advances or a lease is taken, so an invalid
+    value fails without leaving anything behind.
+    """
+    return normalize_coordination_id(kwargs.pop("_coordination_id", None))
+
+
 def _validate_shared_scope(
     func: Callable[..., Any],
     scope: IdempotencyScope,
@@ -257,6 +287,12 @@ def step(
     @functools.wraps(func)
     async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
         ctx = get_context()
+        # A step may name its own coordination domain, overriding the
+        # session's for this call only. It is recorded with the step and, under
+        # SCOPE_SHARED, is what the key is derived from, so the call is
+        # deduplicated under the same domain it is recorded under.
+        call_coordination = _pop_call_coordination(kwargs)
+        coordination_id = call_coordination or ctx.coordination_id
         # A cache hit may have left this counter ahead of the
         # engine's. Adopt the position it reported before claiming the next
         # sequence, or this commit fails the ordering check and names the wrong
@@ -284,7 +320,7 @@ def step(
                     agent_id,
                     actual_tool_name,
                     scope,
-                    ctx.coordination_id,
+                    coordination_id,
                     _shared_on=shared_on,
                     **bound.arguments,
                 )
@@ -296,7 +332,7 @@ def step(
                     agent_id,
                     actual_tool_name,
                     scope,
-                    ctx.coordination_id,
+                    coordination_id,
                     *args,
                     **kwargs,
                 )
@@ -364,6 +400,9 @@ def step(
                 output_payload={"result": result},
                 idempotency_key=ikey,
                 idempotency_fencing_token=fencing_token,
+                # Omitted when the call names none, so the engine records the
+                # session's default.
+                coordination_id=call_coordination,
             )
             return result
         except Exception as e:
@@ -382,6 +421,12 @@ def step(
     @functools.wraps(func)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
         ctx = get_context()
+        # A step may name its own coordination domain, overriding the
+        # session's for this call only. It is recorded with the step and, under
+        # SCOPE_SHARED, is what the key is derived from, so the call is
+        # deduplicated under the same domain it is recorded under.
+        call_coordination = _pop_call_coordination(kwargs)
+        coordination_id = call_coordination or ctx.coordination_id
         # A cache hit may have left this counter ahead of the
         # engine's. Adopt the position it reported before claiming the next
         # sequence, or this commit fails the ordering check and names the wrong
@@ -409,7 +454,7 @@ def step(
                     agent_id,
                     actual_tool_name,
                     scope,
-                    ctx.coordination_id,
+                    coordination_id,
                     _shared_on=shared_on,
                     **bound.arguments,
                 )
@@ -421,7 +466,7 @@ def step(
                     agent_id,
                     actual_tool_name,
                     scope,
-                    ctx.coordination_id,
+                    coordination_id,
                     *args,
                     **kwargs,
                 )
@@ -489,6 +534,9 @@ def step(
                 output_payload={"result": result},
                 idempotency_key=ikey,
                 idempotency_fencing_token=fencing_token,
+                # Omitted when the call names none, so the engine records the
+                # session's default.
+                coordination_id=call_coordination,
             )
             return result
         except Exception as e:

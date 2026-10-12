@@ -17,6 +17,38 @@ class IdempotencyScope(Enum):
     SCOPE_SHARED = 4
 
 
+#: The longest coordination id the engine accepts, in UTF-8 bytes.
+MAX_COORDINATION_ID_BYTES = 256
+
+
+def normalize_coordination_id(value: Optional[str]) -> Optional[str]:
+    """Applies the engine's rules for a coordination id, returning it unchanged.
+
+    Empty means absent and returns `None`. Leading or trailing whitespace,
+    colons, and values over 256 bytes raise `ValueError`.
+
+    The value is never trimmed or otherwise cleaned up. It is hashed into
+    `SCOPE_SHARED` keys exactly as given, so a cleaned-up copy would record the
+    work under one domain while deduplicating it under another.
+
+    The engine applies the same rules, but a step's own coordination id only
+    reaches it with the commit, after the step body has run. Checking here
+    means an invalid value fails before the side effect rather than after it.
+    """
+    if not value:
+        return None
+    if value.strip() != value:
+        raise ValueError(
+            f"coordination_id {value!r} cannot be blank or have leading or "
+            f"trailing whitespace"
+        )
+    if ":" in value:
+        raise ValueError(f"coordination_id {value!r} cannot contain colons (:)")
+    if len(value.encode("utf-8")) > MAX_COORDINATION_ID_BYTES:
+        raise ValueError(f"coordination_id exceeds {MAX_COORDINATION_ID_BYTES} bytes")
+    return value
+
+
 def _hash_inputs(*args: Any, **kwargs: Any) -> str:
     """
     Hashes the inputs using RFC 8785 Canonical JSON and SHA-256.
@@ -77,9 +109,11 @@ def derive_idempotency_key(
             raise ValueError(
                 "SCOPE_SHARED requires a coordination_id naming the work being "
                 "shared -- a ticket, task, or tenant id. Pass it when invoking "
-                "the workflow, e.g. my_agent(..., _coordination_id='ticket-4417'). "
-                "It has no default: a shared one would deduplicate unrelated "
-                "callers that happen to make the same call."
+                "the workflow, e.g. my_agent(..., _coordination_id='ticket-4417'), "
+                "or when calling the tool, e.g. refund(..., "
+                "_coordination_id='customer-88'). It has no built-in default: a "
+                "shared one would deduplicate unrelated callers that happen to "
+                "make the same call."
             )
         return f"shared:{coordination_id}:{tool_name}:{inputs_hash}"
 

@@ -8,6 +8,7 @@ from cellaflow import CellaflowSaver, durable_tools, tool, tool_session_id
 from cellaflow.context import get_context
 from cellaflow.client import CellaflowClient
 from cellaflow.serialization import serialize, deserialize
+from cellaflow.v1 import service_pb2
 from cellaflow.v1.idempotency_pb2 import CACHE_STATUS_ACQUIRED, CACHE_STATUS_HIT
 from langgraph.graph import StateGraph, START, END
 from langchain_core.runnables import RunnableConfig
@@ -61,7 +62,7 @@ class MockCellaflowClient:
     MAX_PAGE = 1000
 
     def __init__(self) -> None:
-        self.sessions: Dict[str, Dict[str, str]] = {}
+        self.sessions: Dict[str, Dict[str, Optional[str]]] = {}
         self.graphs: Dict[str, List[Dict[str, Any]]] = {}
         #: Every get_graph call, as (limit, cursor) — lets tests assert on paging.
         self.graph_calls: List[Tuple[Optional[int], Optional[str]]] = []
@@ -69,16 +70,34 @@ class MockCellaflowClient:
         self.get_graph_fails_with: Optional[Any] = None
 
     def start_session(
-        self, workflow_id: str, version: str, session_id: Optional[str] = None
-    ) -> MagicMock:
+        self,
+        workflow_id: str,
+        version: str,
+        session_id: Optional[str] = None,
+        coordination_id: Optional[str] = None,
+    ) -> service_pb2.StartSessionResponse:
         sid = session_id or "default_session"
-        self.sessions[sid] = {"workflow_id": workflow_id, "version": version}
+        # The engine pins the coordination domain with the session, refuses a
+        # resume naming another, and returns the stored value either way.
+        pinned = self.sessions.get(sid, {}).get("coordination_id", coordination_id)
+        if coordination_id is not None and coordination_id != pinned:
+            raise _FailedPrecondition(
+                f"Coordination mismatch for session {sid}: pinned to "
+                f"{pinned or 'no coordination_id'}, but request specified "
+                f"{coordination_id}"
+            )
+        self.sessions[sid] = {
+            "workflow_id": workflow_id,
+            "version": version,
+            "coordination_id": pinned,
+        }
         if sid not in self.graphs:
             self.graphs[sid] = []
-        resp = MagicMock()
-        resp.session_id = sid
-        resp.version = version
-        resp.is_recovered = False
+        resp = service_pb2.StartSessionResponse(
+            session_id=sid, version=version, is_recovered=False
+        )
+        if pinned is not None:
+            resp.coordination_id = pinned
         return resp
 
     def commit_step(
@@ -90,6 +109,7 @@ class MockCellaflowClient:
         output_payload: Dict[str, Any],
         idempotency_key: Optional[str] = None,
         idempotency_fencing_token: Optional[int] = None,
+        coordination_id: Optional[str] = None,
     ) -> MagicMock:
         if session_id not in self.graphs:
             self.graphs[session_id] = []
@@ -115,6 +135,8 @@ class MockCellaflowClient:
                 "status": status,
                 "output_payload": unpacked,
                 "idempotency_key": idempotency_key,
+                "coordination_id": coordination_id
+                or self.sessions.get(session_id, {}).get("coordination_id"),
             }
         )
         resp = MagicMock()
@@ -951,6 +973,7 @@ class LeasingMockClient(MockCellaflowClient):
         output_payload: Dict[str, Any],
         idempotency_key: Optional[str] = None,
         idempotency_fencing_token: Optional[int] = None,
+        coordination_id: Optional[str] = None,
     ) -> Any:
         if idempotency_key:
             self.cache[idempotency_key] = serialize(output_payload)
@@ -962,6 +985,7 @@ class LeasingMockClient(MockCellaflowClient):
             output_payload,
             idempotency_key,
             idempotency_fencing_token,
+            coordination_id,
         )
 
     def release_lease(

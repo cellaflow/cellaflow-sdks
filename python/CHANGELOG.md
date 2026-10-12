@@ -2,6 +2,42 @@
 
 All notable changes to the CellaFlow Python SDK.
 
+## Unreleased
+
+### Added & Changed
+
+- **The coordination domain is sent to the engine and recorded on every step.**
+  `_coordination_id` on a `@workflow` call, and `coordination_id` on `durable_tools`, are now sent
+  with `StartSession`. The engine stores the value as the session's default coordination domain and
+  records every step under it.
+
+- **A resumed session adopts its stored domain.** Resuming with `_session_id` and no
+  `_coordination_id` now picks up the domain the session was started with, so `SCOPE_SHARED` tools
+  keep deriving the same keys. Resuming with a different domain, or naming one on a session started
+  without one, is refused by the engine with `FAILED_PRECONDITION`.
+
+- **A step can override the domain for one call.** Pass `_coordination_id` when calling a `@step`
+  or `@tool`:
+
+  ```python
+  refund(customer, 25, _coordination_id=customer)
+  ```
+
+  The call is recorded under that domain and, under `SCOPE_SHARED`, keyed by it, so it converges
+  with other agents using the same domain whatever their session default. The key format is
+  unchanged; its coordination input is now the call's override if given, otherwise the session's.
+
+- **Coordination ids are validated.** A coordination id may not contain colons, may not have
+  leading or trailing whitespace, and may not exceed 256 bytes. An empty string means none. Invalid
+  values raise `ValueError` before the session starts or, for an override, before the step runs,
+  where previously any string was accepted. Values are never trimmed.
+
+- `CellaflowClient.start_session` and `commit_step` take an optional `coordination_id`, and
+  `get_graph` returns each step's `coordination_id`.
+
+Engines that do not support the field ignore it. Keys are derived exactly as before against them,
+from the value the caller passed.
+
 ## 0.7.0
 
 ### Added & Changed

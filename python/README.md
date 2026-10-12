@@ -139,7 +139,8 @@ doc_writer_agent("v4.2", _coordination_id="release-4.2")
 
 `_coordination_id` names **the work being shared** — a release, a ticket, a task, a tenant — and is
 passed at the call site alongside `_session_id`, because it is a property of the collaboration and
-not of the tool definition.
+not of the tool definition. The engine stores it with the session as the session's default
+coordination domain, and records every step under it.
 
 `shared_on` names the arguments that identify the shared work — here, the version being
 published. **It is required** (or an explicit `idempotency_key`), and omitting it raises at import
@@ -154,18 +155,60 @@ Note the trade-off you accept by doing so: the agents that lose receive a result
 arguments they did not supply. If that matters, make the disputed value itself a leased step so
 they agree on it before reaching the step that spends it.
 
-`_coordination_id` is **required** for `SCOPE_SHARED` and has no default; omitting it raises `ValueError`. A default
-would silently deduplicate unrelated callers that happen to make the same call — one agent's
-operation is suppressed and it is handed a result it never asked for, with no error raised anywhere.
-Making the domain explicit forces that boundary to be a decision rather than an accident. The other
-scopes ignore `_coordination_id` if it is passed.
+`_coordination_id` is **required** for `SCOPE_SHARED` and has no built-in default; a shared call
+with no domain raises `ValueError`. A built-in default would silently deduplicate unrelated callers
+that happen to make the same call: one agent's operation is suppressed and it is handed a result it
+never asked for, with no error raised anywhere. Making the domain explicit forces that boundary to be
+a decision rather than an accident. The other scopes do not use it in their keys, though the engine
+still records it on every step.
+
+**Resuming keeps the domain.** A resumed session may omit `_coordination_id`: the stored value is
+adopted, so the agent keeps deriving the same shared keys as the agents it was working with. Passing
+a *different* one is refused with `FAILED_PRECONDITION`, and so is naming one on a session started
+without one, because either would silently stop it deduplicating against its peers.
+
+```python
+coder_agent("v4.2", _session_id=sid)                                 # adopts "release-4.2"
+coder_agent("v4.2", _session_id=sid, _coordination_id="release-4.3")  # grpc.RpcError
+```
+
+**Overriding the domain for one call.** A step can name its own domain by passing
+`_coordination_id` when it is called. That one call is recorded under it and, under `SCOPE_SHARED`,
+keyed by it, so it converges with any other agent using the same domain, whatever that agent's
+session default:
+
+```python
+@tool(tool_name="refund", scope=IdempotencyScope.SCOPE_SHARED, shared_on=["customer"])
+def refund(customer: str, amount: int) -> dict:
+    return payments.refund(customer, amount)
+
+@workflow(version="1.0.0")
+def ticket_agent(ticket: str, customer: str) -> dict:
+    # Works the ticket, but refunds under the customer's domain.
+    return refund(customer, 25, _coordination_id=customer)
+
+@workflow(version="1.0.0")
+def billing_agent(customer: str) -> dict:
+    return refund(customer, 25)
+
+ticket_agent("T-4417", "customer-88", _coordination_id="T-4417")
+billing_agent("customer-88", _coordination_id="customer-88")   # one refund, not two
+```
+
+The override is popped before your function is called. Compute it from the workflow's inputs, not
+from anything that varies between runs, so a resumed run derives the same key.
+
+A coordination id must not contain colons, must not have leading or trailing whitespace, and must
+not exceed 256 bytes; an empty string means none. An invalid value raises `ValueError` before the
+session starts or, for an override, before the step runs. It is never trimmed or otherwise cleaned
+up, because it is hashed into the key exactly as given.
 
 **Three things must match for two agents to converge.** All of them are under your control, and any
 one of them being different means both agents execute:
 
 | Must match | Note |
 | --- | --- |
-| `coordination_id` | Different domains stay isolated. This is what keeps the scope from being too wide. |
+| `coordination_id` | The call's own, if it passes one, otherwise the session's. Different domains stay isolated. This is what keeps the scope from being too wide. |
 | `tool_name` | Defaults to the *function name*. Agents whose functions are named differently must set `tool_name=` explicitly to the same value. |
 | Arguments | Hashed with RFC 8785 + SHA-256, so `publish("v4.2")` and `publish("V4.2")` are different operations. |
 
@@ -491,7 +534,7 @@ Marks the entry point for a durable workflow execution:
 - **Automatic Client Management**: Transparently initializes the underlying gRPC client and session state.
 - **Context Isolation**: Uses Python's `contextvars` to manage session context safely across async event loops and threads.
 - **Replay State Loader**: Loads completed step history from the engine whenever `_session_id` is supplied.
-- **Call-time keyword arguments**: `_session_id` resumes an existing session; `_coordination_id` names the coordination domain for `SCOPE_SHARED` steps. Both are popped before your function is called.
+- **Call-time keyword arguments**: `_session_id` resumes an existing session; `_coordination_id` sets the session's default coordination domain, which every step is recorded under and `SCOPE_SHARED` keys are derived from. On resume it may be omitted, and the stored value is adopted. Both are popped before your function is called.
 
 ### `@step` and `@tool`
 Decorators for atomic units of execution within a workflow:
@@ -508,6 +551,7 @@ Decorators for atomic units of execution within a workflow:
   — except under `SCOPE_SHARED`, which drops the session and version entirely, and hashes only
   the arguments named in `shared_on`:
   `shared:[Coordination_ID]:[Tool_Name]:[RFC8785_SHA256_Hash]`
+- **Coordination override**: Passing `_coordination_id` when calling a step records that call under its own coordination domain instead of the session's, and derives its `SCOPE_SHARED` key from it. It is popped before your function is called.
 - **Replay Interception**: If a step was already completed in the session history, immediately returns the cached output without re-running the function body.
 - **Lease Heartbeating**: Automatically runs background heartbeats (`RenewLease`) via daemon threads (sync) or asyncio tasks (async) to keep engine locks refreshed.
 - **Lock Release on Failure**: If an unhandled exception occurs, automatically releases the lease with `reason="TOOL_ERROR"`.
@@ -534,6 +578,9 @@ counters and would otherwise compete for graph positions — and **deterministic
 thread, so the idempotency key survives a restart. `tool_session_id(thread_id)` exposes the
 mapping for inspection. See [Leased Tool Calls Inside LangGraph Nodes](#6-leased-tool-calls-inside-langgraph-nodes-durable_tools).
 
+`coordination_id` sets the session's default coordination domain, as `_coordination_id` does for
+`@workflow`. A later block for the same thread may omit it and adopts the stored value.
+
 `config` is the same mapping you pass to `invoke` — only `configurable.thread_id` is read from it,
 and a bare thread id string is accepted too. Leasing is independent of where checkpoints are
 stored, so this works with any LangGraph checkpointer, not just `CellaflowSaver`.
@@ -543,7 +590,7 @@ Controls how cached step and tool results are shared across multi-agent sessions
 - `IdempotencyScope.SCOPE_SESSION_WIDE` *(Default)*: Cached results are shared across all agents in the session.
 - `IdempotencyScope.SCOPE_AGENT_PRIVATE`: Isolates cache hits to the executing `agent_id`.
 - `IdempotencyScope.SCOPE_STEP_LOCAL`: Strictly isolates cache hits to the current superstep sequence and `agent_id`.
-- `IdempotencyScope.SCOPE_SHARED`: Shares one execution across **different sessions** within a declared coordination domain. Requires `_coordination_id` at the call site — see [Coordinating Agents Across Different Sessions](#3-coordinating-agents-across-different-sessions).
+- `IdempotencyScope.SCOPE_SHARED`: Shares one execution across **different sessions** within a declared coordination domain. Requires a coordination domain, from the session or from the call. See [Coordinating Agents Across Different Sessions](#3-coordinating-agents-across-different-sessions).
 
 The first three narrow the key from the session default; `SCOPE_SHARED` is the only one that widens
 past the session, which is why it is the only one that demands an explicit domain.
