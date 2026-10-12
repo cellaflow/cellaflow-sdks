@@ -29,6 +29,25 @@ export class StartSessionRequest extends Message<StartSessionRequest> {
    */
   sessionId?: string;
 
+  /**
+   * The coordination domain this session works in by default: the ticket, task
+   * or tenant that several agents are collaborating on.
+   *
+   * Stored once with the session and inherited by every step that does not
+   * name its own (see `StepResult.coordination_id`). Resuming an existing
+   * session with a different value is refused with FAILED_PRECONDITION, because
+   * a resumed agent under a different domain would derive different shared keys
+   * and stop deduplicating against the agents it was working with. That includes
+   * naming one on a session created without one. Omitting it on resume is
+   * allowed; the stored value comes back on the response.
+   *
+   * Empty is treated as absent. Must not have leading or trailing whitespace,
+   * must not contain colons and must not exceed 256 bytes.
+   *
+   * @generated from field: optional string coordination_id = 4;
+   */
+  coordinationId?: string;
+
   constructor(data?: PartialMessage<StartSessionRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -40,6 +59,7 @@ export class StartSessionRequest extends Message<StartSessionRequest> {
     { no: 1, name: "workflow_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "coordination_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StartSessionRequest {
@@ -78,6 +98,15 @@ export class StartSessionResponse extends Message<StartSessionResponse> {
    */
   isRecovered = false;
 
+  /**
+   * The coordination domain stored with this session, if any. On resume this is
+   * the value pinned when the session was created, which lets a caller that did
+   * not supply one adopt it.
+   *
+   * @generated from field: optional string coordination_id = 4;
+   */
+  coordinationId?: string;
+
   constructor(data?: PartialMessage<StartSessionResponse>) {
     super();
     proto3.util.initPartial(data, this);
@@ -89,6 +118,7 @@ export class StartSessionResponse extends Message<StartSessionResponse> {
     { no: 1, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "is_recovered", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "coordination_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StartSessionResponse {

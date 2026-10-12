@@ -110,6 +110,24 @@ export class StepResult extends Message<StepResult> {
    */
   sourceSequence?: bigint;
 
+  /**
+   * The coordination domain this step belongs to.
+   *
+   * When omitted, the engine fills in the session's default from
+   * `StartSessionRequest.coordination_id` before the step is stored, so every
+   * stored step carries the domain it was actually executed under. Setting it
+   * overrides the default for this step only.
+   *
+   * Carried as its own field rather than read out of `idempotency_key`, which
+   * the engine treats as opaque. Empty is treated as absent. Must not have
+   * leading or trailing whitespace, must not contain colons and must not exceed
+   * 256 bytes. A TimerFired event the engine writes takes the domain of the
+   * step that scheduled the timer.
+   *
+   * @generated from field: optional string coordination_id = 8;
+   */
+  coordinationId?: string;
+
   constructor(data?: PartialMessage<StepResult>) {
     super();
     proto3.util.initPartial(data, this);
@@ -125,6 +143,7 @@ export class StepResult extends Message<StepResult> {
     { no: 5, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 6, name: "deadline_ms", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
     { no: 7, name: "source_sequence", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 8, name: "coordination_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StepResult {
