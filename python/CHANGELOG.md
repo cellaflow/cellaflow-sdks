@@ -30,7 +30,8 @@ All notable changes to the CellaFlow Python SDK.
 - **Coordination ids are validated.** A coordination id may not contain colons, may not have
   leading or trailing whitespace, and may not exceed 256 bytes. An empty string means none. Invalid
   values raise `ValueError` before the session starts or, for an override, before the step runs,
-  where previously any string was accepted. Values are never trimmed.
+  where previously any string was accepted. A value that is not a string, such as an int or a
+  `uuid.UUID`, raises `TypeError`; pass `str()` of it. Values are never trimmed.
 
 - `CellaflowClient.start_session` and `commit_step` take an optional `coordination_id`, and
   `get_graph` returns each step's `coordination_id`.

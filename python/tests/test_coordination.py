@@ -201,6 +201,38 @@ def test_an_invalid_override_fails_before_anything_runs(
     assert [s.sequence for s in committed(stub)] == [1]
 
 
+@pytest.mark.parametrize(
+    "bad",
+    ["ticket:4417", " t-1", "t-1 ", "x" * (MAX_COORDINATION_ID_BYTES + 1)],
+)
+@pytest.mark.asyncio
+async def test_an_invalid_async_override_fails_before_anything_runs(
+    stub: MagicMock, bad: str
+) -> None:
+    stub.StartSession.return_value = started("ticket-4417")
+
+    @tool(
+        tool_name="notify", scope=IdempotencyScope.SCOPE_SHARED, shared_on=["who"]
+    )  # type: ignore[untyped-decorator]
+    async def notify(who: str) -> str:
+        ran.append(who)
+        return f"notified {who}"
+
+    @workflow(version="1.0.0")
+    async def agent() -> str:
+        with pytest.raises(ValueError):
+            await notify("customer-88", _coordination_id=bad)
+        assert ran == [], "an invalid override must fail before the tool body"
+        stub.CheckIdempotencyCache.assert_not_called()
+        # And the failed call must not have consumed a sequence.
+        result = await notify("customer-88")
+        return result  # type: ignore[no-any-return]
+
+    await cast(Any, agent)(_coordination_id="ticket-4417")
+
+    assert [s.sequence for s in committed(stub)] == [1]
+
+
 def test_an_invalid_session_default_fails_before_the_session_starts(
     stub: MagicMock,
 ) -> None:
@@ -268,3 +300,5 @@ def test_normalize_matches_the_engine_rules() -> None:
     # The limit is in UTF-8 bytes, as the engine counts it, not characters.
     with pytest.raises(ValueError):
         normalize_coordination_id("é" * (MAX_COORDINATION_ID_BYTES // 2 + 1))
+    with pytest.raises(TypeError):
+        normalize_coordination_id(cast(Any, 4417))

@@ -24,8 +24,9 @@ MAX_COORDINATION_ID_BYTES = 256
 def normalize_coordination_id(value: Optional[str]) -> Optional[str]:
     """Applies the engine's rules for a coordination id, returning it unchanged.
 
-    Empty means absent and returns `None`. Leading or trailing whitespace,
-    colons, and values over 256 bytes raise `ValueError`.
+    Empty means absent and returns `None`. A value that is not a string raises
+    `TypeError`. Leading or trailing whitespace, colons, and values over 256
+    bytes raise `ValueError`.
 
     The value is never trimmed or otherwise cleaned up. It is hashed into
     `SCOPE_SHARED` keys exactly as given, so a cleaned-up copy would record the
@@ -35,6 +36,13 @@ def normalize_coordination_id(value: Optional[str]) -> Optional[str]:
     reaches it with the commit, after the step body has run. Checking here
     means an invalid value fails before the side effect rather than after it.
     """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(
+            f"coordination_id must be a string, got {type(value).__name__}; "
+            f"pass str() of it to use it as one"
+        )
     if not value:
         return None
     if value.strip() != value:
