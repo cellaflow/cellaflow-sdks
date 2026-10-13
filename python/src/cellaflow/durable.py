@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator, Optional, cast
 
 from cellaflow.client import CellaflowClient
+from cellaflow.idempotency import normalize_coordination_id
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,11 @@ def durable_tools(
     same constraint LangGraph itself imposes -- one execution per thread -- not
     an additional one.
 
+    `coordination_id` is the session's default coordination domain. It is
+    stored with the session, and on a later block for the same thread it may be
+    omitted: the stored value is adopted, so `SCOPE_SHARED` tools keep deriving
+    the same keys. Passing a different one is refused by the engine.
+
     `config` is normally the same mapping passed to `invoke`, and only
     `configurable.thread_id` is read from it. A bare thread id string is
     accepted too, for callers who have no config to hand.
@@ -143,16 +149,21 @@ def durable_tools(
         WorkflowContext,
         set_context,
         reset_context,
+        session_coordination_id,
         _register_session,
         _deregister_session,
     )
 
     thread_id = _thread_id_from(config)
     session_id = tool_session_id(thread_id)
+    coordination_id = normalize_coordination_id(coordination_id)
 
     client = CellaflowClient(target=target, secure=secure)
     resp = client.start_session(
-        workflow_id=workflow_id, version=version, session_id=session_id
+        workflow_id=workflow_id,
+        version=version,
+        session_id=session_id,
+        coordination_id=coordination_id,
     )
 
     # Deliberately no `replayed_steps`, which is the one thing that must not be
@@ -183,7 +194,7 @@ def durable_tools(
         session_id=resp.session_id,
         workflow_version=resp.version,
         sequence=0,
-        coordination_id=coordination_id,
+        coordination_id=session_coordination_id(resp, coordination_id),
     )
     # Registered as well as set: the ContextVar covers frameworks that dispatch
     # tools on the calling context, and the registry covers those that do not.

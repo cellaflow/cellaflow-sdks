@@ -21,14 +21,28 @@ class CellaflowClient:
         self.stub = service_pb2_grpc.WorkflowEngineServiceStub(self.channel)
 
     def start_session(
-        self, workflow_id: str, version: str, session_id: Optional[str] = None
+        self,
+        workflow_id: str,
+        version: str,
+        session_id: Optional[str] = None,
+        coordination_id: Optional[str] = None,
     ) -> service_pb2.StartSessionResponse:
+        """Starts or resumes a session.
+
+        `coordination_id` is the session's default coordination domain. The
+        engine stores it with the session, and every step that does not name its
+        own is recorded under it. Resuming with a different value is refused
+        with `FAILED_PRECONDITION`; omitting it on resume is allowed, and the
+        stored value comes back on the response.
+        """
         req = service_pb2.StartSessionRequest(
             workflow_id=workflow_id,
             version=version,
         )
         if session_id:
             req.session_id = session_id
+        if coordination_id:
+            req.coordination_id = coordination_id
 
         return cast(service_pb2.StartSessionResponse, self.stub.StartSession(req))
 
@@ -41,7 +55,13 @@ class CellaflowClient:
         output_payload: Dict[str, Any],
         idempotency_key: Optional[str] = None,
         idempotency_fencing_token: Optional[int] = None,
+        coordination_id: Optional[str] = None,
     ) -> service_pb2.CommitStepResponse:
+        """Commits a step.
+
+        `coordination_id` records the step under its own coordination domain.
+        When omitted, the engine records it under the session's default.
+        """
         # Strictly serialize dict to MessagePack
         serialized_state = serialize(output_payload)
 
@@ -51,6 +71,8 @@ class CellaflowClient:
             status=status,
             output_payload=serialized_state,
         )
+        if coordination_id:
+            step_result.coordination_id = coordination_id
 
         req = service_pb2.CommitStepRequest(
             session_id=session_id,
@@ -93,6 +115,11 @@ class CellaflowClient:
                     "idempotency_key": (
                         step.idempotency_key
                         if step.HasField("idempotency_key")
+                        else None
+                    ),
+                    "coordination_id": (
+                        step.coordination_id
+                        if step.HasField("coordination_id")
                         else None
                     ),
                 }

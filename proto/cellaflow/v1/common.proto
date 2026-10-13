@@ -38,6 +38,20 @@ message StepResult {
   // The sequence number of the originating TimerScheduled event.
   // Used when status is STEP_STATUS_TIMER_FIRED to explicitly pair events.
   optional uint64 source_sequence = 7;
+
+  // The coordination domain this step belongs to.
+  //
+  // When omitted, the engine fills in the session's default from
+  // `StartSessionRequest.coordination_id` before the step is stored, so every
+  // stored step carries the domain it was actually executed under. Setting it
+  // overrides the default for this step only.
+  //
+  // Carried as its own field rather than read out of `idempotency_key`, which
+  // the engine treats as opaque. Empty is treated as absent. Must not have
+  // leading or trailing whitespace, must not contain colons and must not exceed
+  // 256 bytes. A TimerFired event the engine writes takes the domain of the
+  // step that scheduled the timer.
+  optional string coordination_id = 8;
 }
 
 message WorkflowDefinition {

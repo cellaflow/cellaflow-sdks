@@ -6,6 +6,7 @@ import contextvars
 import threading
 
 from cellaflow.client import CellaflowClient
+from cellaflow.v1 import service_pb2
 
 
 @dataclass
@@ -19,8 +20,10 @@ class WorkflowContext:
     # verify it is returning *this* step's result and not whatever happens to sit
     # at the same index.
     replayed_steps: Dict[int, Dict[str, Any]] = field(default_factory=dict)
-    # Names the work several agents are collaborating on -- a ticket, a
-    # task, a tenant. Only SCOPE_SHARED reads it, and that scope requires it.
+    # The session's default coordination domain: the ticket, task or tenant
+    # several agents are collaborating on, as the engine stored it. Steps that
+    # do not name their own are recorded under it, and SCOPE_SHARED derives its
+    # keys from it.
     coordination_id: Optional[str] = None
     # The session position the engine last reported, held from a cache hit
     # until the next step consumes it. See `reconcile_sequence`.
@@ -84,6 +87,21 @@ class WorkflowContext:
             yield self
         finally:
             reset_context(token)
+
+
+def session_coordination_id(
+    resp: service_pb2.StartSessionResponse, requested: Optional[str]
+) -> Optional[str]:
+    """The coordination domain a started or resumed session works under.
+
+    The engine returns the value stored with the session, which is what lets a
+    resumed agent that did not pass one adopt it and keep deriving the same
+    shared keys as its peers. An engine that does not return the field keeps
+    the requested value.
+    """
+    if resp.HasField("coordination_id"):
+        return resp.coordination_id
+    return requested
 
 
 _current_context: contextvars.ContextVar[WorkflowContext] = contextvars.ContextVar(
