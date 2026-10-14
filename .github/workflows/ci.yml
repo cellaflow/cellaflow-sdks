@@ -45,13 +45,21 @@ jobs:
 
       - name: Run Tests with Coverage
         working-directory: ./python
+        # pytest is piped through tee, and a step with no `shell:` runs `bash -e`
+        # without pipefail, so the step would report tee's status rather than
+        # pytest's and a failing suite would pass. pipefail makes the pipe carry
+        # pytest's status; it is captured rather than exited on, so the summary is
+        # still written, and the step exits with it at the end.
         run: |
+          set -o pipefail
           mkdir -p ../badges
-          pytest --cov=cellaflow --cov-report=term --cov-report=xml:../badges/coverage.xml | tee pytest_output.txt
+          status=0
+          pytest --cov=cellaflow --cov-report=term --cov-report=xml:../badges/coverage.xml | tee pytest_output.txt || status=$?
           echo "### 📊 Python SDK Test & Coverage Summary" >> $GITHUB_STEP_SUMMARY
           echo '```text' >> $GITHUB_STEP_SUMMARY
           grep -A 30 "coverage: platform" pytest_output.txt >> $GITHUB_STEP_SUMMARY || cat pytest_output.txt >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+          exit $status
 
       - name: Generate Coverage Badge
         working-directory: ./python
