@@ -63,17 +63,25 @@ export class CellaflowClient {
    * @param sessionId - Optional client-proposed session ID. When provided, the
    *   engine performs a transactional check-and-insert to prevent concurrent
    *   race conditions. Omit to let the engine assign one.
+   * @param coordinationId - Optional default coordination id for the session.
+   *   The engine stores it and records every step under it unless the step
+   *   names its own. On resume, omitting it adopts the stored one, which the
+   *   response returns; naming a different one is refused.
    */
   async startSession(
     workflowId: string,
     version: string,
-    sessionId?: string
+    sessionId?: string,
+    coordinationId?: string
   ): Promise<StartSessionResponse> {
     const req: PartialMessage<StartSessionRequest> = { workflowId, version };
-    // Only set sessionId when truthy — matches Python's `if session_id:` guard.
+    // Only set sessionId when truthy, matching Python's `if session_id:` guard.
     // Sending an empty string may trigger the engine's custom-ID validation path.
     if (sessionId) {
       req.sessionId = sessionId;
+    }
+    if (coordinationId) {
+      req.coordinationId = coordinationId;
     }
     return await this.client.startSession(req);
   }
@@ -88,6 +96,8 @@ export class CellaflowClient {
    * @param outputPayload - Arbitrary step output. Serialized as MessagePack.
    * @param idempotencyKey - Optional idempotency lease key.
    * @param idempotencyFencingToken - Required when `idempotencyKey` is set.
+   * @param coordinationId - Optional coordination id for this step alone.
+   *   Omitted, the engine records the step under the session's default.
    */
   async commitStep(
     sessionId: string,
@@ -96,7 +106,8 @@ export class CellaflowClient {
     status: StepStatus,
     outputPayload: Record<string, any>,
     idempotencyKey?: string,
-    idempotencyFencingToken?: number
+    idempotencyFencingToken?: number,
+    coordinationId?: string
   ): Promise<CommitStepResponse> {
     // Strictly serialize object to MessagePack
     const serializedState = serialize(outputPayload);
@@ -110,6 +121,9 @@ export class CellaflowClient {
         outputPayload: Buffer.from(serializedState) as unknown as Uint8Array<ArrayBuffer>,
       },
     };
+    if (coordinationId) {
+      req.stepResult!.coordinationId = coordinationId;
+    }
 
     if (idempotencyKey !== undefined) {
       req.idempotencyKey = idempotencyKey;
@@ -155,6 +169,9 @@ export class CellaflowClient {
       outputPayload:
         step.outputPayload.length > 0 ? deserialize(step.outputPayload) : {},
       idempotencyKey: step.idempotencyKey,
+      // The coordination id the engine recorded the step under, or undefined
+      // when it has none.
+      coordinationId: step.coordinationId,
     }));
 
     const nextCursor = resp.nextCursor ? resp.nextCursor : undefined;

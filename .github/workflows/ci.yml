@@ -70,3 +70,33 @@ jobs:
             git commit -m "ci: update coverage badge [skip ci]"
             git push
           fi
+
+  typescript-ci:
+    name: TypeScript SDK Tests
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # The lowest Node the package supports (engines: >=18), and the version the
+      # publish job builds with.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18.x"
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./typescript
+        run: npm ci
+
+      # Builds with tsc, which is also the type check, then runs the tests under
+      # tests/*.test.mjs. Those need no engine; tests/smoke.mjs does and is not run.
+      - name: Build and test
+        working-directory: ./typescript
+        run: npm test
