@@ -32,6 +32,8 @@ All notable changes to the CellaFlow TypeScript SDK.
 
 ### Compatibility
 
+- **Breaking:** a `coordinationId` containing a colon, with leading or trailing whitespace, over
+  256 bytes, or not a string was accepted before and now throws.
 - Against an engine without the field, the requested coordination id is kept and keys are derived
   exactly as before.
 
