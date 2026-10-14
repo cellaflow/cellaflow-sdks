@@ -2,6 +2,39 @@
 
 All notable changes to the CellaFlow TypeScript SDK.
 
+## Unreleased
+
+### Added & Changed
+
+- **The coordination id is sent to the engine and recorded on every step.**
+  `coordinationId` on `durableTools` is now sent when the session starts. The engine stores it
+  as the session's default and records every step under it. A later block for the same thread
+  that omits it adopts the stored value, so `SHARED` tools keep deriving the same keys; naming a
+  different one is refused by the engine before the callback runs.
+- **A call can run under a different coordination id.** A leased tool has
+  `withCoordinationId(id)`, which runs one call under `id`:
+
+  ```typescript
+  await refund.withCoordinationId("customer-88")({ customer: "customer-88", cents: 2500 });
+  ```
+
+  That call is recorded under `id`, and its `SHARED` key is derived from `id`. The key format is
+  unchanged; its coordination input is now the call's id if given, otherwise the session's.
+- **Coordination ids are validated.** A coordination id may not contain colons, may not have
+  leading or trailing whitespace, may not exceed 256 bytes, and must be a string. An empty string
+  means none. Invalid values throw before the session starts or, for a single call, before it
+  takes a sequence number or a lease. Values are never trimmed. `normalizeCoordinationId` and
+  `MAX_COORDINATION_ID_BYTES` are exported.
+- `CellaflowClient.startSession` and `commitStep` take an optional `coordinationId`, and
+  `getGraph` returns each step's `coordinationId`. `sessionCoordinationId` and the `LeasedTool`
+  type are exported.
+- `npm test` builds the package and runs the tests under `tests/*.test.mjs`, which need no engine.
+
+### Compatibility
+
+- Against an engine without the field, the requested coordination id is kept and keys are derived
+  exactly as before.
+
 ## 0.7.1
 
 ### Added
