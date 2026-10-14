@@ -38,8 +38,13 @@ function fakeClient() {
   };
 }
 
-function sessionUnder(coordinationId, client = fakeClient()) {
-  const ctx = new WorkflowContext({ client, sessionId: "s-1", workflowVersion: "1.0.0", coordinationId });
+/**
+ * A context like the one durableTools builds after the engine starts a session.
+ * The session id and version only reach keys outside SHARED scope, but tests that
+ * claim different sessions converge pass different ones.
+ */
+function sessionUnder(coordinationId, { sessionId = "s-1", workflowVersion = "1.0.0", client = fakeClient() } = {}) {
+  const ctx = new WorkflowContext({ client, sessionId, workflowVersion, coordinationId });
   return { ctx, client };
 }
 
@@ -78,13 +83,14 @@ test("a call can override the coordination id", async () => {
 
 test("an override converges with a session whose default is that id", async () => {
   // One agent works a ticket and refunds the customer under the customer's id;
-  // another works for the customer directly. They disagree on the amount, which
-  // sharedOn leaves out of the key.
-  const ticket = sessionUnder("ticket-4417");
+  // another works for the customer directly. They are different sessions on
+  // different workflow versions, and they disagree on the amount, which sharedOn
+  // leaves out of the key. None of that may split the key.
+  const ticket = sessionUnder("ticket-4417", { sessionId: "s-ticket", workflowVersion: "1.0.0" });
   await runWithContext(ticket.ctx, () =>
     refund.withCoordinationId("customer-88")({ customer: "customer-88", cents: 10 }),
   );
-  const customer = sessionUnder("customer-88");
+  const customer = sessionUnder("customer-88", { sessionId: "s-customer", workflowVersion: "2.3.0" });
   await runWithContext(customer.ctx, () => refund({ customer: "customer-88", cents: 25 }));
 
   assert.equal(ticket.client.calls.keys[0], customer.client.calls.keys[0]);
