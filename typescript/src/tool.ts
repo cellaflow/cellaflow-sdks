@@ -1,7 +1,7 @@
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { getContext } from "./context.js";
-import { IdempotencyScope, deriveIdempotencyKey } from "./idempotency.js";
+import { IdempotencyScope, deriveIdempotencyKey, normalizeCoordinationId } from "./idempotency.js";
 import { LeaseHeartbeat } from "./lease.js";
 import { deserialize } from "./serialization.js";
 
@@ -41,6 +41,28 @@ export interface ToolOptions {
   sharedOn?: readonly string[];
 }
 
+/**
+ * A leased tool: call it like the function it wraps.
+ *
+ * `withCoordinationId(id)` returns the same tool for one call made under `id`
+ * instead of the session's coordination id. That call is recorded under `id`,
+ * and under {@link IdempotencyScope.SHARED} its key is derived from `id`, so it
+ * deduplicates with every agent whose session default is `id`.
+ *
+ * ```ts
+ * // An agent working ticket-4417 refunds the customer under the customer's id,
+ * // so it converges with any agent working directly for that customer.
+ * await refund.withCoordinationId(customerId)({ customerId, cents: 2500 });
+ * ```
+ *
+ * The id is checked when `withCoordinationId` is called, so an invalid one throws
+ * before the call takes a sequence number or a lease. An empty string means none:
+ * the call uses the session's coordination id.
+ */
+export type LeasedTool<A extends unknown[], R> = ((...args: A) => Promise<R>) & {
+  withCoordinationId(coordinationId: string): (...args: A) => Promise<R>;
+};
+
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
@@ -67,7 +89,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 export function tool<A extends unknown[], R>(
   fn: (...args: A) => R | Promise<R>,
   options: ToolOptions = {},
-): (...args: A) => Promise<R> {
+): LeasedTool<A, R> {
   const {
     idempotencyKey,
     agentId = "default",
@@ -97,8 +119,16 @@ export function tool<A extends unknown[], R>(
     );
   }
 
-  return async function leasedTool(...args: A): Promise<R> {
+  /**
+   * Runs one call. `callCoordination` is this call's own coordination id, already
+   * validated, or undefined to use the session's.
+   */
+  async function run(args: A, callCoordination: string | undefined): Promise<R> {
     const ctx = getContext();
+    // The id the call is recorded and, under SHARED, deduplicated under. The two
+    // must be the same: keying on the session's id while recording the override
+    // would deduplicate the call in one domain and record it in another.
+    const coordinationId = callCoordination ?? ctx.coordinationId;
 
     // A cache hit may have left this counter ahead of the engine's. Adopt the
     // position it reported before claiming the next sequence, or this commit
@@ -128,7 +158,7 @@ export function tool<A extends unknown[], R>(
         agentId,
         toolName,
         scope,
-        coordinationId: ctx.coordinationId,
+        coordinationId,
         args: sharedOn !== undefined ? [] : args,
         kwargs,
         sharedOn,
@@ -212,6 +242,9 @@ export function tool<A extends unknown[], R>(
         { result },
         ikey,
         fencingToken,
+        // Only the override is sent. Without one the engine records the step
+        // under the session's default, which it already holds.
+        callCoordination,
       );
       return result;
     } catch (err) {
@@ -227,7 +260,14 @@ export function tool<A extends unknown[], R>(
     } finally {
       await hb?.stop();
     }
+  }
+
+  const leased = (async (...args: A): Promise<R> => run(args, undefined)) as LeasedTool<A, R>;
+  leased.withCoordinationId = (coordinationId: string) => {
+    const callCoordination = normalizeCoordinationId(coordinationId);
+    return (...args: A) => run(args, callCoordination);
   };
+  return leased;
 }
 
 /** `step` and `tool` are the same mechanism, kept distinct for readability. */

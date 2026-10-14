@@ -7,11 +7,17 @@ export * from "./cellaflow/v1/idempotency_pb.js";
 // of the public SDK surface.
 
 // High-level API
-export { IdempotencyScope, deriveIdempotencyKey, hashInputs } from "./idempotency.js";
+export {
+  IdempotencyScope,
+  deriveIdempotencyKey,
+  hashInputs,
+  normalizeCoordinationId,
+  MAX_COORDINATION_ID_BYTES,
+} from "./idempotency.js";
 export type { DeriveKeyOptions } from "./idempotency.js";
 export { tool, step, DivergentStepError } from "./tool.js";
-export type { ToolOptions } from "./tool.js";
-export { durableTools, toolSessionId } from "./durable.js";
+export type { ToolOptions, LeasedTool } from "./tool.js";
+export { durableTools, toolSessionId, sessionCoordinationId } from "./durable.js";
 export type { DurableToolsOptions, DurableSession, ThreadRef } from "./durable.js";
 export {
   executionLease,

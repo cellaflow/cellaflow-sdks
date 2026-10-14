@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
 import { CellaflowClient } from "./client.js";
+import type { StartSessionResponse } from "./cellaflow/v1/service_pb.js";
 import {
   WorkflowContext,
   deregisterSession,
   registerSession,
   runWithContext,
 } from "./context.js";
+import { normalizeCoordinationId } from "./idempotency.js";
 
 /**
  * Appended to a caller's thread id to derive the tool session, keeping it
@@ -75,9 +77,29 @@ export interface DurableToolsOptions {
   secure?: boolean;
   /**
    * Names the work several agents are collaborating on: a ticket, a task, a
-   * tenant. Required by {@link IdempotencyScope.SHARED} and ignored otherwise.
+   * tenant. Sent to the engine, which stores it as the session's default and
+   * records every step under it. Required by {@link IdempotencyScope.SHARED}.
+   *
+   * A later block for the same thread may omit it and adopts the stored one.
+   * Naming a different one is refused by the engine, because a session's shared
+   * keys would otherwise change underneath it.
    */
   coordinationId?: string;
+}
+
+/**
+ * The coordination id a started session runs under.
+ *
+ * The engine returns the stored default, which is what lets a resumed session
+ * that did not name one keep deriving the same shared keys. An engine that
+ * predates the field returns nothing, and the requested value is kept, exactly
+ * as before the engine recorded it.
+ */
+export function sessionCoordinationId(
+  resp: Pick<StartSessionResponse, "coordinationId">,
+  requested: string | undefined,
+): string | undefined {
+  return resp.coordinationId !== undefined ? resp.coordinationId : requested;
 }
 
 /** The open session, for binding a tool the framework dispatched off-context. */
@@ -141,21 +163,25 @@ export async function durableTools<T>(
     version = "1.0.0",
     target = "localhost:50051",
     secure = false,
-    coordinationId,
   } = options;
+  // Checked before anything is opened, so an invalid id fails here rather than
+  // at the engine.
+  const coordinationId = normalizeCoordinationId(options.coordinationId);
 
   const threadId = threadIdFrom(config);
   const sessionId = toolSessionId(threadId);
 
   const client = new CellaflowClient({ target, secure });
-  const resp = await client.startSession(workflowId, version, sessionId);
+  // A resume naming a different coordination id than the stored one is refused
+  // here, before the callback runs.
+  const resp = await client.startSession(workflowId, version, sessionId, coordinationId);
 
   const ctx = new WorkflowContext({
     client,
     sessionId: resp.sessionId,
     workflowVersion: resp.version,
     sequence: 0,
-    coordinationId,
+    coordinationId: sessionCoordinationId(resp, coordinationId),
   });
 
   const session: DurableSession = {

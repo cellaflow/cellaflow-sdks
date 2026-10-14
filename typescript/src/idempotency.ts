@@ -24,6 +24,48 @@ export enum IdempotencyScope {
   SHARED = 4,
 }
 
+/** The longest coordination id the engine accepts, in UTF-8 bytes. */
+export const MAX_COORDINATION_ID_BYTES = 256;
+
+/**
+ * Applies the engine's rules for a coordination id, returning it unchanged.
+ *
+ * `undefined`, `null` and the empty string mean none and return `undefined`. A
+ * value that is not a string throws `TypeError`. Leading or trailing whitespace,
+ * colons, and values over 256 UTF-8 bytes throw `Error`.
+ *
+ * The value is never trimmed or otherwise cleaned up. It is hashed into
+ * {@link IdempotencyScope.SHARED} keys exactly as given, so a cleaned-up copy
+ * would record the work under one id while deduplicating it under another.
+ *
+ * The engine applies the same rules, but a call's own coordination id only
+ * reaches it with the commit, after the tool has run. Checking here means an
+ * invalid value fails before the side effect rather than after it.
+ */
+export function normalizeCoordinationId(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") {
+    throw new TypeError(
+      `coordinationId must be a string, got ${typeof value}; pass String(...) of it ` +
+        "to use it as one.",
+    );
+  }
+  if (value === "") return undefined;
+  if (value.trim() !== value) {
+    throw new Error(
+      `coordinationId ${JSON.stringify(value)} cannot be blank or have leading or ` +
+        "trailing whitespace.",
+    );
+  }
+  if (value.includes(":")) {
+    throw new Error(`coordinationId ${JSON.stringify(value)} cannot contain colons (:).`);
+  }
+  if (Buffer.byteLength(value, "utf8") > MAX_COORDINATION_ID_BYTES) {
+    throw new Error(`coordinationId exceeds ${MAX_COORDINATION_ID_BYTES} bytes.`);
+  }
+  return value;
+}
+
 /**
  * Hashes inputs with RFC 8785 Canonical JSON and SHA-256, returning the first
  * 16 bytes hex-encoded.
@@ -112,9 +154,10 @@ export function deriveIdempotencyKey(opts: DeriveKeyOptions): string {
       throw new Error(
         "IdempotencyScope.SHARED requires a coordinationId naming the work being " +
           "shared: a ticket, task, or tenant id. Pass it when opening the session, " +
-          'e.g. durableTools(config, { coordinationId: "ticket-4417" }, fn). It has ' +
-          "no default: a shared one would deduplicate unrelated callers that happen " +
-          "to make the same call.",
+          'e.g. durableTools(config, { coordinationId: "ticket-4417" }, fn), or for ' +
+          'one call, e.g. refund.withCoordinationId("customer-88")(...). It has no ' +
+          "default: a shared one would deduplicate unrelated callers that happen to " +
+          "make the same call.",
       );
     }
     return `shared:${coordinationId}:${toolName}:${inputsHash}`;
