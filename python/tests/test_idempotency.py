@@ -86,7 +86,7 @@ def test_derive_idempotency_key_dict_ordering() -> None:
 
 
 def test_shared_scope_omits_session_so_sessions_converge() -> None:
-    """CEL-99: the whole point -- different sessions, one key."""
+    """The whole point of SCOPE_SHARED: different sessions, one key."""
     keys = {
         derive_idempotency_key(
             f"session-{i}",

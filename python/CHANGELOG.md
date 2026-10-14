@@ -2,7 +2,7 @@
 
 All notable changes to the CellaFlow Python SDK.
 
-## Unreleased
+## 0.8.0
 
 ### Added & Changed
 
@@ -39,11 +39,16 @@ All notable changes to the CellaFlow Python SDK.
 Engines that do not support the field ignore it. Keys are derived exactly as before against them,
 from the value the caller passed.
 
+### Packaging
+
+- The published package includes the license text, and its homepage and project links point to
+  cellaflow.com.
+
 ## 0.7.0
 
 ### Added & Changed
 
-- **Distributed Execution Lease Primitive (`CEL-157`)**:
+- **Distributed Execution Lease Primitive**:
   Added native Python SDK support for the `task_execution_lease` primitive, which acts as a distributed lock with liveness heartbeating.
   - Added synchronous `execution_lease` and asynchronous `async_execution_lease` context managers.
   - Added a first-class `@task_lease` decorator for wrapping execution entry points.
@@ -75,7 +80,7 @@ from the value the caller passed.
 
 ### Fixed
 
-- **Protobuf runtime mismatch & toolchain pinning (`CEL-148`)**:
+- **Protobuf runtime mismatch & toolchain pinning**:
   Fixed an issue where `cellaflow==0.5.0` declared `protobuf>=4.25.0` while its generated gRPC stubs asserted a runtime of at least `7.35.1` at import, causing resolver confusion and immediate runtime crashes on `import cellaflow`.
   - Pinned development tools to `grpcio-tools==1.71.0` (emitting gencode `5.29.0`) and `mypy-protobuf==3.6.0` (avoiding bundled protobuf 6.x gencode guards).
   - Aligned the declared runtime floor in `pyproject.toml` to `protobuf>=5.29.0`.
@@ -92,7 +97,7 @@ from the value the caller passed.
 
 ### Added
 
-- **`shared_on` for cross-session convergence (`CEL-145`)**:
+- **`shared_on` for cross-session convergence**:
   When heterogeneous agents across different sessions or workflows converge on a shared side effect (such as issuing a refund for a customer ticket), they frequently reason their way to different secondary arguments (e.g. diverging refund amounts, notes, or metadata). Previously, `SCOPE_SHARED` hashed all arguments into the idempotency key, causing each agent to derive a distinct key and execute duplicate side effects.
 
   The `@tool` and `@step` decorators now accept `shared_on: Optional[Sequence[str]] = None`. When specified, only the named arguments contribute to the derived idempotency key:
