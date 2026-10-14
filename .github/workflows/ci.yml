@@ -50,11 +50,13 @@ jobs:
         # pytest's and a failing suite would pass. pipefail makes the pipe carry
         # pytest's status; it is captured rather than exited on, so the summary is
         # still written, and the step exits with it at the end.
+        #
+        # --cov-fail-under: coverage of the Python package must not drop below 90%.
         run: |
           set -o pipefail
           mkdir -p ../badges
           status=0
-          pytest --cov=cellaflow --cov-report=term --cov-report=xml:../badges/coverage.xml | tee pytest_output.txt || status=$?
+          pytest --cov=cellaflow --cov-fail-under=90 --cov-report=term --cov-report=xml:../badges/coverage.xml | tee pytest_output.txt || status=$?
           echo "### 📊 Python SDK Test & Coverage Summary" >> $GITHUB_STEP_SUMMARY
           echo '```text' >> $GITHUB_STEP_SUMMARY
           grep -A 30 "coverage: platform" pytest_output.txt >> $GITHUB_STEP_SUMMARY || cat pytest_output.txt >> $GITHUB_STEP_SUMMARY
