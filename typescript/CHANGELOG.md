@@ -2,7 +2,7 @@
 
 All notable changes to the CellaFlow TypeScript SDK.
 
-## Unreleased
+## 0.8.0
 
 ### Added & Changed
 
@@ -36,6 +36,11 @@ All notable changes to the CellaFlow TypeScript SDK.
   256 bytes, or not a string was accepted before and now throws.
 - Against an engine without the field, the requested coordination id is kept and keys are derived
   exactly as before.
+
+### Packaging
+
+- The published package includes the license text, and its homepage and project links point to
+  cellaflow.com.
 
 ## 0.7.1
 

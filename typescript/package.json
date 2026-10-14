@@ -1,6 +1,6 @@
 {
   "name": "@cellaflow/sdk",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "TypeScript/Node.js SDK for Cellaflow: at-most-once tool calls and durable replay for AI agents",
   "type": "module",
   "main": "dist/index.js",

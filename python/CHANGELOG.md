@@ -2,7 +2,7 @@
 
 All notable changes to the CellaFlow Python SDK.
 
-## Unreleased
+## 0.8.0
 
 ### Added & Changed
 
@@ -38,6 +38,11 @@ All notable changes to the CellaFlow Python SDK.
 
 Engines that do not support the field ignore it. Keys are derived exactly as before against them,
 from the value the caller passed.
+
+### Packaging
+
+- The published package includes the license text, and its homepage and project links point to
+  cellaflow.com.
 
 ## 0.7.0
 
