@@ -581,7 +581,7 @@ def _two_step_workflow() -> Any:
 def test_adopts_engine_sequence_after_cross_session_hit(
     mock_stub: MagicMock, mock_client: None
 ) -> None:
-    """CEL-98: a hit satisfied from another session must not desync the counter.
+    """A hit satisfied from another session must not desync the counter.
 
     The hit returns without committing, so this session's engine-side sequence is
     still 0. Without adopting the reported position the next step would ask for 2
@@ -611,7 +611,7 @@ def test_adopts_engine_sequence_after_cross_session_hit(
 def test_preserves_sequence_after_same_session_hit(
     mock_stub: MagicMock, mock_client: None
 ) -> None:
-    """CEL-98 must not break the case that already worked.
+    """Adopting the engine's position must not break the same-session case.
 
     A peer in the *same* session committed at 1, so the engine did advance and
     the next step legitimately targets 2.
@@ -688,7 +688,7 @@ def test_no_reconciliation_when_workflow_ends_on_a_hit(
 def test_consecutive_cache_hits_reconcile_correctly(
     mock_stub: MagicMock, mock_client: None
 ) -> None:
-    """CEL-98 acceptance criterion: correct when several hits occur in a row.
+    """Adopting the engine's position stays correct over several hits in a row.
 
     Each hit re-reports the same position because the engine has not advanced,
     so the counter must not creep forward once per hit.
@@ -857,10 +857,10 @@ def _recovered_session(mock_stub: MagicMock, session_id: str, names: List[str]) 
 def test_replay_rejects_a_different_step_at_the_same_sequence(
     mock_stub: MagicMock, mock_client: None
 ) -> None:
-    """CEL-102: a resumed run that skips a branch must fail loudly.
+    """A resumed run that skips a branch must fail loudly.
 
-    Before this check it silently received the *previous* step's result — warmup's
-    output returned for shared — and carried on computing with foreign data.
+    Without this check it would receive the *previous* step's result (warmup's
+    output returned for shared) and carry on computing with foreign data.
     """
     from cellaflow import NondeterministicWorkflowError
 
@@ -953,10 +953,9 @@ def test_replay_refuses_history_it_cannot_verify(
 ) -> None:
     """A record with no name is unverifiable, so replay must refuse it.
 
-    An earlier version replayed positionally here, justified as tolerating
-    history from before names were retained. No such history exists — every
-    writer sets a name — so the exemption protected nothing while silently
-    restoring the exact positional replay CEL-102 exists to prevent.
+    Every writer sets a name, so a nameless record cannot come from this SDK.
+    Replaying it by position would hand back whatever happens to sit there,
+    which is exactly what checking the name on replay exists to prevent.
     """
     from cellaflow import NondeterministicWorkflowError
 
@@ -1009,7 +1008,7 @@ def _refusal(details: str) -> Exception:
 def test_step_sends_its_intended_sequence(
     mock_stub: MagicMock, mock_client: None
 ) -> None:
-    """CEL-103: the engine cannot guard a position it was not told about."""
+    """The engine cannot guard a position it was not told about."""
     mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
         session_id="s", version="1.0.0", is_recovered=False
     )
@@ -1042,7 +1041,7 @@ def test_step_sends_its_intended_sequence(
 def test_refused_lease_raises_divergent_step_error(
     mock_stub: MagicMock, mock_client: None
 ) -> None:
-    """CEL-103: a refusal must name the step, not surface as a raw RpcError.
+    """A refusal must name the step, not surface as a raw RpcError.
 
     The refusal arrives *before* the tool body runs -- that is the whole point --
     so the test also asserts the body never executed.

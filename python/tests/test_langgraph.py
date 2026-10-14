@@ -47,9 +47,9 @@ def _FailedPrecondition(details: str) -> _RpcFailure:
 class MockCellaflowClient:
     """In-memory mock of CellaflowClient mimicking engine gRPC behavior.
 
-    Two behaviours here are load-bearing and were absent originally, which is
-    why CEL-108 shipped: this double was *more capable* than the engine, so the
-    suite passed against limits the real backend enforces.
+    Two behaviours here are load-bearing: without them this double would be
+    *more capable* than the engine, and the suite would pass against limits the
+    real backend enforces.
 
     - ``get_graph`` pages. The engine returns at most ``limit`` events (default
       100, capped at 1000), oldest first, plus a cursor for the rest.
@@ -501,9 +501,9 @@ def test_get_tuple_empty_or_error() -> None:
     res_missing = saver.get_tuple(non_existent_config)
     assert res_missing is None
 
-    # A read that fails is NOT an empty thread. This previously asserted None,
-    # which is what made a transport failure look like a thread with no history
-    # and start the run over. See CEL-109.
+    # A read that fails is NOT an empty thread. Returning None would make a
+    # transport failure look like a thread with no history and start the run
+    # over.
     mock_failing_client = MagicMock()
     mock_failing_client.get_graph.side_effect = RuntimeError("gRPC connection error")
     failing_saver = CellaflowSaver(client=cast(CellaflowClient, mock_failing_client))
@@ -566,10 +566,9 @@ def test_recovery_from_existing_graph_and_exception_handling() -> None:
     assert res["configurable"]["checkpoint_id"] == "cp-6"
     assert new_saver._next_sequence["pre-existing-thread"] == 7
 
-    # A failed read during sequence initialisation must not resolve to 1.
-    # This previously asserted seq == 1, which meant an unreadable engine
-    # produced a confident guess at a position that is taken on any thread with
-    # history. See CEL-109.
+    # A failed read during sequence initialisation must not resolve to 1. That
+    # would turn an unreadable engine into a confident guess at a position that
+    # is taken on any thread with history.
     err_client = MagicMock()
     err_client.get_graph.side_effect = RuntimeError("network down")
     err_client.start_session.side_effect = RuntimeError("session start failed")
@@ -739,7 +738,7 @@ def test_import_without_langgraph_dependency() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CEL-108: a thread longer than one page of engine history
+# A thread longer than one page of engine history
 # ---------------------------------------------------------------------------
 #
 # The engine returns at most 100 events per GetGraph, oldest first, with a
@@ -827,7 +826,7 @@ def test_a_new_saver_can_write_to_a_long_thread() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CEL-109: an engine that cannot be read is not an empty thread
+# An engine that cannot be read is not an empty thread
 # ---------------------------------------------------------------------------
 #
 # `get_tuple` returning None tells LangGraph to start the run from the

@@ -185,8 +185,8 @@ def durable_tools(
     # tool body never runs. Deduplication comes from the idempotency cache, which
     # is position-independent, instead of from a counter that cannot stay aligned.
     #
-    # A hit also arbitrates no graph position (the engine's `Hit` arm returns
-    # untouched, CEL-92) and reports `current_sequence`, which
+    # A hit also arbitrates no graph position (the engine returns a hit without
+    # claiming one) and reports `current_sequence`, which
     # `reconcile_sequence` adopts before the next step -- so the counter
     # re-converges on the engine's view rather than drifting.
     ctx = WorkflowContext(

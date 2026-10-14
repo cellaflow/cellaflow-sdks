@@ -217,7 +217,8 @@ class CellaflowSaver(_BaseSaver):
         page, and that is a real answer: it means no history, which is what every
         first run looks like. Every *other* failure means the history could not be
         read, which is a different thing entirely and is allowed to propagate.
-        Collapsing the two is what CEL-109 was.
+        Treating it as no history would start a run with history over from the
+        beginning.
         """
         cursor: Optional[str] = None
         yielded = False
