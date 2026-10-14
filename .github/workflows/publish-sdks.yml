@@ -50,6 +50,9 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: python/dist/
+          # One run publishes both packages, so re-running it after the other one
+          # failed must not fail here on a version PyPI already has.
+          skip-existing: true
 
   publish-typescript:
     name: Build and publish TypeScript SDK to npm
@@ -63,11 +66,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      # Trusted publishing exchanges this job's OIDC token for npm credentials, and
+      # only npm 11.5.1 and later can do that. Node 24.5 and later bundle it; Node 18
+      # and 22 bundle npm 10, which publishes with no credentials at all, and npm
+      # answers that with a misleading 404. The check below fails clearly instead.
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18.x'
+          node-version: '24.x'
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Check npm can use trusted publishing
+        run: |
+          v=$(npm --version)
+          echo "npm $v"
+          if [ "$(printf '%s\n' 11.5.1 "$v" | sort -V | head -1)" != 11.5.1 ]; then
+            echo "::error::npm $v cannot use trusted publishing; it needs 11.5.1 or later."
+            exit 1
+          fi
           
       - name: Install dependencies
         working-directory: ./typescript
