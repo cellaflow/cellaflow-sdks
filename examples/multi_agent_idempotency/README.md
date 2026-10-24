@@ -49,7 +49,7 @@ python run_demo.py --scenario langgraph   # the crash-mid-charge one
   REAL CHARGES ON THE LEDGER: 5
   Customer was billed:        $124.95
 
-  SCENARIO 2 - 5 agents, coordinated through CellaFlow
+  SCENARIO 2 - 5 agents, coordinated through Cellaflow
   agent-1    reused cached charge       rf_190ceb68d56c
   agent-2    reused cached charge       rf_190ceb68d56c
   agent-3    reused cached charge       rf_190ceb68d56c

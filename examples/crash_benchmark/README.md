@@ -1,6 +1,6 @@
 # Your agent charged the customer. Then the pod died.
 
-> **The agent that started the work may not be the agent that finishes it.** CellaFlow
+> **The agent that started the work may not be the agent that finishes it.** Cellaflow
 > makes the work itself durable, giving side effects an identity that survives
 > crashes, retries, agent replacement, and independent agents converging on the same
 > operation.
@@ -50,14 +50,14 @@ to be.
 Every cell comes from a run of `benchmark.py`; *not run* means the harness does not
 exercise that pair, not that it was omitted.
 
-**On `Crash after side effect`, CellaFlow charges exactly as many times as no guard at
+**On `Crash after side effect`, Cellaflow charges exactly as many times as no guard at
 all.** Two charges either way; the customer is out the same money. The charge had
 already left the process, and nothing downstream can unsend it.
 
 What differs is underneath the count. `no-guard` re-runs immediately because it owned
 nothing. `cellaflow` waits out the dead holder's lease and reclaims the work, which is
 measurable: 4.6s against 23.2s for the identical scenario. That buys a durable record
-of what was attempted, not a smaller number in the charges column. That row is not a CellaFlow win and is not
+of what was attempted, not a smaller number in the charges column. That row is not a Cellaflow win and is not
 presented as one. The charge already left the process; nothing downstream can unsend
 it. What differs is only that the attempt is durably recorded, which is the difference
 between a duplicate you can find and a duplicate you cannot.
@@ -87,7 +87,7 @@ something a single agent framework can provide at all, because it has to hold ac
 frameworks, and note it is *identity*, not coordination: the agents never talk to each
 other. What they share is a name for the work.
 
-The interesting claim is not that CellaFlow does any one of these. It is that the five
+The interesting claim is not that Cellaflow does any one of these. It is that the five
 have to hold together, and the failures below are what it looks like when one is
 missing.
 
@@ -147,7 +147,7 @@ Every cell counts **charges for one order**, so **1 is correct everywhere**. The
 `they wait` column is how long the four non-stalled agents took to finish; it
 measures blocking, not correctness.
 
-## What CellaFlow does here
+## What Cellaflow does here
 
 One context manager around the invocation, and `@tool` on the function that moves
 money:
@@ -184,7 +184,7 @@ records that this operation was started, by whom, and with what fencing token,
 before the gateway is touched. A retry that arrives later gets the recorded result
 instead of a second charge.
 
-The lease is a *record in the CellaFlow engine*, not a lock held by your process.
+The lease is a *record in the Cellaflow engine*, not a lock held by your process.
 Three properties come with it:
 
 - **A ceiling.** A holder that stalls without dying is reclaimed rather than blocking
@@ -235,7 +235,7 @@ failures you do not get to schedule.
   A  no-guard    stock PostgresSaver only                    2                2         5       2.3s        5
   B  lock        + pg_advisory_lock                          2                2         5       7.9s        5
   C  claim       + claim-first idempotency key               1     1 deadlocked         1       8.2s        1
-  D  cellaflow   + CellaFlow leased tool                     1      2 recovered         1       8.7s        1
+  D  cellaflow   + Cellaflow leased tool                     1      2 recovered         1       8.7s        1
 ```
 
 ## Reading this table
@@ -254,7 +254,7 @@ recovers the *execution*, and makes the ambiguous attempt durable.
 
 Be precise about what that second one means, because it is easy to overstate.
 **Execution recovery is not business-outcome recovery.** The external system now holds
-two refunds and CellaFlow has not resolved that; it has finished the run and left a
+two refunds and Cellaflow has not resolved that; it has finished the run and left a
 record saying what was attempted and when. The duplicate remains a reconciliation
 problem at the business level. The trade on offer is *a duplicate you can find*
 against *an order that never ships and stays silent until someone notices*, not
@@ -281,7 +281,7 @@ and on those the guards are not equivalent:
   Measured below, and it is the clearest separation in this file.
 
 And a fourth no benchmark can show. Any guard that writes something durable before it
-acts gets the right answer under these four failures, CellaFlow does, and so does a
+acts gets the right answer under these four failures, Cellaflow does, and so does a
 carefully written idempotency key. If a single irreversible call is all you need to
 protect, a few dozen lines against a database you already run will do it.
 
@@ -320,13 +320,13 @@ completing `UPDATE` are all yours to write and yours to get right.
 `pg_advisory_lock` is session-scoped, so the connection is pinned from acquire to
 release, across the work. Ten operations of 3 seconds each, varying the pool:
 
-| pool size | lock-based guard | CellaFlow |
+| pool size | lock-based guard | Cellaflow |
 | ---: | ---: | ---: |
 | 2 | 15.1s | 3.0s |
 | 5 | 6.2s | 3.0s |
 | 20 | 3.3s | 3.0s |
 
-The lock-based guard is `ceil(10 / pool) × 3s`, exactly pool-bound. CellaFlow is
+The lock-based guard is `ceil(10 / pool) × 3s`, exactly pool-bound. Cellaflow is
 flat, because a lease is a record and the SDK multiplexes one gRPC channel. If your
 side effects are slow, that is a concurrency ceiling with nothing to do with your
 database's capacity. `claim` avoids it too: it releases the connection after the claim.
@@ -342,7 +342,7 @@ land.
 Two findings the columns above do not carry, both about a holder that is *slow*
 rather than dead, the case a crash test cannot reach.
 **The others wait.** At an 8-second stall, a lock and a lease behave identically:
-both make the other agents wait the full 8 seconds. CellaFlow's lease ceiling defaults
+both make the other agents wait the full 8 seconds. Cellaflow's lease ceiling defaults
 to one hour, and below the ceiling a lease waits exactly like a lock. That is
 deliberate: reclaiming a merely slow worker trades a starvation bug for a double
 charge, which is the worse trade. The real difference is **bounded versus unbounded**
@@ -350,7 +350,7 @@ waiting, a lock has no ceiling to reach at all. This harness does not lower ours
 manufacture a favourable number.
 
 **And neither can take the work away.** `claim` cannot supersede a slow holder because
-it has no TTL. CellaFlow does not because the holder is still heartbeating. Same
+it has no TTL. Cellaflow does not because the holder is still heartbeating. Same
 outcome, different reason, and the reason decides what happens when a holder *stops*
 rather than slows. `claim` has no way to tell those apart, so it waits forever; the
 engine stops seeing heartbeats and reclaims. That is the separation in *Then the agent
@@ -430,7 +430,7 @@ collision to arbitrate, so every guard lets every agent through and the customer
 refunded once per agent, correctly, by agents each behaving exactly as designed.
 
 Something has to construct the shared identity that separate sessions do not supply.
-That is what this half measures, and it is the case CellaFlow is built for: the
+That is what this half measures, and it is the case Cellaflow is built for: the
 coordination has to come from outside any single agent framework, because no framework
 can make another framework's agents converge on one side effect.
 
@@ -629,7 +629,7 @@ top of its replacement's. Without fencing, the paused worker resumes and commits
 the top; a monotonic token is what makes that refusable.
 
 That is a lease with heartbeating and fencing, which is what `cellaflow` calls. The
-argument for CellaFlow is not that a TTL is unthinkable. It is that a correct TTL is
+argument for Cellaflow is not that a TTL is unthinkable. It is that a correct TTL is
 a lease, and writing one yourself means owning the heartbeat interval, the reclaim
 rule, the token comparison and their failure modes for as long as the code lives.
 
@@ -679,14 +679,14 @@ exclusion at all. Nothing in the output looks wrong.
 start-order race: a fast agent takes the lock, finishes in milliseconds, and the
 staller finds the work already done, measuring nothing.
 
-**Contention shares one `thread_id` across all N workers.** CellaFlow derives its
+**Contention shares one `thread_id` across all N workers.** Cellaflow derives its
 lease session from the thread, so per-worker threads mean nothing contends and the
 harness reports N charges for a race that never happened.
 
 ## Using this in your own agent
 
 `durable_tools` composes with the checkpointer you already run; this benchmark
-keeps stock `PostgresSaver` under every guard, CellaFlow's included. There is no
+keeps stock `PostgresSaver` under every guard, Cellaflow's included. There is no
 migration: wrap the invocation, decorate the call that must not repeat.
 
 ```bash

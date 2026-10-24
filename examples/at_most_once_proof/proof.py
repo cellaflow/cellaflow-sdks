@@ -4,7 +4,7 @@
 Two arms. Identical graph, identical crash, identical Postgres checkpointer.
 The only difference is whether the tool call holds a lease.
 
-    A   plain LangGraph      ordinary function, no CellaFlow
+    A   plain LangGraph      ordinary function, no Cellaflow
     B   the same, leased     @tool inside durable_tools
 
 A two-node booking agent reserves a seat, then charges a card, then the process
@@ -140,7 +140,7 @@ def main() -> int:
     a = b = None
     if args.arm in ("a", "both"):
         a = run_arm(
-            "ARM A  -  PostgresSaver only, no CellaFlow",
+            "ARM A  -  PostgresSaver only, no Cellaflow",
             reserve_seat, charge_card, no_lease,
         )
     if args.arm in ("b", "both"):
@@ -159,7 +159,7 @@ def main() -> int:
     if a is not None:
         print(f"  Arm A   PostgresSaver alone .............. {a} charge(s)")
     if b is not None:
-        print(f"  Arm B   + CellaFlow leased tools ......... {b} charge(s)")
+        print(f"  Arm B   + Cellaflow leased tools ......... {b} charge(s)")
     print("  " + "=" * 58)
 
     if args.arm != "both":

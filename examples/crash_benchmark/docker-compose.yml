@@ -1,4 +1,4 @@
-# Postgres holds the LangGraph checkpoints for every guard. CellaFlow holds the
+# Postgres holds the LangGraph checkpoints for every guard. Cellaflow holds the
 # leases for the cellaflow guard only. Every guard runs against exactly this.
 services:
   postgres:

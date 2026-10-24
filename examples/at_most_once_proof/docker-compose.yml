@@ -1,4 +1,4 @@
-# Postgres holds the LangGraph checkpoints. CellaFlow holds the leases.
+# Postgres holds the LangGraph checkpoints. Cellaflow holds the leases.
 # Both arms of the proof run against exactly this, so the only variable is
 # whether the tool call is leased.
 services:

@@ -123,7 +123,7 @@ def scenario_coordinated(
 ) -> tuple[int, int]:
     """Returns (charges made, charges expected)."""
     print("\n" + "=" * 72)
-    print(f"  SCENARIO 2 - {n_agents} agents, coordinated through CellaFlow")
+    print(f"  SCENARIO 2 - {n_agents} agents, coordinated through Cellaflow")
     print("=" * 72)
     session_id = session_id or f"refund-{TICKET_ID}-{uuid.uuid4().hex[:8]}"
     # Resumed is a property of the engine's state, not of whether the caller
@@ -427,12 +427,12 @@ def main() -> int:
     print("  VERDICT")
     print("=" * 72)
     if naive_charges is not None:
-        print(f"  Without CellaFlow: {naive_charges} charges for 1 refund request")
+        print(f"  Without Cellaflow: {naive_charges} charges for 1 refund request")
     if coordinated_charges is not None:
         noun = "charge" if coordinated_charges == 1 else "charges"
         suffix = " (already refunded before this run)" if expected == 0 else ""
         print(
-            f"  With CellaFlow:    {coordinated_charges} {noun} for 1 refund "
+            f"  With Cellaflow:    {coordinated_charges} {noun} for 1 refund "
             f"request{suffix}"
         )
     if divergent_charges is not None:

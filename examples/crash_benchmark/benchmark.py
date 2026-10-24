@@ -12,7 +12,7 @@ irreversible call inside the node:
     A  no-guard     nothing                          the default
     B  lock         pg_advisory_lock                 mutual exclusion only
     C  claim        claim-first idempotency key      what teams actually build
-    D  cellaflow    CellaFlow leased tool
+    D  cellaflow    Cellaflow leased tool
 
 The letters are a table index. The names are the identity -- select with
 `--guards claim,cellaflow`.
@@ -64,7 +64,7 @@ GUARDS = {
     "no-guard":  ("A", "stock PostgresSaver only", False),
     "lock":      ("B", "+ pg_advisory_lock", False),
     "claim":     ("C", "+ claim-first idempotency key", True),
-    "cellaflow": ("D", "+ CellaFlow leased tool", True),
+    "cellaflow": ("D", "+ Cellaflow leased tool", True),
 }
 GUARD_ORDER = list(GUARDS)
 

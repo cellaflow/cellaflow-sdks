@@ -63,7 +63,7 @@ def run_naive_agent(
 
 
 # ---------------------------------------------------------------------------
-# Variant 2: coordinated through CellaFlow
+# Variant 2: coordinated through Cellaflow
 # ---------------------------------------------------------------------------
 
 

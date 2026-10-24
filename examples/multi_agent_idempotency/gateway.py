@@ -1,7 +1,7 @@
 """A stand-in for a real, irreversible side effect.
 
 The point of this module is that it is deliberately *not* idempotent and knows
-nothing about CellaFlow. Every call to :func:`issue_refund` appends one line to a
+nothing about Cellaflow. Every call to :func:`issue_refund` appends one line to a
 ledger file. Counting the lines afterwards is how the demo proves how many times
 the side effect actually happened -- no trust in log statements required.
 
