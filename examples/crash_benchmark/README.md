@@ -691,7 +691,8 @@ migration: wrap the invocation, decorate the call that must not repeat.
 
 ```bash
 pip install cellaflow
-docker run -p 50051:50051 ghcr.io/cellaflow/cellaflow:latest
+docker run -p 50051:50051 -e CELLAFLOW_ALLOW_UNAUTHENTICATED=true \
+  ghcr.io/cellaflow/cellaflow:latest
 ```
 
 - [Quickstart](https://docs.cellaflow.com/quickstart)

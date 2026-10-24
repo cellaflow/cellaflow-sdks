@@ -22,6 +22,7 @@ Every agent runs as its own OS process, released simultaneously, so they genuine
 ```bash
 docker run -d --name cellaflow-demo \
   -p 50051:50051 -p 9090:9090 \
+  -e CELLAFLOW_ALLOW_UNAUTHENTICATED=true \
   -e CELLAFLOW_DB_PATH=/data/cellaflow \
   -e CELLAFLOW_HOST=:: \
   ghcr.io/cellaflow/cellaflow:latest
