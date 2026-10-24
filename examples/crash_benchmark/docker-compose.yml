@@ -1,4 +1,4 @@
-# Postgres holds the LangGraph checkpoints for every guard. CellaFlow holds the
+# Postgres holds the LangGraph checkpoints for every guard. Cellaflow holds the
 # leases for the cellaflow guard only. Every guard runs against exactly this.
 services:
   postgres:
@@ -16,6 +16,9 @@ services:
   cellaflow:
     image: ghcr.io/cellaflow/cellaflow:latest
     environment:
+      # The engine refuses to start without either an auth token or this
+      # explicit opt-out, so a demo that omits it serves nothing at all.
+      CELLAFLOW_ALLOW_UNAUTHENTICATED: "true"
       CELLAFLOW_HOST: "::"
       CELLAFLOW_DB_PATH: /data/cellaflow
     ports: ["50051:50051", "9090:9090"]

@@ -1,6 +1,6 @@
 """The agent implementations the demo compares.
 
-All of them do the same job: refund one customer exactly once. They differ in how
+All of them do the same job: issue one refund to one customer. They differ in how
 they reach the payment gateway -- not at all, through a shared session, or through
 a shared coordination domain.
 
@@ -63,7 +63,7 @@ def run_naive_agent(
 
 
 # ---------------------------------------------------------------------------
-# Variant 2: coordinated through CellaFlow
+# Variant 2: coordinated through Cellaflow
 # ---------------------------------------------------------------------------
 
 

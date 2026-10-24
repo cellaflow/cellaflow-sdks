@@ -22,6 +22,10 @@ from cellaflow import step, tool, workflow
 
 LEDGER = Path("charges.log")
 
+#: Every other example honours this; this one did not, so it was the one
+#: example that could not be pointed at an engine somewhere else.
+ENGINE = os.environ.get("CELLAFLOW_TARGET", "localhost:50051")
+
 #: Incremented inside the tool body. Stays 0 when the step is replayed, because
 #: a replayed step never enters its body.
 EXECUTED = {"charges": 0}
@@ -57,7 +61,7 @@ def build_receipt(charge: dict, order_id: str) -> dict:
     return {"order_id": order_id, "confirmation": charge["confirmation"]}
 
 
-@workflow(version="1.0.0")
+@workflow(version="1.0.0", target=ENGINE)
 def checkout(order_id: str, die_after_charging: bool = False) -> dict:
     charge = charge_card(order_id, 2499)
 

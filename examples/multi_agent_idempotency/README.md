@@ -15,6 +15,12 @@ Five scenarios, each a different way a charge gets duplicated:
 
 Scenario 5 is the one a checkpointer cannot do: the side effect happens inside a LangGraph node.
 
+None of this is exactly-once, and nothing is. A crash between the charge leaving the
+process and the record of it landing repeats the charge, because the gateway does not
+take part in the arbitration. What a lease decides is at-most-once: whether a *second*
+agent is allowed to reach the gateway at all. `examples/crash_benchmark` measures the
+case that stays open.
+
 Every agent runs as its own OS process, released simultaneously, so they genuinely race.
 
 ## Run it
@@ -22,6 +28,7 @@ Every agent runs as its own OS process, released simultaneously, so they genuine
 ```bash
 docker run -d --name cellaflow-demo \
   -p 50051:50051 -p 9090:9090 \
+  -e CELLAFLOW_ALLOW_UNAUTHENTICATED=true \
   -e CELLAFLOW_DB_PATH=/data/cellaflow \
   -e CELLAFLOW_HOST=:: \
   ghcr.io/cellaflow/cellaflow:latest
@@ -42,7 +49,7 @@ python run_demo.py --scenario langgraph   # the crash-mid-charge one
   REAL CHARGES ON THE LEDGER: 5
   Customer was billed:        $124.95
 
-  SCENARIO 2 - 5 agents, coordinated through CellaFlow
+  SCENARIO 2 - 5 agents, coordinated through Cellaflow
   agent-1    reused cached charge       rf_190ceb68d56c
   agent-2    reused cached charge       rf_190ceb68d56c
   agent-3    reused cached charge       rf_190ceb68d56c

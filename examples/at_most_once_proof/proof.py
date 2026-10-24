@@ -4,7 +4,7 @@
 Two arms. Identical graph, identical crash, identical Postgres checkpointer.
 The only difference is whether the tool call holds a lease.
 
-    A   plain LangGraph      ordinary function, no CellaFlow
+    A   plain LangGraph      ordinary function, no Cellaflow
     B   the same, leased     @tool inside durable_tools
 
 A two-node booking agent reserves a seat, then charges a card, then the process
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import os
 import sys
 import uuid
@@ -139,22 +140,26 @@ def main() -> int:
     a = b = None
     if args.arm in ("a", "both"):
         a = run_arm(
-            "ARM A  -  PostgresSaver only, no CellaFlow",
+            "ARM A  -  PostgresSaver only, no Cellaflow",
             reserve_seat, charge_card, no_lease,
         )
     if args.arm in ("b", "both"):
         leased_reserve = tool(tool_name="reserve_seat")(reserve_seat)
         leased_charge = tool(tool_name="charge_card")(charge_card)
+        # Bound to ENGINE, not left on the default: the line above prints the
+        # engine this proof claims to be using, and a proof that reports one
+        # address while talking to another is not evidence of anything.
+        leased = functools.partial(durable_tools, target=ENGINE)
         b = run_arm(
             "ARM B  -  identical graph, leased with durable_tools",
-            leased_reserve, leased_charge, durable_tools,
+            leased_reserve, leased_charge, leased,
         )
 
     print("\n  " + "=" * 58)
     if a is not None:
         print(f"  Arm A   PostgresSaver alone .............. {a} charge(s)")
     if b is not None:
-        print(f"  Arm B   + CellaFlow leased tools ......... {b} charge(s)")
+        print(f"  Arm B   + Cellaflow leased tools ......... {b} charge(s)")
     print("  " + "=" * 58)
 
     if args.arm != "both":

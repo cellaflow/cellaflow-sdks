@@ -9,7 +9,7 @@ python proof.py
 ```
 
 ```
-  ARM A  -  PostgresSaver only, no CellaFlow
+  ARM A  -  PostgresSaver only, no Cellaflow
         >>> SEAT RESERVED   BK-1
         >>> CARD CHARGED    2499 for BK-1
       run 1: charged, then the process died

@@ -5,6 +5,7 @@ beyond the SDK.
 
 ```bash
 docker run -d --name cellaflow -p 50051:50051 -p 9090:9090 \
+  -e CELLAFLOW_ALLOW_UNAUTHENTICATED=true \
   ghcr.io/cellaflow/cellaflow:latest
 pip install cellaflow
 
