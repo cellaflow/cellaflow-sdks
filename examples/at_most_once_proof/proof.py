@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import os
 import sys
 import uuid
@@ -145,9 +146,13 @@ def main() -> int:
     if args.arm in ("b", "both"):
         leased_reserve = tool(tool_name="reserve_seat")(reserve_seat)
         leased_charge = tool(tool_name="charge_card")(charge_card)
+        # Bound to ENGINE, not left on the default: the line above prints the
+        # engine this proof claims to be using, and a proof that reports one
+        # address while talking to another is not evidence of anything.
+        leased = functools.partial(durable_tools, target=ENGINE)
         b = run_arm(
             "ARM B  -  identical graph, leased with durable_tools",
-            leased_reserve, leased_charge, durable_tools,
+            leased_reserve, leased_charge, leased,
         )
 
     print("\n  " + "=" * 58)
