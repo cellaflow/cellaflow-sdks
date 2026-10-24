@@ -15,6 +15,12 @@ Five scenarios, each a different way a charge gets duplicated:
 
 Scenario 5 is the one a checkpointer cannot do: the side effect happens inside a LangGraph node.
 
+None of this is exactly-once, and nothing is. A crash between the charge leaving the
+process and the record of it landing repeats the charge, because the gateway does not
+take part in the arbitration. What a lease decides is at-most-once: whether a *second*
+agent is allowed to reach the gateway at all. `examples/crash_benchmark` measures the
+case that stays open.
+
 Every agent runs as its own OS process, released simultaneously, so they genuinely race.
 
 ## Run it

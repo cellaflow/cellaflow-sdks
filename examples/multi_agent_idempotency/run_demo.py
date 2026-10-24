@@ -6,7 +6,8 @@
     python run_demo.py --scenario coordinated
 
 Scenario 1 has no coordination and charges the customer once per replica.
-Scenario 2 routes the same work through CellaFlow and charges exactly once.
+Scenario 2 routes the same work through Cellaflow, and one charge reaches the
+gateway.
 
 The verdict is read off the gateway's append-only ledger file, not off anything
 the agents report about themselves.
@@ -459,7 +460,7 @@ def main() -> int:
             return 1
 
     if coordinated_charges is not None and coordinated_charges != expected:
-        # Fresh session must charge exactly once; an already-refunded one must
+        # A fresh session must produce one charge; an already-refunded one must
         # not reach the gateway at all.
         print(
             f"  UNEXPECTED: coordinated run produced {coordinated_charges} charges, "
