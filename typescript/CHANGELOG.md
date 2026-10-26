@@ -14,6 +14,10 @@ All notable changes to the CellaFlow TypeScript SDK.
   session, or one further along than the run counted, keeps the previous behaviour, so a resume
   never writes a second record of a step. Matches the Python SDK.
 
+  If writing the record fails, it is kept and sent again before the next step claims a position.
+  If another writer in the session took the position first, the run logs a warning, stops
+  recording, and continues from the session's real position.
+
 ## 0.8.0
 
 ### Added & Changed

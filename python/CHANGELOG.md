@@ -17,6 +17,10 @@ All notable changes to the CellaFlow Python SDK.
   `durable_tools` thread that resumes, or a run that finds the session further along than it
   counted, keeps the previous behaviour, so a resume never writes a second record of a step.
 
+  If writing the record fails, it is kept and sent again before the next step claims a position.
+  If another writer in the session took the position first, the run logs a warning, stops
+  recording, and continues from the session's real position.
+
 ## 0.8.0
 
 ### Added & Changed

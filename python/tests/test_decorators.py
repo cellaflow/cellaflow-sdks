@@ -1276,11 +1276,11 @@ def test_a_session_with_a_recorded_hit_resumes_by_replay(
 
 
 def test_a_position_taken_first_stops_recording_hits(
-    mock_stub: MagicMock, mock_client: None
+    mock_stub: MagicMock, mock_client: None, caplog: Any
 ) -> None:
     """If another writer in the session took the position before the record, the
-    run no longer knows what the session holds. It carries on without recording
-    later hits, rather than failing or writing a second record."""
+    run no longer knows what the session holds. It reads the session's real
+    position, carries on from there without recording later hits, and says so."""
     import grpc
 
     class Taken(grpc.RpcError):  # type: ignore[misc]
@@ -1297,8 +1297,20 @@ def test_a_position_taken_first_stops_recording_hits(
     mock_stub.CheckIdempotencyCache.side_effect = [_hit(0), _acquired()]
     mock_stub.CommitStep.side_effect = [
         Taken(),
-        service_pb2.CommitStepResponse(session_id="sess-race", next_sequence=3),
+        service_pb2.CommitStepResponse(session_id="sess-race", next_sequence=4),
     ]
+    # The other writer committed positions 1 and 2 meanwhile.
+    from cellaflow.v1 import common_pb2
+
+    mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(
+        steps=[
+            common_pb2.StepResult(
+                sequence=i, name="peer", output_payload=serialize({"result": None})
+            )
+            for i in (1, 2)
+        ],
+        next_cursor="",
+    )
 
     @step
     def place_order() -> str:
@@ -1313,12 +1325,14 @@ def test_a_position_taken_first_stops_recording_hits(
         place_order()
         return mine()  # type: ignore[no-any-return]
 
-    assert wf() == "mine"
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert wf() == "mine"
     commits = [c[0][0].step_result for c in mock_stub.CommitStep.call_args_list]
     assert [(c.sequence, c.name) for c in commits] == [
         (1, "place_order"),
-        (2, "mine"),
+        (3, "mine"),
     ]
+    assert "was not recorded at position 1" in caplog.text
 
 
 def test_a_hit_into_history_the_run_did_not_count_is_not_recorded(
@@ -1362,3 +1376,53 @@ def test_a_hit_into_history_the_run_did_not_count_is_not_recorded(
     assert wf() == "mine"
     commits = [c[0][0].step_result for c in mock_stub.CommitStep.call_args_list]
     assert [(c.sequence, c.name) for c in commits] == [(6, "mine")]
+
+
+def test_a_failed_record_is_kept_and_sent_again(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """A transient error writing the record keeps it, so retrying the step that
+    hit it sends it again before anything else runs. Dropping it would let the
+    retried step take the shared step's position."""
+    import grpc
+
+    class Unavailable(grpc.RpcError):  # type: ignore[misc]
+        def code(self) -> grpc.StatusCode:
+            return grpc.StatusCode.UNAVAILABLE
+
+    from cellaflow.client import CellaflowClient
+    from cellaflow.context import WorkflowContext
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(), session_id="sess-retry", workflow_version="1.0.0"
+    )
+    ctx.sequence = 1
+    ctx.defer_hit_record(1, "place_order", {"result": "ORD-1"}, None)
+    mock_stub.CommitStep.side_effect = [
+        Unavailable(),
+        service_pb2.CommitStepResponse(session_id="sess-retry", next_sequence=2),
+    ]
+
+    with pytest.raises(grpc.RpcError):
+        ctx.reconcile_sequence()
+    ctx.reconcile_sequence()
+
+    sent = [c[0][0].step_result for c in mock_stub.CommitStep.call_args_list]
+    assert [(c.sequence, c.name) for c in sent] == [(1, "place_order")] * 2
+    assert ctx.sequence == 1
+
+
+def test_deferring_a_record_never_moves_the_counter(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """Parallel calls in one session may have taken later positions by the time a
+    hit is deferred, so deferring must not move the counter back to the hit."""
+    from cellaflow.client import CellaflowClient
+    from cellaflow.context import WorkflowContext
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(), session_id="sess-par", workflow_version="1.0.0"
+    )
+    ctx.sequence = 5
+    ctx.defer_hit_record(3, "place_order", {"result": "ORD-1"}, None)
+    assert ctx.sequence == 5

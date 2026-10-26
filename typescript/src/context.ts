@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { CellaflowClient } from "./client.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
+import { isFailedPrecondition } from "./errors.js";
 
 /** A cache hit's result, waiting to be recorded at its position in the session. */
 interface PendingHit {
@@ -45,6 +46,12 @@ export class WorkflowContext {
 
   private pendingHit?: PendingHit;
 
+  /**
+   * The write of {@link pendingHit}, while it is in flight. Every call waits for it
+   * before claiming a position, so no later position is committed ahead of it.
+   */
+  private recording?: Promise<void>;
+
   constructor(init: {
     client: CellaflowClient;
     sessionId: string;
@@ -81,7 +88,6 @@ export class WorkflowContext {
     coordinationId?: string,
   ): void {
     this.pendingHit = { sequence, name, payload, coordinationId };
-    this.sequence = sequence;
   }
 
   /**
@@ -113,29 +119,11 @@ export class WorkflowContext {
    * the field. Behaviour then degrades to the original defect rather than to
    * something new.
    */
-  async reconcileSequence(): Promise<void> {
-    const pending = this.pendingHit;
-    this.pendingHit = undefined;
-    if (pending) {
-      try {
-        await this.client.commitStep(
-          this.sessionId,
-          pending.sequence,
-          pending.name,
-          StepStatus.SUCCESS,
-          pending.payload,
-          undefined,
-          undefined,
-          pending.coordinationId,
-        );
-      } catch (err) {
-        const code = (err as { code?: unknown } | undefined)?.code;
-        if (code !== 9 && code !== "failed_precondition") throw err;
-        // Another writer in this session took the position first. The run no
-        // longer knows what the session holds, so it stops recording hits and
-        // the counter stays where the hit left it.
-        this.historyKnown = false;
-      }
+  reconcileSequence(): void {
+    if (this.pendingHit) {
+      // Started here and awaited by {@link settleRecording}, so a call still claims
+      // its position synchronously, in call order, as it always has.
+      this.recording ??= this.writePendingHit();
       return;
     }
     if (this.reportedSequence !== undefined) {
@@ -143,6 +131,68 @@ export class WorkflowContext {
       this.reportedSequence = undefined;
     }
   }
+  /** Whether a deferred record is being written. */
+  get recordingInFlight(): boolean {
+    return this.recording !== undefined;
+  }
+
+  /**
+   * Waits for a deferred record being written, by this call or a concurrent one.
+   * Rejects if the write failed; the record is kept and the next call sends it
+   * again.
+   */
+  async settleRecording(): Promise<void> {
+    if (this.recording) await this.recording;
+  }
+
+  private async writePendingHit(): Promise<void> {
+    const pending = this.pendingHit!;
+    try {
+      await this.client.commitStep(
+        this.sessionId,
+        pending.sequence,
+        pending.name,
+        StepStatus.SUCCESS,
+        pending.payload,
+        undefined,
+        undefined,
+        pending.coordinationId,
+      );
+      this.pendingHit = undefined;
+    } catch (err) {
+      // Kept on any other error, so the next call sends it again. If the write
+      // did land, the engine takes an identical re-send at the same position as
+      // a retry.
+      if (!isFailedPrecondition(err)) throw err;
+      // Another writer in this session took the position first. The run no
+      // longer knows what the session holds: it stops recording hits and
+      // continues from the session's real position.
+      this.pendingHit = undefined;
+      this.historyKnown = false;
+      this.sequence = await this.enginePosition();
+      console.warn(
+        `Cellaflow: the result of '${pending.name}' was not recorded at position ` +
+          `${pending.sequence} of session ${this.sessionId}, because another writer ` +
+          `committed there first. Continuing from position ${this.sequence}. A later ` +
+          "resume of this session may not replay that step.",
+      );
+    } finally {
+      this.recording = undefined;
+    }
+  }
+
+  /** The session's highest committed position, read from its history. */
+  private async enginePosition(): Promise<number> {
+    let highest = 0;
+    let cursor: string | undefined;
+    for (;;) {
+      const [steps, next] = await this.client.getGraph(this.sessionId, 1000, cursor);
+      for (const step of steps) highest = Math.max(highest, Number(step.sequence ?? 0));
+      if (!next) return highest;
+      cursor = next;
+    }
+  }
+
 }
 
 const storage = new AsyncLocalStorage<WorkflowContext>();

@@ -3,12 +3,15 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 import contextvars
+import logging
 import threading
 
 import grpc
 
 from cellaflow.client import CellaflowClient
 from cellaflow.v1 import common_pb2, service_pb2
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -76,7 +79,6 @@ class WorkflowContext:
             "payload": payload,
             "coordination_id": coordination_id,
         }
-        self.sequence = sequence
 
     def reconcile_sequence(self) -> None:
         """Records a deferred hit, then adopts the position the engine reported.
@@ -100,7 +102,7 @@ class WorkflowContext:
         field. Behaviour then degrades to the original defect rather than to
         something new.
         """
-        pending, self._pending_hit = self._pending_hit, None
+        pending = self._pending_hit
         if pending is not None:
             try:
                 self.client.commit_step(
@@ -113,15 +115,45 @@ class WorkflowContext:
                 )
             except grpc.RpcError as exc:
                 if exc.code() != grpc.StatusCode.FAILED_PRECONDITION:
+                    # Kept, so the step that hit this is retried with it. If the
+                    # write did land, the engine takes an identical re-send at the
+                    # same position as a retry.
                     raise
-                # Another writer in this session took the position first. The
-                # run no longer knows what the session holds, so it stops
-                # recording hits and the counter stays where the hit left it.
+                # Another writer in this session took the position first. The run
+                # no longer knows what the session holds: it stops recording hits
+                # and continues from the session's real position.
+                self._pending_hit = None
                 self.history_known = False
+                self.sequence = self._engine_position()
+                logger.warning(
+                    "Cellaflow: the result of %r was not recorded at position %d "
+                    "of session %s, because another writer committed there first. "
+                    "Continuing from position %d. A later resume of this session "
+                    "may not replay that step.",
+                    pending["name"],
+                    pending["sequence"],
+                    self.session_id,
+                    self.sequence,
+                )
+                return
+            self._pending_hit = None
             return
         if self._reported_sequence is not None:
             self.sequence = self._reported_sequence
             self._reported_sequence = None
+
+    def _engine_position(self) -> int:
+        """The session's highest committed position, read from its history."""
+        highest = 0
+        cursor: Optional[str] = None
+        while True:
+            steps, cursor = self.client.get_graph(
+                self.session_id, limit=1000, cursor=cursor
+            )
+            for record in steps:
+                highest = max(highest, int(record.get("sequence") or 0))
+            if not cursor:
+                return highest
 
     @contextlib.contextmanager
     def bind(self) -> Iterator["WorkflowContext"]:

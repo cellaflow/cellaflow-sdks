@@ -1,3 +1,4 @@
+import { isFailedPrecondition } from "./errors.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { getContext } from "./context.js";
@@ -134,7 +135,14 @@ export function tool<A extends unknown[], R>(
     // position it reported before claiming the next sequence, or this commit
     // fails the ordering check and names the wrong step. Deferred to here rather
     // than done on the hit itself so a run that ends on a hit does no extra work.
-    await ctx.reconcileSequence();
+    ctx.reconcileSequence();
+    // A shared result may be being recorded at an earlier position, by this call
+    // or a concurrent one. Wait for it before claiming a position: nothing may
+    // reach the engine ahead of it, and if it fails, this call fails having
+    // claimed nothing. Waiting calls resume in the order they arrived, so
+    // positions are still claimed in call order. With nothing in flight there is
+    // no await, and the claim stays synchronous as before.
+    if (ctx.recordingInFlight) await ctx.settleRecording();
     ctx.sequence += 1;
     const seq = ctx.sequence;
 
@@ -297,7 +305,3 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  * Connect and gRPC surface `FAILED_PRECONDITION` differently depending on
  * transport, so match on the code rather than the class.
  */
-function isFailedPrecondition(err: unknown): boolean {
-  const code = (err as { code?: unknown } | undefined)?.code;
-  return code === 9 || code === "failed_precondition";
-}

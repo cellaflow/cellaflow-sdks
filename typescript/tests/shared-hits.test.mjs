@@ -9,12 +9,19 @@ import { serialize } from "../dist/serialization.js";
 import { runWithContext } from "../dist/context.js";
 
 /** Answers checks from `answers` in order, and records every commit. */
-function scriptedClient(answers, { refuseFirstCommit = false } = {}) {
+function scriptedClient(answers, { refuseFirstCommit = false, failFirstCommit = false, history = [] } = {}) {
   const commits = [];
+  const order = [];
   let refused = false;
+  let failed = false;
   return {
     commits,
+    order,
+    async getGraph() {
+      return [history.map((sequence) => ({ sequence: BigInt(sequence) })), undefined];
+    },
     async checkIdempotencyCache() {
+      order.push("check");
       const next = answers.shift();
       if (!next) throw new Error("no scripted answer left");
       return next;
@@ -24,6 +31,12 @@ function scriptedClient(answers, { refuseFirstCommit = false } = {}) {
         refused = true;
         throw Object.assign(new Error("sequence already committed"), { code: 9 });
       }
+      if (failFirstCommit && !failed) {
+        failed = true;
+        throw Object.assign(new Error("engine unavailable"), { code: 14 });
+      }
+      await new Promise((r) => setTimeout(r, 5));
+      order.push(`commit:${sequence}:${name}`);
       commits.push({ sequence, name, payload, key, token, coordinationId });
       return {};
     },
@@ -125,17 +138,71 @@ test("a session further along than the run counted is not recorded into", async 
   );
 });
 
-test("a position taken first stops recording hits instead of failing", async () => {
-  ran.length = 0;
-  const client = scriptedClient([hit(0), acquired()], { refuseFirstCommit: true });
+test("a position taken first stops recording and continues from the real position", async () => {
+  // Another writer committed positions 1 and 2 meanwhile.
+  const client = scriptedClient([hit(0), acquired()], { refuseFirstCommit: true, history: [1, 2] });
   const ctx = session(client);
-  await runWithContext(ctx, async () => {
-    await placeOrder({ orderId: "4417" });
-    assert.equal(await sendConfirmation({ orderId: "4417" }), "emailed");
-  });
+  const warn = console.warn;
+  const warnings = [];
+  console.warn = (msg) => warnings.push(msg);
+  try {
+    await runWithContext(ctx, async () => {
+      await placeOrder({ orderId: "4417" });
+      assert.equal(await sendConfirmation({ orderId: "4417" }), "emailed");
+    });
+  } finally {
+    console.warn = warn;
+  }
   assert.equal(ctx.historyKnown, false);
   assert.deepEqual(
     client.commits.map((c) => [c.sequence, c.name]),
-    [[2, "send_confirmation"]],
+    [[3, "send_confirmation"]],
   );
+  assert.match(warnings[0], /was not recorded at position 1/);
+});
+
+test("a record that fails to write is kept and sent again before anything else", async () => {
+  const client = scriptedClient([hit(0), acquired()], { failFirstCommit: true });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    await placeOrder({ orderId: "4417" });
+    // The next call fails before reaching the engine, and its body never runs.
+    await assert.rejects(sendConfirmation({ orderId: "4417" }), /unavailable/);
+  });
+  assert.deepEqual(client.order, ["check"]);
+  // Retried as is, it sends the record first, then itself at the next position.
+  await runWithContext(ctx, () => sendConfirmation({ orderId: "4417" }));
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [
+      [1, "place_order"],
+      [2, "send_confirmation"],
+    ],
+  );
+});
+
+test("concurrent calls after a hit wait for its record and keep call order", async () => {
+  const client = scriptedClient([hit(0), acquired(), acquired()]);
+  const first = tool(async () => "a", { toolName: "first" });
+  const second = tool(async () => "b", { toolName: "second" });
+  await runWithContext(session(client), async () => {
+    await placeOrder({ orderId: "4417" });
+    await Promise.all([first(), second()]);
+  });
+  // The record lands before either call reaches the engine, and the two calls
+  // keep the positions they claimed in call order.
+  assert.equal(client.order[1], "commit:1:place_order");
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]).sort(),
+    [
+      [1, "place_order"],
+      [2, "first"],
+      [3, "second"],
+    ],
+  );
+});
+
+test("reconcileSequence stays synchronous", () => {
+  const ctx = session(scriptedClient([]));
+  assert.equal(ctx.reconcileSequence(), undefined);
 });
