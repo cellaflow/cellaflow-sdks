@@ -24,16 +24,27 @@ const RETRYABLE_CODES = new Set<unknown>([
 ]);
 
 /**
- * Whether an engine call failed in a way that may pass if it is sent again. An
- * error carrying no status code did not come back from the engine, such as a
- * dropped connection, so it counts as retryable.
+ * Whether an engine call failed in a way that may pass if it is sent again. The
+ * transport reports a dropped connection or a timeout with one of these codes. An
+ * error with no status code was thrown before the call reached the engine, such as
+ * a payload that does not serialize, and fails the same way every time.
  */
 export function isRetryable(err: unknown): boolean {
-  const code = codeOf(err);
-  return code === undefined || RETRYABLE_CODES.has(code);
+  return RETRYABLE_CODES.has(codeOf(err));
 }
 
-/** The status code of a failed engine call, for messages. */
+/** Whether an engine call answered NOT_FOUND. */
+export function isNotFound(err: unknown): boolean {
+  const code = codeOf(err);
+  return code === 5 || code === "not_found";
+}
+
+/** Whether an error came back from the engine with a status code. */
+export function hasStatusCode(err: unknown): boolean {
+  return codeOf(err) !== undefined;
+}
+
+/** Why an engine call failed, for messages: its status code, or the error itself. */
 export function errorCode(err: unknown): string {
-  return String(codeOf(err));
+  return hasStatusCode(err) ? String(codeOf(err)) : String(err);
 }

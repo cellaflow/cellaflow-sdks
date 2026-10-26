@@ -11,7 +11,14 @@ import { runWithContext } from "../dist/context.js";
 /** Answers checks from `answers` in order, and records every commit. */
 function scriptedClient(
   answers,
-  { refuseFirstCommit = false, refuseCode = 9, failFirstCommit = false, history = [], failGraph = false } = {},
+  {
+    refuseFirstCommit = false,
+    refuseCode = 9,
+    failFirstCommit = false,
+    history = [],
+    failGraph = false,
+    unknownSession = false,
+  } = {},
 ) {
   const commits = [];
   const order = [];
@@ -25,6 +32,7 @@ function scriptedClient(
     async getGraph(sessionId, limit, cursor) {
       graphCursors.push(cursor);
       if (failGraph) throw Object.assign(new Error("engine unavailable"), { code: 14 });
+      if (unknownSession) throw Object.assign(new Error("session not found"), { code: 5 });
       const from = cursor === undefined ? 1 : Number(cursor);
       const steps = history.filter((sequence) => sequence >= from);
       return [steps.map((sequence) => ({ sequence: BigInt(sequence) })), undefined];
@@ -38,7 +46,9 @@ function scriptedClient(
     async commitStep(sessionId, sequence, name, status, payload, key, token, coordinationId) {
       if (refuseFirstCommit && !refused) {
         refused = true;
-        throw Object.assign(new Error("refused"), { code: refuseCode });
+        throw refuseCode === null
+          ? new TypeError("cannot serialize")
+          : Object.assign(new Error("refused"), { code: refuseCode });
       }
       if (failFirstCommit && !failed) {
         failed = true;
@@ -81,7 +91,7 @@ const sendConfirmation = tool(
   { toolName: "send_confirmation", scope: IdempotencyScope.SHARED, sharedOn: ["orderId"] },
 );
 
-function session(client, historyKnown) {
+function session(client, historyKnown = true) {
   return new WorkflowContext({
     client,
     sessionId: "s-1",
@@ -300,5 +310,60 @@ test("a failed position read keeps the record for the next call", async () => {
       [1, "place_order"],
       [2, "send_confirmation"],
     ],
+  );
+});
+
+test("a record that cannot be sent is dropped rather than retried forever", async () => {
+  // An error with no status code was thrown before the record reached the engine,
+  // and fails the same way every time.
+  const client = scriptedClient([hit(0), acquired()], { refuseFirstCommit: true, refuseCode: null });
+  const ctx = session(client);
+  const warn = console.warn;
+  const warnings = [];
+  console.warn = (msg) => warnings.push(msg);
+  try {
+    await runWithContext(ctx, async () => {
+      await placeOrder({ orderId: "4417" });
+      assert.equal(await sendConfirmation({ orderId: "4417" }), "emailed");
+    });
+  } finally {
+    console.warn = warn;
+  }
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [[1, "send_confirmation"]],
+  );
+  assert.match(warnings[0], /it could not be sent \(TypeError: cannot serialize\)/);
+});
+
+test("a session the engine does not know reads as empty when the record is refused", async () => {
+  const client = scriptedClient([hit(0), acquired()], { refuseFirstCommit: true, refuseCode: 3, unknownSession: true });
+  const ctx = session(client);
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    await runWithContext(ctx, async () => {
+      await placeOrder({ orderId: "4417" });
+      assert.equal(await sendConfirmation({ orderId: "4417" }), "emailed");
+    });
+  } finally {
+    console.warn = warn;
+  }
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [[1, "send_confirmation"]],
+  );
+});
+
+test("a context built by hand does not record hits", async () => {
+  const client = scriptedClient([hit(0), acquired()]);
+  const ctx = new WorkflowContext({ client, sessionId: "s-hand", workflowVersion: "1.0.0", coordinationId: "order-4417" });
+  await runWithContext(ctx, async () => {
+    await placeOrder({ orderId: "4417" });
+    await sendConfirmation({ orderId: "4417" });
+  });
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [[1, "send_confirmation"]],
   );
 });

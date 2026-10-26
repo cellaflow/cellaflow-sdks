@@ -1,7 +1,13 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { CellaflowClient } from "./client.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
-import { errorCode, isFailedPrecondition, isRetryable } from "./errors.js";
+import {
+  errorCode,
+  hasStatusCode,
+  isFailedPrecondition,
+  isNotFound,
+  isRetryable,
+} from "./errors.js";
 
 /** A cache hit's result, waiting to be recorded at its position in the session. */
 interface PendingHit {
@@ -72,7 +78,9 @@ export class WorkflowContext {
     this.workflowVersion = init.workflowVersion;
     this.sequence = init.sequence ?? 0;
     this.coordinationId = init.coordinationId;
-    this.historyKnown = init.historyKnown ?? true;
+    // Opt-in: a context built for a session whose history it never read must not
+    // record into it.
+    this.historyKnown = init.historyKnown ?? false;
   }
 
   /**
@@ -216,9 +224,10 @@ export class WorkflowContext {
       // takes an identical re-send at the same position as a retry.
       if (isRetryable(err)) throw err;
       // The record will not be accepted: another writer in this session took the
-      // position first, or the engine refused the write itself. Read where the
-      // session is before changing anything, so a failed read leaves the record
-      // to be tried again.
+      // position first, the engine refused the write itself, or it failed before
+      // reaching the engine and would fail the same way on every retry. Read where
+      // the session is before changing anything, so a failed read leaves the
+      // record to be tried again.
       const position = Math.max(
         pending.sequence - 1,
         await this.enginePosition(pending.sequence),
@@ -230,7 +239,9 @@ export class WorkflowContext {
       this.sequence = position;
       const reason = isFailedPrecondition(err)
         ? "another writer committed there first"
-        : `the engine refused it (${errorCode(err)})`;
+        : hasStatusCode(err)
+          ? `the engine refused it (${errorCode(err)})`
+          : `it could not be sent (${errorCode(err)})`;
       console.warn(
         `Cellaflow: the result of '${pending.name}' was not recorded at position ` +
           `${pending.sequence} of session ${this.sessionId}, because ${reason}. ` +
@@ -246,12 +257,25 @@ export class WorkflowContext {
    * The session's highest committed position at or after `fromSequence`, or 0 if
    * there is none. The engine's page cursor is the first sequence to read and is
    * inclusive, so only the tail of the session is read.
+   *
+   * A session the engine does not know answers NOT_FOUND rather than an empty
+   * page, which means it holds nothing. NOT_FOUND after the first page means the
+   * session went away mid-read, and propagates like any other failure.
    */
   private async enginePosition(fromSequence: number): Promise<number> {
     let highest = 0;
     let cursor: string | undefined = String(fromSequence);
+    let firstPage = true;
     for (;;) {
-      const [steps, next] = await this.client.getGraph(this.sessionId, 1000, cursor);
+      let steps: Record<string, any>[];
+      let next: string | undefined;
+      try {
+        [steps, next] = await this.client.getGraph(this.sessionId, 1000, cursor);
+      } catch (err) {
+        if (firstPage && isNotFound(err)) return 0;
+        throw err;
+      }
+      firstPage = false;
       for (const step of steps) highest = Math.max(highest, Number(step.sequence ?? 0));
       if (!next) return highest;
       cursor = next;
