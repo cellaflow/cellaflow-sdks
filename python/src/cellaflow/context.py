@@ -12,7 +12,8 @@ import grpc
 
 from cellaflow.client import CellaflowClient
 from cellaflow.history import latest_session_sequence
-from cellaflow.idempotency import record_idempotency_key
+from cellaflow.failures import capture, importable
+from cellaflow.idempotency import failure_idempotency_key, record_idempotency_key
 from cellaflow.v1 import common_pb2, idempotency_pb2, service_pb2
 
 logger = logging.getLogger(__name__)
@@ -200,6 +201,8 @@ class WorkflowContext:
         `record_idempotency_key`.
         """
         self._pending_hit = {
+            "kind": "result",
+            "status": common_pb2.StepStatus.STEP_STATUS_SUCCESS,
             "sequence": sequence,
             "name": name,
             "payload": payload,
@@ -207,6 +210,87 @@ class WorkflowContext:
             "agent_id": agent_id,
             "received_key": received_key,
         }
+
+    def defer_failure_record(
+        self,
+        sequence: int,
+        name: str,
+        exc: BaseException,
+        coordination_id: Optional[str],
+        agent_id: str = "default",
+        step_key: str = "",
+    ) -> None:
+        """Holds a step's failure to be recorded at `sequence` in this session.
+
+        A step that fails leaves its position empty. A workflow that catches the
+        failure and carries on would otherwise put its next step one position
+        past the gap, where the engine refuses the commit after that step's side
+        effect has run. Recording the failure fills the position, and lets a
+        resumed run raise the same exception there instead of running the step
+        again, so the workflow takes the same branch. See `failures.rebuild`.
+
+        Written when the next step claims a position, or when the workflow
+        returns: only once the run has moved past the failure. A failure the
+        workflow lets propagate is not recorded, so resuming retries the step.
+
+        Only while the step is the session's only call in flight and no later
+        position was claimed meanwhile, as for a hit. Otherwise nothing is
+        recorded, as before.
+        """
+        with self._lock:
+            if not (self._in_flight == 1 and self.sequence == sequence):
+                return
+            if not importable(type(exc)):
+                logger.warning(
+                    "Cellaflow: %s raised by %r cannot be imported by name, so a "
+                    "resumed run cannot raise it again and will refuse to resume "
+                    "past position %d. Define exceptions a step raises at module "
+                    "level.",
+                    type(exc).__qualname__,
+                    name,
+                    sequence,
+                )
+            self._pending_hit = {
+                "kind": "failure",
+                "status": common_pb2.StepStatus.STEP_STATUS_FAILED,
+                "sequence": sequence,
+                "name": name,
+                "payload": {"error": capture(exc)},
+                "coordination_id": coordination_id,
+                "agent_id": agent_id,
+                "received_key": step_key,
+            }
+
+    def record_pending_failure(self) -> None:
+        """Records a failure the workflow caught and finished after.
+
+        Called when a workflow returns normally. A failure followed by a later
+        step is recorded when that step starts; this covers one followed by none.
+        """
+        while True:
+            wait = self._try_record_failure()
+            if wait is None:
+                return
+            time.sleep(wait)
+
+    async def record_pending_failure_async(self) -> None:
+        """`record_pending_failure` for an async workflow."""
+        while True:
+            wait = self._try_record_failure()
+            if wait is None:
+                return
+            await asyncio.sleep(wait)
+
+    def _try_record_failure(self) -> Optional[float]:
+        with self._lock:
+            pending = self._pending_hit
+            if pending is None or pending.get("kind") != "failure":
+                return None
+            try:
+                self.reconcile_sequence()
+            except _RecordHeld as held:
+                return held.retry_after_s
+            return None
 
     def reconcile_sequence(self) -> None:
         """Records a deferred hit, then adopts the position the engine reported.
@@ -269,9 +353,10 @@ class WorkflowContext:
                 else:
                     reason = f"it could not be sent ({type(exc).__name__}: {exc})"
                 logger.warning(
-                    "Cellaflow: the result of %r was not recorded at position %d "
+                    "Cellaflow: the %s of %r was not recorded at position %d "
                     "of session %s, because %s. Continuing from position %d. A "
                     "later resume of this session may not replay that step.",
+                    "failure" if pending.get("kind") == "failure" else "result",
                     pending["name"],
                     pending["sequence"],
                     self.session_id,
@@ -295,9 +380,17 @@ class WorkflowContext:
         it refuses the record at a position another lease has claimed, or refuses
         the later lease before its side effect runs.
         """
-        key = record_idempotency_key(
-            self.session_id, pending["sequence"], pending["received_key"]
-        )
+        if pending.get("kind") == "failure":
+            key = failure_idempotency_key(
+                self.session_id,
+                pending["sequence"],
+                pending["name"],
+                pending["received_key"],
+            )
+        else:
+            key = record_idempotency_key(
+                self.session_id, pending["sequence"], pending["received_key"]
+            )
         agent_id = pending["agent_id"]
         resp = self.client.check_idempotency_cache(
             agent_id=agent_id,
@@ -323,7 +416,7 @@ class WorkflowContext:
                 session_id=self.session_id,
                 sequence=pending["sequence"],
                 name=pending["name"],
-                status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+                status=pending["status"],
                 output_payload=pending["payload"],
                 idempotency_key=key,
                 idempotency_fencing_token=token,

@@ -4,6 +4,24 @@ All notable changes to the CellaFlow Python SDK.
 
 ## Unreleased
 
+### Added
+
+- **A step's failure is recorded at its position, and replayed.** When a workflow catches a step's
+  exception and carries on, the failure is recorded at the step's position as a step with status
+  `STEP_STATUS_FAILED`, and the next step takes the following position. A resumed `@workflow`
+  raises the same exception there instead of running the step again, so it takes the same branch.
+
+  The exception comes back as an instance of its own class, with its arguments and attributes,
+  rebuilt without calling its constructor, so `except` clauses and `isinstance` checks behave as
+  they did. Its class must be importable by name: defined at module level, and still present when
+  the run resumes. Otherwise the resume stops with `NondeterministicWorkflowError` rather than run
+  the step again, and the original run logs a warning when the failure happens. Attributes whose
+  values cannot be serialized, such as an HTTP response object, are not recorded; reading one on
+  replay raises `AttributeError`.
+
+  A failure the workflow lets propagate is not recorded, so resuming retries the step. A failure
+  while another step of the session is in flight is not recorded either.
+
 ### Fixed
 
 - **A session that received a shared result can be resumed.** When a `SCOPE_SHARED` step was

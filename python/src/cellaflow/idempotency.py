@@ -152,3 +152,17 @@ def record_idempotency_key(session_id: str, sequence: int, received_key: str) ->
     """
     digest = hashlib.sha256(received_key.encode("utf-8")).hexdigest()
     return f"{session_id}:record:{sequence}:{digest}"
+
+
+def failure_idempotency_key(
+    session_id: str, sequence: int, step_name: str, step_key: str
+) -> str:
+    """The key a session records a step's failure under, at `sequence`.
+
+    Its own key, not the step's: completing the step's key with a failure would
+    answer every later call with that key from the cache, so a retry of the tool
+    would never run again. Leased like any step, so the engine arbitrates the
+    position, as for `record_idempotency_key`.
+    """
+    digest = hashlib.sha256(f"{step_name}\n{step_key}".encode("utf-8")).hexdigest()
+    return f"{session_id}:failure:{sequence}:{digest}"

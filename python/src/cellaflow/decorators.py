@@ -16,6 +16,7 @@ from cellaflow.context import (
     get_context,
     session_coordination_id,
 )
+from cellaflow.failures import ReplayedFailureError, rebuild
 from cellaflow.history import iter_session_steps
 from cellaflow.idempotency import (
     derive_idempotency_key,
@@ -24,7 +25,7 @@ from cellaflow.idempotency import (
 )
 from cellaflow.lease import LeaseHeartbeat
 from cellaflow.serialization import deserialize
-from cellaflow.v1.common_pb2 import STEP_STATUS_SUCCESS
+from cellaflow.v1.common_pb2 import STEP_STATUS_FAILED, STEP_STATUS_SUCCESS
 from cellaflow.v1.idempotency_pb2 import (
     CACHE_STATUS_HIT,
     CACHE_STATUS_ACQUIRED,
@@ -74,6 +75,7 @@ def workflow(
                     replayed_steps[step_info["sequence"]] = {
                         "name": step_info["name"],
                         "payload": step_info["output_payload"],
+                        "status": step_info.get("status"),
                     }
 
             ctx = WorkflowContext(
@@ -89,7 +91,12 @@ def workflow(
             )
             token = set_context(ctx)
             try:
-                return await func(*args, **kwargs)
+                result = await func(*args, **kwargs)
+                # A failure the workflow caught, with no step after it to record
+                # it. Only on a normal return: a failure the workflow lets
+                # propagate stays unrecorded, so resuming retries the step.
+                await ctx.record_pending_failure_async()
+                return result
             finally:
                 reset_context(token)
 
@@ -126,6 +133,7 @@ def workflow(
                     replayed_steps[step_info["sequence"]] = {
                         "name": step_info["name"],
                         "payload": step_info["output_payload"],
+                        "status": step_info.get("status"),
                     }
 
             ctx = WorkflowContext(
@@ -141,7 +149,10 @@ def workflow(
             )
             token = set_context(ctx)
             try:
-                return func(*args, **kwargs)
+                result = func(*args, **kwargs)
+                # See the async wrapper.
+                ctx.record_pending_failure()
+                return result
             finally:
                 reset_context(token)
 
@@ -221,9 +232,37 @@ def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
         )
 
     payload = recorded.get("payload")
+    if recorded.get("status") == STEP_STATUS_FAILED:
+        # The step failed the first time, and the workflow carried on past it.
+        # Raise the same exception, so the resumed run takes the same branch.
+        try:
+            failure = rebuild((payload or {}).get("error", {}), expected_name, seq)
+        except ReplayedFailureError as exc:
+            raise NondeterministicWorkflowError(str(exc)) from None
+        raise failure
     if payload is None:
         return None
     return payload.get("result")
+
+
+def _note_failure(
+    ctx: WorkflowContext,
+    seq: int,
+    name: str,
+    exc: BaseException,
+    call_coordination: Optional[str],
+    agent_id: str,
+    ikey: Optional[str],
+) -> None:
+    """Holds a live step's failure to be recorded at its position.
+
+    Not for a refused lease: another writer owns that position and fills it.
+    """
+    if isinstance(exc, DivergentStepError):
+        return
+    ctx.defer_failure_record(
+        seq, name, exc, call_coordination, agent_id=agent_id, step_key=ikey or ""
+    )
 
 
 def _take_hit(
@@ -348,9 +387,14 @@ def step(
         # the wrong step. Deferred to here rather than done on the hit itself so
         # a workflow that ends on a hit does no extra work.
         seq = await ctx.begin_call_async()
+        # Set once the step runs live rather than replaying, so only a live
+        # failure is recorded; `ikey` once it is known.
+        live = False
+        ikey: Optional[str] = None
         try:
             if seq in ctx.replayed_steps:
                 return _replay(ctx, seq, actual_tool_name)
+            live = True
 
             # Derive idempotency key
             ikey = idempotency_key
@@ -465,6 +509,12 @@ def step(
             finally:
                 if hb:
                     await hb.stop_async()
+        except BaseException as exc:
+            if live:
+                _note_failure(
+                    ctx, seq, actual_tool_name, exc, call_coordination, agent_id, ikey
+                )
+            raise
         finally:
             ctx.end_call()
 
@@ -483,9 +533,14 @@ def step(
         # the wrong step. Deferred to here rather than done on the hit itself so
         # a workflow that ends on a hit does no extra work.
         seq = ctx.begin_call()
+        # Set once the step runs live rather than replaying, so only a live
+        # failure is recorded; `ikey` once it is known.
+        live = False
+        ikey: Optional[str] = None
         try:
             if seq in ctx.replayed_steps:
                 return _replay(ctx, seq, actual_tool_name)
+            live = True
 
             # Derive idempotency key
             ikey = idempotency_key
@@ -600,6 +655,12 @@ def step(
             finally:
                 if hb:
                     hb.stop_sync()
+        except BaseException as exc:
+            if live:
+                _note_failure(
+                    ctx, seq, actual_tool_name, exc, call_coordination, agent_id, ikey
+                )
+            raise
         finally:
             ctx.end_call()
 
