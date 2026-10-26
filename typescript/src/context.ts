@@ -1,6 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { CellaflowClient } from "./client.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
+import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
+import { recordIdempotencyKey } from "./idempotency.js";
 import {
   errorCode,
   hasStatusCode,
@@ -15,7 +17,13 @@ interface PendingHit {
   name: string;
   payload: Record<string, unknown>;
   coordinationId?: string;
+  /** The agent whose call was answered by the hit. */
+  agentId: string;
+  /** The idempotency key the hit answered. */
+  receivedKey: string;
 }
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * The session a tool call belongs to, plus the bookkeeping that keeps the local
@@ -95,14 +103,20 @@ export class WorkflowContext {
    * Deferred to the next step, like {@link recordEngineSequence}: the record only
    * matters once something would otherwise take its position, so a run that ends
    * on a hit still does no extra work.
+   *
+   * `receivedKey` is the idempotency key the hit answered, and `agentId` the agent
+   * that asked. The record is leased under its own key, derived from both. See
+   * {@link recordIdempotencyKey}.
    */
   deferHitRecord(
     sequence: number,
     name: string,
     payload: Record<string, unknown>,
     coordinationId?: string,
+    agentId = "default",
+    receivedKey = "",
   ): void {
-    this.pendingHit = { sequence, name, payload, coordinationId };
+    this.pendingHit = { sequence, name, payload, coordinationId, agentId, receivedKey };
   }
 
   /**
@@ -139,9 +153,11 @@ export class WorkflowContext {
     payload: Record<string, unknown>,
     reported: number,
     coordinationId?: string,
+    agentId = "default",
+    receivedKey = "",
   ): void {
     if (this.inFlight === 1 && this.historyKnown && reported === sequence - 1) {
-      this.deferHitRecord(sequence, name, payload, coordinationId);
+      this.deferHitRecord(sequence, name, payload, coordinationId, agentId, receivedKey);
       return;
     }
     // The run can no longer tell what the session holds.
@@ -208,20 +224,11 @@ export class WorkflowContext {
   private async writePendingHit(): Promise<void> {
     const pending = this.pendingHit!;
     try {
-      await this.client.commitStep(
-        this.sessionId,
-        pending.sequence,
-        pending.name,
-        StepStatus.SUCCESS,
-        pending.payload,
-        undefined,
-        undefined,
-        pending.coordinationId,
-      );
+      await this.writeRecord(pending);
       if (this.pendingHit === pending) this.pendingHit = undefined;
     } catch (err) {
-      // Kept, so the next call sends it again. If the write did land, the engine
-      // takes an identical re-send at the same position as a retry.
+      // Kept, so the next call sends it again. If the write did land, sending it
+      // again finds its completed entry.
       if (isRetryable(err)) throw err;
       // The record will not be accepted: another writer in this session took the
       // position first, the engine refused the write itself, or it failed before
@@ -238,7 +245,7 @@ export class WorkflowContext {
       this.historyKnown = false;
       this.sequence = position;
       const reason = isFailedPrecondition(err)
-        ? "another writer committed there first"
+        ? "another writer committed or claimed it first"
         : hasStatusCode(err)
           ? `the engine refused it (${errorCode(err)})`
           : `it could not be sent (${errorCode(err)})`;
@@ -250,6 +257,61 @@ export class WorkflowContext {
       );
     } finally {
       this.recording = undefined;
+    }
+  }
+
+  /**
+   * Records a received result at its position, through a lease.
+   *
+   * A plain commit is checked only for order, not against the positions that
+   * leases have claimed. A replica in this session holding a lease at the same
+   * position would then have its commit refused after its side effect ran, losing
+   * the record that it did. Leasing the record makes the engine decide: it refuses
+   * the record at a position another lease has claimed, or refuses the later
+   * lease before its side effect runs.
+   */
+  private async writeRecord(pending: PendingHit): Promise<void> {
+    const key = recordIdempotencyKey(this.sessionId, pending.sequence, pending.receivedKey);
+    let token = 0;
+    for (;;) {
+      const resp = await this.client.checkIdempotencyCache(
+        pending.agentId,
+        key,
+        undefined,
+        undefined,
+        this.sessionId,
+        pending.sequence,
+      );
+      // Written by an earlier attempt whose answer was lost.
+      if (resp.status === CacheStatus.HIT) return;
+      if (resp.status === CacheStatus.IN_PROGRESS) {
+        // An earlier attempt's lease, not yet released or lapsed.
+        await sleep(Number(resp.retryAfterMs ?? 1000n));
+        continue;
+      }
+      if (resp.status !== CacheStatus.ACQUIRED) {
+        throw new Error(`unexpected cache status ${resp.status} leasing the record`);
+      }
+      token = Number(resp.fencingToken ?? 0n);
+      break;
+    }
+    try {
+      await this.client.commitStep(
+        this.sessionId,
+        pending.sequence,
+        pending.name,
+        StepStatus.SUCCESS,
+        pending.payload,
+        key,
+        token,
+        pending.coordinationId,
+      );
+    } catch (err) {
+      await this.client.releaseLease(pending.agentId, key, token, "TOOL_ERROR").catch(() => {
+        // The lease lapses on its own. Losing the release is not worth masking the
+        // error that caused it.
+      });
+      throw err;
     }
   }
 

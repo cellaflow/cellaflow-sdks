@@ -237,6 +237,8 @@ export function tool<A extends unknown[], R>(
             envelope as Record<string, unknown>,
             Number(resp.currentSequence),
             callCoordination,
+            agentId,
+            ikey,
           );
         }
         return envelope?.result as R;

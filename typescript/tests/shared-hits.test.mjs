@@ -19,9 +19,12 @@ function scriptedClient(
     history = [],
     failGraph = false,
     unknownSession = false,
+    recordLease,
   } = {},
 ) {
   const commits = [];
+  const recordLeases = [];
+  const releases = [];
   const order = [];
   const graphCursors = [];
   let refused = false;
@@ -30,6 +33,8 @@ function scriptedClient(
     commits,
     order,
     graphCursors,
+    recordLeases,
+    releases,
     async getGraph(sessionId, limit, cursor) {
       graphCursors.push(cursor);
       if (failGraph) throw Object.assign(new Error("engine unavailable"), { code: 14 });
@@ -38,7 +43,14 @@ function scriptedClient(
       const steps = history.filter((sequence) => sequence >= from);
       return [steps.map((sequence) => ({ sequence: BigInt(sequence) })), undefined];
     },
-    async checkIdempotencyCache() {
+    async checkIdempotencyCache(agentId, key, waitTimeoutMs, leaseTtlMs, sessionId, sequence) {
+      // A recorded hit is leased under its own key before it is committed.
+      if (key.includes(":record:")) {
+        order.push(`record-lease:${sequence}`);
+        recordLeases.push({ agentId, key, sessionId, sequence });
+        if (recordLease) return recordLease();
+        return { status: CacheStatus.ACQUIRED, fencingToken: 99n, heartbeatIntervalMs: 60_000n };
+      }
       order.push("check");
       const next = answers.shift();
       if (!next) throw new Error("no scripted answer left");
@@ -60,7 +72,9 @@ function scriptedClient(
       commits.push({ sequence, name, payload, key, token, coordinationId });
       return {};
     },
-    async releaseLease() {},
+    async releaseLease(agentId, key, token) {
+      releases.push({ agentId, key, token });
+    },
     async renewLease() {
       return { renewed: true };
     },
@@ -118,11 +132,16 @@ test("a hit from another session is recorded at its position before the next ste
       [2, "send_confirmation"],
     ],
   );
-  // A plain step: the result under the tool's name, with no lease behind it.
+  // The result under the tool's name, committed through a lease on its own key,
+  // so the engine arbitrates the position like any other step's.
   const recorded = client.commits[0];
   assert.deepEqual(recorded.payload, { result: "ORD-1" });
-  assert.equal(recorded.key, undefined);
-  assert.equal(recorded.token, undefined);
+  assert.match(recorded.key, /^s-1:record:1:[0-9a-f]{64}$/);
+  assert.equal(recorded.token, 99);
+  assert.deepEqual(
+    client.recordLeases.map((l) => [l.sessionId, l.sequence]),
+    [["s-1", 1]],
+  );
 });
 
 test("a run ending on a hit records nothing", async () => {
@@ -189,7 +208,9 @@ test("a record that fails to write is kept and sent again before anything else",
     // The next call fails before reaching the engine, and its body never runs.
     await assert.rejects(sendConfirmation({ orderId: "4417" }), /unavailable/);
   });
-  assert.deepEqual(client.order, ["check"]);
+  // Only the record was attempted: the call's own check never happened.
+  assert.deepEqual(client.order, ["check", "record-lease:1"]);
+  assert.equal(client.releases.length, 1);
   // Retried as is, it sends the record first, then itself at the next position.
   await runWithContext(ctx, () => sendConfirmation({ orderId: "4417" }));
   assert.deepEqual(
@@ -211,7 +232,7 @@ test("concurrent calls after a hit wait for its record and keep call order", asy
   });
   // The record lands before either call reaches the engine, and the two calls
   // keep the positions they claimed in call order.
-  assert.equal(client.order[1], "commit:1:place_order");
+  assert.deepEqual(client.order.slice(1, 3), ["record-lease:1", "commit:1:place_order"]);
   assert.deepEqual(
     client.commits.map((c) => [c.sequence, c.name]).sort(),
     [
@@ -392,3 +413,70 @@ for (const [label, failCode] of [
     );
   });
 }
+
+// The record is leased, so the engine arbitrates its position.
+
+test("a record is refused at a position another lease claimed", async () => {
+  // A replica in this session leased position 1 and is running its side effect.
+  // The record must not take it, or that replica's commit is refused afterwards.
+  const client = scriptedClient([hit(0), acquired()], {
+    recordLease: () => {
+      throw Object.assign(new Error("position claimed"), { code: 9 });
+    },
+    history: [1],
+  });
+  const ctx = session(client);
+  const warn = console.warn;
+  const warnings = [];
+  console.warn = (msg) => warnings.push(msg);
+  try {
+    await runWithContext(ctx, async () => {
+      await placeOrder({ orderId: "4417" });
+      assert.equal(await sendConfirmation({ orderId: "4417" }), "emailed");
+    });
+  } finally {
+    console.warn = warn;
+  }
+  // Nothing written at 1; the run continues after the replica's step.
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [[2, "send_confirmation"]],
+  );
+  assert.equal(ctx.historyKnown, false);
+  assert.match(warnings[0], /another writer committed or claimed it first/);
+});
+
+test("a record that already landed is not written twice", async () => {
+  const client = scriptedClient([hit(0), acquired()], {
+    recordLease: () => ({ status: CacheStatus.HIT }),
+  });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    await placeOrder({ orderId: "4417" });
+    await sendConfirmation({ orderId: "4417" });
+  });
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [[2, "send_confirmation"]],
+  );
+  assert.equal(ctx.historyKnown, true);
+});
+
+test("a record waits out its own earlier lease", async () => {
+  const answers = [{ status: CacheStatus.IN_PROGRESS, retryAfterMs: 1n }];
+  const client = scriptedClient([hit(0), acquired()], {
+    recordLease: () =>
+      answers.shift() ?? { status: CacheStatus.ACQUIRED, fencingToken: 99n, heartbeatIntervalMs: 60_000n },
+  });
+  await runWithContext(session(client), async () => {
+    await placeOrder({ orderId: "4417" });
+    await sendConfirmation({ orderId: "4417" });
+  });
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [
+      [1, "place_order"],
+      [2, "send_confirmation"],
+    ],
+  );
+});
