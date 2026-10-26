@@ -1426,3 +1426,261 @@ def test_deferring_a_record_never_moves_the_counter(
     ctx.sequence = 5
     ctx.defer_hit_record(3, "place_order", {"result": "ORD-1"}, None)
     assert ctx.sequence == 5
+
+
+# --- Calls in flight together ------------------------------------------------
+#
+# A hit is recorded only while it is the only call in flight. With overlap, the
+# run behaves as it did before hits were recorded: it adopts the position the
+# engine reported, and the next call claims from there.
+
+
+def _sent(mock_stub: MagicMock) -> List[Tuple[int, str, bool]]:
+    """Every commit as (position, step name, whether it carried a lease key)."""
+    reqs = [c[0][0] for c in mock_stub.CommitStep.call_args_list]
+    return [
+        (r.step_result.sequence, r.step_result.name, r.HasField("idempotency_key"))
+        for r in reqs
+    ]
+
+
+def _accept_commits(mock_stub: MagicMock) -> None:
+    mock_stub.CommitStep.side_effect = (
+        lambda req, **_: service_pb2.CommitStepResponse(
+            session_id=req.session_id, next_sequence=req.step_result.sequence + 1
+        )
+    )
+
+
+def test_two_hits_in_flight_together_record_nothing(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """Two hits answered while both are in flight both report the session at 0.
+    Neither is recorded, and the next call claims position 1, the session's real
+    next position. Recording one of them moved the counter past it."""
+    import threading
+    import time
+
+    from cellaflow import durable_tools
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-two-hits", version="1.0.0", is_recovered=False
+    )
+    both_in_flight = threading.Barrier(2)
+    hits_left = [2]
+    hits_lock = threading.Lock()
+
+    def check(req: Any, **_: Any) -> Any:
+        with hits_lock:
+            hits_left[0] -= 1
+            if hits_left[0] < 0:
+                return _acquired()
+        both_in_flight.wait(timeout=5)
+        if req.sequence == 2:
+            time.sleep(0.2)  # the first hit is decided first
+        return _hit(0)
+
+    mock_stub.CheckIdempotencyCache.side_effect = check
+    _accept_commits(mock_stub)
+
+    @tool
+    def first() -> str:
+        raise AssertionError("a cache hit must not execute")
+
+    @tool
+    def second() -> str:
+        raise AssertionError("a cache hit must not execute")
+
+    @tool
+    def mine() -> str:
+        return "mine"
+
+    with durable_tools({"configurable": {"thread_id": "t-two-hits"}}):
+        threads = [threading.Thread(target=first), threading.Thread(target=second)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert mine() == "mine"
+
+    assert _sent(mock_stub) == [(1, "mine", True)]
+
+
+def test_a_hit_while_another_call_runs_is_not_recorded(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The other call may commit before or after the hit's position, so the hit
+    cannot know the position is still free. It records nothing and stops the run
+    recording later hits."""
+    import asyncio
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-overlap", version="1.0.0", is_recovered=False
+    )
+    mock_stub.CheckIdempotencyCache.side_effect = [_acquired(), _hit(0), _hit(1)]
+    _accept_commits(mock_stub)
+    hit_answered = asyncio.Event()
+
+    @step
+    async def slow() -> str:
+        await hit_answered.wait()
+        return "slow"
+
+    @step
+    async def place_order() -> str:
+        raise AssertionError("a cache hit must not execute")
+
+    @step
+    async def send_receipt() -> str:
+        raise AssertionError("a cache hit must not execute")
+
+    @workflow(version="1.0.0")
+    async def wf() -> List[str]:
+        async def order_then_release() -> str:
+            result: str = await place_order()
+            hit_answered.set()
+            return result
+
+        results = list(await asyncio.gather(slow(), order_then_release()))
+        # Alone now, but the run no longer knows what the session holds.
+        results.append(await send_receipt())
+        return results
+
+    assert asyncio.run(wf()) == ["slow", "from-elsewhere", "from-elsewhere"]
+    assert _sent(mock_stub) == [(1, "slow", True)]
+
+
+def test_a_recorded_hit_is_written_once_before_concurrent_calls_claim(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """A hit recorded while alone is written by whichever call claims next, before
+    it claims. The calls after it take the following positions, once each."""
+    import asyncio
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-then-par", version="1.0.0", is_recovered=False
+    )
+    mock_stub.CheckIdempotencyCache.side_effect = [_hit(0), _acquired(), _acquired()]
+    _accept_commits(mock_stub)
+
+    @step
+    async def place_order() -> str:
+        raise AssertionError("a cache hit must not execute")
+
+    @step
+    async def a() -> str:
+        await asyncio.sleep(0)
+        return "a"
+
+    @step
+    async def b() -> str:
+        return "b"
+
+    @workflow(version="1.0.0")
+    async def wf() -> List[str]:
+        await place_order()
+        return list(await asyncio.gather(a(), b()))
+
+    assert asyncio.run(wf()) == ["a", "b"]
+    sent = _sent(mock_stub)
+    assert sent[0] == (1, "place_order", False)
+    assert sorted(sent[1:]) == [(2, "a", True), (3, "b", True)]
+
+
+def test_threads_claim_distinct_consecutive_positions(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    import threading
+
+    from cellaflow.client import CellaflowClient
+    from cellaflow.context import WorkflowContext
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(), session_id="sess-threads", workflow_version="1.0.0"
+    )
+    start = threading.Barrier(16)
+    claimed: List[int] = []
+
+    def claim() -> None:
+        start.wait(timeout=5)
+        for _ in range(100):
+            claimed.append(ctx.begin_call())
+            ctx.end_call()
+
+    threads = [threading.Thread(target=claim) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(claimed) == list(range(1, 1601))
+    assert ctx._in_flight == 0
+
+
+def test_a_record_the_engine_refuses_is_dropped(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
+) -> None:
+    """Only failures that can pass on a retry keep the record. One the engine
+    will never accept would fail every later step of the session, so it is
+    dropped, the run continues from the session's real position, and says so."""
+    import grpc
+
+    class Refused(grpc.RpcError):  # type: ignore[misc]
+        def code(self) -> grpc.StatusCode:
+            return grpc.StatusCode.INVALID_ARGUMENT
+
+    from cellaflow.client import CellaflowClient
+    from cellaflow.context import WorkflowContext
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(), session_id="sess-refused", workflow_version="1.0.0"
+    )
+    ctx.sequence = 3
+    ctx.defer_hit_record(3, "place_order", {"result": "ORD-1"}, None)
+    mock_stub.CommitStep.side_effect = Refused()
+    mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(next_cursor="")
+
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert ctx.begin_call() == 3
+
+    # Only the tail from the record's position was read.
+    assert mock_stub.GetGraph.call_args[0][0].cursor == "3"
+    assert not ctx.history_known
+    assert "the engine refused it (INVALID_ARGUMENT)" in caplog.text
+
+
+def test_a_failed_position_read_keeps_the_record(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The session's position is read before anything changes, so a failed read
+    leaves the record in place for the next step to try again."""
+    import grpc
+
+    class Code(grpc.RpcError):  # type: ignore[misc]
+        def __init__(self, code: grpc.StatusCode) -> None:
+            self._code = code
+
+        def code(self) -> grpc.StatusCode:
+            return self._code
+
+    from cellaflow.client import CellaflowClient
+    from cellaflow.context import WorkflowContext
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(), session_id="sess-read", workflow_version="1.0.0"
+    )
+    ctx.sequence = 1
+    ctx.defer_hit_record(1, "place_order", {"result": "ORD-1"}, None)
+    mock_stub.CommitStep.side_effect = [
+        Code(grpc.StatusCode.FAILED_PRECONDITION),
+        service_pb2.CommitStepResponse(session_id="sess-read", next_sequence=2),
+    ]
+    mock_stub.GetGraph.side_effect = Code(grpc.StatusCode.UNAVAILABLE)
+
+    with pytest.raises(grpc.RpcError):
+        ctx.begin_call()
+    assert ctx.sequence == 1 and ctx.history_known and ctx._in_flight == 0
+
+    assert ctx.begin_call() == 2
+    sent = _sent(mock_stub)
+    assert sent == [(1, "place_order", False)] * 2

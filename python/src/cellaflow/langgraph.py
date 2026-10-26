@@ -37,6 +37,7 @@ from typing import (
 
 import grpc
 from cellaflow.client import CellaflowClient
+from cellaflow.history import iter_session_steps, latest_session_sequence
 from cellaflow.v1 import common_pb2
 
 logger = logging.getLogger(__name__)
@@ -202,52 +203,14 @@ class CellaflowSaver(_BaseSaver):
         self._session_started: Set[str] = set()
 
     def _iter_steps(self, session_id: str) -> Iterator[Dict[str, Any]]:
-        """Yields every step of a session, following the engine's page cursor.
-
-        `get_graph` returns a bounded page and a cursor for the rest, so a single
-        call sees only the beginning of a long thread. The cursor it returns is
-        the sequence of the first unread record and is inclusive, so passing it
-        straight back resumes exactly where the previous page stopped.
-
-        Yields rather than returning a list because the two sequence callers want
-        only the highest sequence and have no reason to hold the whole thread in
-        memory to find it.
-
-        A thread the engine has never seen answers NOT_FOUND rather than an empty
-        page, and that is a real answer: it means no history, which is what every
-        first run looks like. Every *other* failure means the history could not be
-        read, which is a different thing entirely and is allowed to propagate.
-        Treating it as no history would start a run with history over from the
-        beginning.
-        """
-        cursor: Optional[str] = None
-        yielded = False
-        while True:
-            try:
-                steps, cursor = self.client.get_graph(
-                    session_id=session_id, cursor=cursor
-                )
-            except grpc.RpcError as exc:
-                # NOT_FOUND partway through means the session went away while we
-                # were reading it, which is a failure rather than an empty thread.
-                if exc.code() == grpc.StatusCode.NOT_FOUND and not yielded:
-                    return
-                raise
-
-            for step in steps:
-                yielded = True
-                yield step
-            if not cursor:
-                return
+        """Yields every step of a session. A thread the engine has never seen
+        yields nothing; any other read failure propagates. See
+        `history.iter_session_steps`."""
+        return iter_session_steps(self.client, session_id)
 
     def _latest_sequence(self, session_id: str) -> int:
         """The session's highest committed sequence, or 0 if it has none."""
-        latest = 0
-        for step in self._iter_steps(session_id):
-            seq = cast(int, step.get("sequence", 0))
-            if seq > latest:
-                latest = seq
-        return latest
+        return latest_session_sequence(self.client, session_id)
 
     def _ensure_session_and_sequence(self, session_id: str) -> int:
         """

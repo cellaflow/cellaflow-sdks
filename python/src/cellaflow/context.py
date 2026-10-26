@@ -9,9 +9,21 @@ import threading
 import grpc
 
 from cellaflow.client import CellaflowClient
+from cellaflow.history import latest_session_sequence
 from cellaflow.v1 import common_pb2, service_pb2
 
 logger = logging.getLogger(__name__)
+
+#: Failures writing a hit's record that may succeed if sent again. The record is
+#: kept for the next step to retry; any other failure drops it.
+_RETRYABLE_CODES = frozenset(
+    {
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.DEADLINE_EXCEEDED,
+        grpc.StatusCode.ABORTED,
+        grpc.StatusCode.RESOURCE_EXHAUSTED,
+    }
+)
 
 
 @dataclass
@@ -43,6 +55,61 @@ class WorkflowContext:
     # A cache hit's result, waiting to be recorded at its position in this
     # session. Written when the next step starts. See `defer_hit_record`.
     _pending_hit: Optional[Dict[str, Any]] = None
+    # Steps of this session that have claimed a position and not yet returned.
+    # Calls in one session can overlap: asyncio tasks, or a framework running
+    # tools on a thread pool. See `take_hit`.
+    _in_flight: int = 0
+    # Guards the position counter, the reported position, the pending record and
+    # the in-flight count, which every call in the session reads and writes, on
+    # whichever thread it runs.
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+
+    def begin_call(self) -> int:
+        """Counts a step as in flight and claims the next position for it.
+
+        One locked step, so calls on different threads never claim the same
+        position, and a pending record is always written before any later
+        position is claimed. Every call to this is paired with `end_call`.
+        """
+        with self._lock:
+            self.reconcile_sequence()
+            self.sequence += 1
+            self._in_flight += 1
+            return self.sequence
+
+    def end_call(self) -> None:
+        """Marks a step claimed by `begin_call` as returned."""
+        with self._lock:
+            self._in_flight -= 1
+
+    def take_hit(
+        self,
+        sequence: int,
+        name: str,
+        payload: Dict[str, Any],
+        reported: int,
+        coordination_id: Optional[str],
+    ) -> None:
+        """Decides what a cache hit at `sequence` leaves in this session.
+
+        The hit is recorded at its position only when nothing else could have
+        moved the session meanwhile: it is the only call in flight, the run knows
+        everything the session holds, and the engine reports the session exactly
+        one position behind it. Otherwise the run adopts the position the engine
+        reported and stops recording hits: a peer in this session already wrote
+        it, the run is resuming into history it did not replay, or other calls in
+        flight may commit in any order.
+        """
+        with self._lock:
+            behind_by_one = reported == sequence - 1
+            if self._in_flight == 1 and self.history_known and behind_by_one:
+                self.defer_hit_record(sequence, name, payload, coordination_id)
+                return
+            # The run can no longer tell what the session holds.
+            self.history_known = False
+            self.record_engine_sequence(reported)
 
     def record_engine_sequence(self, sequence: int) -> None:
         """Notes the session position the engine reported alongside a cache hit.
@@ -114,25 +181,41 @@ class WorkflowContext:
                     coordination_id=pending["coordination_id"],
                 )
             except grpc.RpcError as exc:
-                if exc.code() != grpc.StatusCode.FAILED_PRECONDITION:
+                if exc.code() in _RETRYABLE_CODES:
                     # Kept, so the step that hit this is retried with it. If the
                     # write did land, the engine takes an identical re-send at the
                     # same position as a retry.
                     raise
-                # Another writer in this session took the position first. The run
-                # no longer knows what the session holds: it stops recording hits
-                # and continues from the session's real position.
+                # The record will not be accepted: another writer in this session
+                # took the position first, or the engine refused the write itself.
+                # Read where the session is before changing anything, so a failed
+                # read leaves the record to be tried again.
+                position = max(
+                    pending["sequence"] - 1,
+                    latest_session_sequence(
+                        self.client,
+                        self.session_id,
+                        from_sequence=pending["sequence"],
+                        limit=1000,
+                    ),
+                )
+                # The run no longer knows what the session holds: it stops
+                # recording hits and continues from the session's real position.
                 self._pending_hit = None
                 self.history_known = False
-                self.sequence = self._engine_position()
+                self.sequence = position
+                if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
+                    reason = "another writer committed there first"
+                else:
+                    reason = f"the engine refused it ({exc.code().name})"
                 logger.warning(
                     "Cellaflow: the result of %r was not recorded at position %d "
-                    "of session %s, because another writer committed there first. "
-                    "Continuing from position %d. A later resume of this session "
-                    "may not replay that step.",
+                    "of session %s, because %s. Continuing from position %d. A "
+                    "later resume of this session may not replay that step.",
                     pending["name"],
                     pending["sequence"],
                     self.session_id,
+                    reason,
                     self.sequence,
                 )
                 return
@@ -141,19 +224,6 @@ class WorkflowContext:
         if self._reported_sequence is not None:
             self.sequence = self._reported_sequence
             self._reported_sequence = None
-
-    def _engine_position(self) -> int:
-        """The session's highest committed position, read from its history."""
-        highest = 0
-        cursor: Optional[str] = None
-        while True:
-            steps, cursor = self.client.get_graph(
-                self.session_id, limit=1000, cursor=cursor
-            )
-            for record in steps:
-                highest = max(highest, int(record.get("sequence") or 0))
-            if not cursor:
-                return highest
 
     @contextlib.contextmanager
     def bind(self) -> Iterator["WorkflowContext"]:

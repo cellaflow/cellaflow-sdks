@@ -13,13 +13,20 @@ All notable changes to the CellaFlow Python SDK.
   recorded at its own position, as a plain step under the tool's name, when the next step starts.
   A workflow that ends on the shared step still makes no extra call.
 
-  Recording happens only while the run has accounted for everything the session holds. A
-  `durable_tools` thread that resumes, or a run that finds the session further along than it
-  counted, keeps the previous behaviour, so a resume never writes a second record of a step.
+  Recording happens only while the run has accounted for everything the session holds and no other
+  step of the session is in flight. A `durable_tools` thread that resumes, a run that finds the
+  session further along than it counted, and steps running concurrently in one session (on threads
+  or as `asyncio` tasks) keep the previous behaviour, so a resume never writes a second record of a
+  step.
 
-  If writing the record fails, it is kept and sent again before the next step claims a position.
-  If another writer in the session took the position first, the run logs a warning, stops
-  recording, and continues from the session's real position.
+  If writing the record fails with an error that may pass on a retry, it is kept and sent again
+  before the next step claims a position. If another writer in the session took the position first,
+  or the engine does not accept the record, the run logs a warning, stops recording, and continues
+  from the session's real position.
+
+- **Steps on several threads in one session claim distinct positions.** Claiming a position is now
+  a single locked step, so tools a framework runs on a thread pool inside one `durable_tools` block
+  never claim the same position.
 
 ## 0.8.0
 
