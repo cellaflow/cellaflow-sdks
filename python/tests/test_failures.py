@@ -227,7 +227,9 @@ def test_a_failure_while_another_call_runs_is_not_recorded(
     mock_stub: MagicMock, mock_client: None
 ) -> None:
     """The other call may commit before or after it, so its position cannot be
-    known to be the next one. Nothing is recorded, as before."""
+    known to be the next one. Nothing is recorded, as before. `slow` is released
+    only once `charge`'s failure has been handled, so it is in flight throughout,
+    whatever the event loop's scheduling."""
     _fresh(mock_stub, "sess-overlap")
     release = asyncio.Event()
 
@@ -238,19 +240,64 @@ def test_a_failure_while_another_call_runs_is_not_recorded(
 
     @step
     async def charge() -> str:
-        release.set()
         raise PaymentDeclined("insufficient funds")
 
     @workflow(version="1.0.0")
     async def checkout() -> List[Any]:
-        return list(
-            await asyncio.gather(slow(), charge(), return_exceptions=True)
-        )
+        async def charge_then_release() -> Any:
+            try:
+                return await charge()
+            except PaymentDeclined as e:
+                return e
+            finally:
+                release.set()
+
+        return list(await asyncio.gather(slow(), charge_then_release()))
 
     results = asyncio.run(checkout())
     assert results[0] == "slow"
     assert isinstance(results[1], PaymentDeclined)
     assert _commits(mock_stub) == [(1, "slow", SUCCESS)]
+
+
+def test_a_failure_after_the_other_call_finished_is_recorded(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """Once the other call has committed, the failed call's position is the next
+    one, so recording it there is safe."""
+    _fresh(mock_stub, "sess-after")
+    slow_done = asyncio.Event()
+
+    @step
+    async def slow() -> str:
+        return "slow"
+
+    @step
+    async def charge() -> str:
+        await slow_done.wait()
+        raise PaymentDeclined("insufficient funds")
+
+    @workflow(version="1.0.0")
+    async def checkout() -> str:
+        async def slow_then_signal() -> str:
+            try:
+                result: str = await slow()
+                return result
+            finally:
+                slow_done.set()
+
+        async def charge_caught() -> str:
+            try:
+                await charge()
+            except PaymentDeclined:
+                pass
+            return "fallback"
+
+        await asyncio.gather(slow_then_signal(), charge_caught())
+        return "done"
+
+    assert asyncio.run(checkout()) == "done"
+    assert _commits(mock_stub) == [(1, "slow", SUCCESS), (2, "charge", FAILED)]
 
 
 # --- Replay --------------------------------------------------------------------
