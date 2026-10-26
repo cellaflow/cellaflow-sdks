@@ -480,3 +480,21 @@ test("a record waits out its own earlier lease", async () => {
     ],
   );
 });
+
+test("a hit after a later call failed is not recorded", async () => {
+  // Call A claims 1 and waits. Call B claims 2, fails without committing and
+  // returns, so A is alone again when its hit arrives. A record at 1 would make
+  // the next call claim 3 while the session expects 2.
+  const client = scriptedClient([]);
+  const ctx = session(client);
+  const a = ctx.claimPosition();
+  ctx.claimPosition();
+  ctx.endCall(); // B failed and returned
+  ctx.takeHit(a, "place_order", { result: "ORD-1" }, 0);
+  ctx.endCall();
+
+  ctx.reconcileSequence();
+  assert.equal(ctx.recordingInFlight, false);
+  assert.equal(ctx.claimPosition(), 1);
+  assert.deepEqual(client.commits, []);
+});

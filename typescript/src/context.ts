@@ -140,9 +140,9 @@ export class WorkflowContext {
    * Decides what a cache hit at `sequence` leaves in this session.
    *
    * The hit is recorded at its position only when nothing else could have moved
-   * the session meanwhile: it is the only call in flight, the run knows
-   * everything the session holds, and the engine reports the session exactly one
-   * position behind it. Otherwise the run adopts the position the engine
+   * the session meanwhile: it is the only call in flight and no later position was
+   * claimed while it waited, the run knows everything the session holds, and the
+   * engine reports the session exactly one position behind it. Otherwise the run adopts the position the engine
    * reported and stops recording hits: a peer in this session already wrote it,
    * the run is resuming into history it did not see, or other calls in flight
    * may commit in any order.
@@ -156,7 +156,11 @@ export class WorkflowContext {
     agentId = "default",
     receivedKey = "",
   ): void {
-    if (this.inFlight === 1 && this.historyKnown && reported === sequence - 1) {
+    // No other call is in flight now, and none claimed a later position while this
+    // one waited: one that did and then failed without committing leaves the
+    // counter past `sequence`.
+    const alone = this.inFlight === 1 && this.sequence === sequence;
+    if (alone && this.historyKnown && reported === sequence - 1) {
       this.deferHitRecord(sequence, name, payload, coordinationId, agentId, receivedKey);
       return;
     }
