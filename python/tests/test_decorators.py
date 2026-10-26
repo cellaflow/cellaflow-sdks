@@ -561,6 +561,25 @@ def _hit_then_acquire(
     ]
 
 
+def _with_record_leases(answers: Any) -> Callable[..., Any]:
+    """Answers the scripted `answers` in order, and grants every record's lease.
+
+    A recorded hit is leased under its own key before it is committed, so it asks
+    the engine once more than the steps a test scripts."""
+    queue = list(answers)
+
+    def check(req: Any, **_: Any) -> Any:
+        if ":record:" in req.idempotency_key:
+            return idempotency_pb2.CheckCacheResponse(
+                status=idempotency_pb2.CACHE_STATUS_ACQUIRED,
+                fencing_token=999,
+                heartbeat_interval_ms=10000,
+            )
+        return queue.pop(0)
+
+    return check
+
+
 def _two_step_workflow() -> Any:
     @step
     def shared() -> str:
@@ -592,7 +611,9 @@ def test_records_a_cross_session_hit_at_its_position(
     mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
         session_id="sess-b", version="1.0.0", is_recovered=False
     )
-    mock_stub.CheckIdempotencyCache.side_effect = _hit_then_acquire(0)
+    mock_stub.CheckIdempotencyCache.side_effect = _with_record_leases(
+        _hit_then_acquire(0)
+    )
     mock_stub.CommitStep.return_value = service_pb2.CommitStepResponse(
         session_id="sess-b", next_sequence=2
     )
@@ -605,16 +626,18 @@ def test_records_a_cross_session_hit_at_its_position(
         (2, "local_followup"),
     ]
     recorded = commits[0]
-    # A plain step: the result, under the tool's name, with no lease behind it.
+    # The result, under the tool's name, committed through a lease on its own key
+    # so the engine arbitrates the position like any other step's.
     assert deserialize(recorded.step_result.output_payload) == {
         "result": "from-elsewhere"
     }
-    assert not recorded.step_result.HasField("idempotency_key")
-    assert not recorded.HasField("idempotency_fencing_token")
+    assert recorded.idempotency_key.startswith("sess-b:record:1:")
+    assert recorded.idempotency_fencing_token == 999
+    checks = [c[0][0] for c in mock_stub.CheckIdempotencyCache.call_args_list]
+    lease = next(c for c in checks if ":record:" in c.idempotency_key)
+    assert (lease.session_id, lease.sequence) == ("sess-b", 1)
     # And the engine must have been told which session was asking.
-    assert (
-        mock_stub.CheckIdempotencyCache.call_args_list[0][0][0].session_id == "sess-b"
-    )
+    assert checks[0].session_id == "sess-b"
 
 
 def test_preserves_sequence_after_same_session_hit(
@@ -722,7 +745,7 @@ def test_consecutive_cache_hits_reconcile_correctly(
         r.current_sequence = 0
         return r
 
-    mock_stub.CheckIdempotencyCache.side_effect = [
+    mock_stub.CheckIdempotencyCache.side_effect = _with_record_leases([
         hit("one"),
         hit("two"),
         hit("three"),
@@ -731,7 +754,7 @@ def test_consecutive_cache_hits_reconcile_correctly(
             fencing_token=456,
             heartbeat_interval_ms=10000,
         ),
-    ]
+    ])
     mock_stub.CommitStep.return_value = service_pb2.CommitStepResponse(
         session_id="sess-multi", next_sequence=2
     )
@@ -803,14 +826,14 @@ def test_reconciliation_does_not_disturb_replayed_steps(
         ),
     )
     hit.current_sequence = 1  # this session committed step 1 itself
-    mock_stub.CheckIdempotencyCache.side_effect = [
+    mock_stub.CheckIdempotencyCache.side_effect = _with_record_leases([
         hit,
         idempotency_pb2.CheckCacheResponse(
             status=idempotency_pb2.CACHE_STATUS_ACQUIRED,
             fencing_token=456,
             heartbeat_interval_ms=10000,
         ),
-    ]
+    ])
     mock_stub.CommitStep.return_value = service_pb2.CommitStepResponse(
         session_id="sess-replay", next_sequence=3
     )
@@ -1294,7 +1317,9 @@ def test_a_position_taken_first_stops_recording_hits(
         session_id="sess-race", version="1.0.0", is_recovered=False
     )
     # place_order hits at 1; the record of it is refused; mine acquires at 2.
-    mock_stub.CheckIdempotencyCache.side_effect = [_hit(0), _acquired()]
+    mock_stub.CheckIdempotencyCache.side_effect = _with_record_leases(
+        [_hit(0), _acquired()]
+    )
     mock_stub.CommitStep.side_effect = [
         Taken(),
         service_pb2.CommitStepResponse(session_id="sess-race", next_sequence=4),
@@ -1560,7 +1585,9 @@ def test_a_recorded_hit_is_written_once_before_concurrent_calls_claim(
     mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
         session_id="sess-then-par", version="1.0.0", is_recovered=False
     )
-    mock_stub.CheckIdempotencyCache.side_effect = [_hit(0), _acquired(), _acquired()]
+    mock_stub.CheckIdempotencyCache.side_effect = _with_record_leases(
+        [_hit(0), _acquired(), _acquired()]
+    )
     _accept_commits(mock_stub)
 
     @step
@@ -1583,7 +1610,7 @@ def test_a_recorded_hit_is_written_once_before_concurrent_calls_claim(
 
     assert asyncio.run(wf()) == ["a", "b"]
     sent = _sent(mock_stub)
-    assert sent[0] == (1, "place_order", False)
+    assert sent[0] == (1, "place_order", True)
     assert sorted(sent[1:]) == [(2, "a", True), (3, "b", True)]
 
 
@@ -1686,7 +1713,7 @@ def test_a_failed_position_read_keeps_the_record(
 
     assert ctx.begin_call() == 2
     sent = _sent(mock_stub)
-    assert sent == [(1, "place_order", False)] * 2
+    assert sent == [(1, "place_order", True)] * 2
 
 
 def test_a_record_that_cannot_be_sent_is_dropped(
@@ -1806,5 +1833,109 @@ def test_a_record_the_engine_failed_to_store_is_kept(
         ctx.begin_call()
     assert ctx.history_known and ctx._in_flight == 0
     assert ctx.begin_call() == 2
-    assert _sent(mock_stub) == [(1, "place_order", False)] * 2
+    assert _sent(mock_stub) == [(1, "place_order", True)] * 2
     mock_stub.GetGraph.assert_not_called()
+
+
+# --- The record is leased ----------------------------------------------------
+
+
+def _ctx_with_record(session_id: str, sequence: int) -> Any:
+    from cellaflow.client import CellaflowClient
+    from cellaflow.context import WorkflowContext
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(),
+        session_id=session_id,
+        workflow_version="1.0.0",
+        history_known=True,
+    )
+    ctx.sequence = sequence
+    ctx.defer_hit_record(
+        sequence, "place_order", {"result": "ORD-1"}, None, "agent-1", "shared-key"
+    )
+    return ctx
+
+
+def test_a_record_is_refused_at_a_position_another_lease_claimed(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
+) -> None:
+    """A replica in the same session leased the position first and is running its
+    side effect. The record must not take the position, or that replica's commit
+    is refused after its side effect ran. The engine refuses the record's lease, so
+    nothing is committed, and the run continues from the session's position."""
+    import grpc
+
+    class Claimed(grpc.RpcError):  # type: ignore[misc]
+        def code(self) -> grpc.StatusCode:
+            return grpc.StatusCode.FAILED_PRECONDITION
+
+    ctx = _ctx_with_record("sess-replica", 3)
+    mock_stub.CheckIdempotencyCache.side_effect = Claimed()
+    mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(next_cursor="")
+
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert ctx.begin_call() == 3
+
+    mock_stub.CommitStep.assert_not_called()
+    lease = mock_stub.CheckIdempotencyCache.call_args[0][0]
+    assert (lease.session_id, lease.sequence, lease.agent_id) == (
+        "sess-replica",
+        3,
+        "agent-1",
+    )
+    assert not ctx.history_known
+    assert "another writer committed or claimed it first" in caplog.text
+
+
+def test_a_record_that_already_landed_is_not_written_twice(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """An earlier attempt wrote the record but its answer was lost. Sent again, the
+    record's own key is already complete, so it is not committed a second time."""
+    ctx = _ctx_with_record("sess-landed", 1)
+    mock_stub.CheckIdempotencyCache.return_value = idempotency_pb2.CheckCacheResponse(
+        status=idempotency_pb2.CACHE_STATUS_HIT
+    )
+
+    assert ctx.begin_call() == 2
+    mock_stub.CommitStep.assert_not_called()
+    assert ctx.history_known
+
+
+def test_a_record_whose_commit_fails_releases_its_lease(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """Holding the lease would make the next attempt wait for it to lapse."""
+    import grpc
+
+    class Unavailable(grpc.RpcError):  # type: ignore[misc]
+        def code(self) -> grpc.StatusCode:
+            return grpc.StatusCode.UNAVAILABLE
+
+    ctx = _ctx_with_record("sess-release", 1)
+    mock_stub.CommitStep.side_effect = Unavailable()
+
+    with pytest.raises(grpc.RpcError):
+        ctx.begin_call()
+
+    release = mock_stub.ReleaseLease.call_args[0][0]
+    assert release.idempotency_key.startswith("sess-release:record:1:")
+    assert release.fencing_token == 456
+
+
+def test_a_record_waits_out_its_own_earlier_lease(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """An earlier attempt's lease that was not released is waited out, then the
+    record is written."""
+    ctx = _ctx_with_record("sess-wait", 1)
+    mock_stub.CheckIdempotencyCache.side_effect = [
+        idempotency_pb2.CheckCacheResponse(
+            status=idempotency_pb2.CACHE_STATUS_IN_PROGRESS, retry_after_ms=1
+        ),
+        _acquired(),
+    ]
+
+    assert ctx.begin_call() == 2
+    assert _sent(mock_stub) == [(1, "place_order", True)]

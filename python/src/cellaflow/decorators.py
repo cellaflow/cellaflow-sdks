@@ -226,6 +226,8 @@ def _take_hit(
     seq: int,
     name: str,
     call_coordination: Optional[str],
+    agent_id: str,
+    ikey: str,
 ) -> Any:
     """Returns a cache hit's result and keeps this session's history in step.
 
@@ -238,7 +240,15 @@ def _take_hit(
         payload = deserialize(resp.cached_result.output_payload)
 
     if resp.HasField("current_sequence"):
-        ctx.take_hit(seq, name, payload, resp.current_sequence, call_coordination)
+        ctx.take_hit(
+            seq,
+            name,
+            payload,
+            resp.current_sequence,
+            call_coordination,
+            agent_id=agent_id,
+            received_key=ikey,
+        )
     return payload.get("result")
 
 
@@ -391,7 +401,13 @@ def step(
                     raise
                 if resp.status == CACHE_STATUS_HIT:
                     return _take_hit(
-                        ctx, resp, seq, actual_tool_name, call_coordination
+                        ctx,
+                        resp,
+                        seq,
+                        actual_tool_name,
+                        call_coordination,
+                        agent_id,
+                        ikey,
                     )
                 elif resp.status == CACHE_STATUS_IN_PROGRESS:
                     retry_ms = resp.retry_after_ms or 1000
@@ -520,7 +536,13 @@ def step(
                     raise
                 if resp.status == CACHE_STATUS_HIT:
                     return _take_hit(
-                        ctx, resp, seq, actual_tool_name, call_coordination
+                        ctx,
+                        resp,
+                        seq,
+                        actual_tool_name,
+                        call_coordination,
+                        agent_id,
+                        ikey,
                     )
                 elif resp.status == CACHE_STATUS_IN_PROGRESS:
                     retry_ms = resp.retry_after_ms or 1000

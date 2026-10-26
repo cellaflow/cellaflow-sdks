@@ -5,12 +5,14 @@ from typing import Any, Dict, List, Optional
 import contextvars
 import logging
 import threading
+import time
 
 import grpc
 
 from cellaflow.client import CellaflowClient
 from cellaflow.history import latest_session_sequence
-from cellaflow.v1 import common_pb2, service_pb2
+from cellaflow.idempotency import record_idempotency_key
+from cellaflow.v1 import common_pb2, idempotency_pb2, service_pb2
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +100,8 @@ class WorkflowContext:
         payload: Dict[str, Any],
         reported: int,
         coordination_id: Optional[str],
+        agent_id: str = "default",
+        received_key: str = "",
     ) -> None:
         """Decides what a cache hit at `sequence` leaves in this session.
 
@@ -112,7 +116,9 @@ class WorkflowContext:
         with self._lock:
             behind_by_one = reported == sequence - 1
             if self._in_flight == 1 and self.history_known and behind_by_one:
-                self.defer_hit_record(sequence, name, payload, coordination_id)
+                self.defer_hit_record(
+                    sequence, name, payload, coordination_id, agent_id, received_key
+                )
                 return
             # The run can no longer tell what the session holds.
             self.history_known = False
@@ -134,6 +140,8 @@ class WorkflowContext:
         name: str,
         payload: Dict[str, Any],
         coordination_id: Optional[str],
+        agent_id: str = "default",
+        received_key: str = "",
     ) -> None:
         """Holds a cache hit's result to be recorded at `sequence` in this session.
 
@@ -146,12 +154,18 @@ class WorkflowContext:
         Deferred to the next step, like `record_engine_sequence`: the record only
         matters once something would otherwise take its position, so a workflow
         that ends on a hit still does no extra work.
+
+        `received_key` is the idempotency key the hit answered, and `agent_id`
+        the agent that asked. The record is leased under its own key, derived
+        from both. See `record_idempotency_key`.
         """
         self._pending_hit = {
             "sequence": sequence,
             "name": name,
             "payload": payload,
             "coordination_id": coordination_id,
+            "agent_id": agent_id,
+            "received_key": received_key,
         }
 
     def reconcile_sequence(self) -> None:
@@ -179,20 +193,12 @@ class WorkflowContext:
         pending = self._pending_hit
         if pending is not None:
             try:
-                self.client.commit_step(
-                    session_id=self.session_id,
-                    sequence=pending["sequence"],
-                    name=pending["name"],
-                    status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
-                    output_payload=pending["payload"],
-                    coordination_id=pending["coordination_id"],
-                )
+                self._write_record(pending)
             except Exception as exc:
                 code = exc.code() if isinstance(exc, grpc.RpcError) else None
                 if code in _RETRYABLE_CODES:
                     # Kept, so the step that hit this is retried with it. If the
-                    # write did land, the engine takes an identical re-send at the
-                    # same position as a retry.
+                    # write did land, sending it again finds its completed entry.
                     raise
                 # The record will not be accepted: another writer in this session
                 # took the position first, the engine refused the write itself, or
@@ -214,7 +220,7 @@ class WorkflowContext:
                 self.history_known = False
                 self.sequence = position
                 if code == grpc.StatusCode.FAILED_PRECONDITION:
-                    reason = "another writer committed there first"
+                    reason = "another writer committed or claimed it first"
                 elif code is not None:
                     reason = f"the engine refused it ({code.name})"
                 else:
@@ -235,6 +241,65 @@ class WorkflowContext:
         if self._reported_sequence is not None:
             self.sequence = self._reported_sequence
             self._reported_sequence = None
+
+    def _write_record(self, pending: Dict[str, Any]) -> None:
+        """Records a received result at its position, through a lease.
+
+        A plain commit is checked only for order, not against the positions that
+        leases have claimed. A replica in this session holding a lease at the same
+        position would then have its commit refused after its side effect ran,
+        losing the record that it did. Leasing the record makes the engine decide:
+        it refuses the record at a position another lease has claimed, or refuses
+        the later lease before its side effect runs.
+        """
+        key = record_idempotency_key(
+            self.session_id, pending["sequence"], pending["received_key"]
+        )
+        agent_id = pending["agent_id"]
+        while True:
+            resp = self.client.check_idempotency_cache(
+                agent_id=agent_id,
+                idempotency_key=key,
+                session_id=self.session_id,
+                sequence=pending["sequence"],
+            )
+            if resp.status == idempotency_pb2.CACHE_STATUS_HIT:
+                # Written by an earlier attempt whose answer was lost.
+                return
+            if resp.status == idempotency_pb2.CACHE_STATUS_IN_PROGRESS:
+                # An earlier attempt's lease, not yet released or lapsed.
+                time.sleep((resp.retry_after_ms or 1000) / 1000.0)
+                continue
+            if resp.status != idempotency_pb2.CACHE_STATUS_ACQUIRED:
+                raise RuntimeError(
+                    f"unexpected cache status {resp.status} leasing the record"
+                )
+            break
+        token = resp.fencing_token or 0
+        try:
+            self.client.commit_step(
+                session_id=self.session_id,
+                sequence=pending["sequence"],
+                name=pending["name"],
+                status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+                output_payload=pending["payload"],
+                idempotency_key=key,
+                idempotency_fencing_token=token,
+                coordination_id=pending["coordination_id"],
+            )
+        except Exception:
+            try:
+                self.client.release_lease(
+                    agent_id=agent_id,
+                    idempotency_key=key,
+                    fencing_token=token,
+                    reason="TOOL_ERROR",
+                )
+            except Exception:
+                # The lease lapses on its own. Losing the release is not worth
+                # masking the error that caused it.
+                pass
+            raise
 
     @contextlib.contextmanager
     def bind(self) -> Iterator["WorkflowContext"]:

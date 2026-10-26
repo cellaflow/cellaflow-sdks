@@ -10,8 +10,9 @@ All notable changes to the CellaFlow Python SDK.
   answered from another session's result, nothing was recorded at its position in the receiving
   session, so the next step took that position. Resuming the session then found the next step where
   the shared one was expected and raised `NondeterministicWorkflowError`. The shared result is now
-  recorded at its own position, as a plain step under the tool's name, when the next step starts.
-  A workflow that ends on the shared step still makes no extra call.
+  recorded at its own position, under the tool's name, when the next step starts. It is leased
+  under its own key like any step, so the engine refuses it at a position another lease in the
+  session has claimed. A workflow that ends on the shared step still makes no extra call.
 
   Recording happens only while the run has accounted for everything the session holds and no other
   step of the session is in flight. A `durable_tools` thread that resumes, a run that finds the
