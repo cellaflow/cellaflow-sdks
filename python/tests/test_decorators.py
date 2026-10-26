@@ -1771,3 +1771,40 @@ def test_a_resumed_workflow_replays_every_page_of_history(
 
     assert wf(_session_id="sess-long") == list(range(1, 251))  # type: ignore[call-arg]
     mock_stub.CommitStep.assert_not_called()
+
+
+@pytest.mark.parametrize("code", ["INTERNAL", "CANCELLED"])
+def test_a_record_the_engine_failed_to_store_is_kept(
+    mock_stub: MagicMock, mock_client: None, code: str
+) -> None:
+    """INTERNAL is how the engine reports a storage write that failed, and CANCELLED
+    a call that was abandoned. Neither is a refusal, so the record is kept and sent
+    again rather than dropped."""
+    import grpc
+
+    class Failed(grpc.RpcError):  # type: ignore[misc]
+        def code(self) -> grpc.StatusCode:
+            return getattr(grpc.StatusCode, code)
+
+    from cellaflow.client import CellaflowClient
+    from cellaflow.context import WorkflowContext
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(),
+        session_id="sess-internal",
+        workflow_version="1.0.0",
+        history_known=True,
+    )
+    ctx.sequence = 1
+    ctx.defer_hit_record(1, "place_order", {"result": "ORD-1"}, None)
+    mock_stub.CommitStep.side_effect = [
+        Failed(),
+        service_pb2.CommitStepResponse(session_id="sess-internal", next_sequence=2),
+    ]
+
+    with pytest.raises(grpc.RpcError):
+        ctx.begin_call()
+    assert ctx.history_known and ctx._in_flight == 0
+    assert ctx.begin_call() == 2
+    assert _sent(mock_stub) == [(1, "place_order", False)] * 2
+    mock_stub.GetGraph.assert_not_called()

@@ -15,13 +15,17 @@ from cellaflow.v1 import common_pb2, service_pb2
 logger = logging.getLogger(__name__)
 
 #: Failures writing a hit's record that may succeed if sent again. The record is
-#: kept for the next step to retry; any other failure drops it.
+#: kept for the next step to retry; any other failure drops it. INTERNAL is how
+#: the engine reports a failed storage write, which it does not retry itself, and
+#: CANCELLED is the call being abandoned rather than refused.
 _RETRYABLE_CODES = frozenset(
     {
         grpc.StatusCode.UNAVAILABLE,
         grpc.StatusCode.DEADLINE_EXCEEDED,
         grpc.StatusCode.ABORTED,
         grpc.StatusCode.RESOURCE_EXHAUSTED,
+        grpc.StatusCode.INTERNAL,
+        grpc.StatusCode.CANCELLED,
     }
 )
 
