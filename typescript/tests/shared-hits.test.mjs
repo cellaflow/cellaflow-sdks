@@ -462,32 +462,40 @@ test("a record that already landed is not written twice", async () => {
   assert.equal(ctx.historyKnown, true);
 });
 
-test("a record held by a live lease is dropped without waiting", async () => {
-  // Waiting would hold up every call in the session, which waits on the record
-  // before claiming. While that lease lives, its claim protects the position.
-  const client = scriptedClient([hit(0), acquired()], {
-    recordLease: () => ({ status: CacheStatus.IN_PROGRESS, retryAfterMs: 60_000n }),
+test("a record held by a live lease is waited out, and calls queue behind it", async () => {
+  // An earlier attempt's lease, or a replica writing the same record, commits or
+  // lapses. The wait is an await, so the event loop stays free; this session's
+  // calls wait behind the record, and none claims a position ahead of it.
+  const answers = [
+    { status: CacheStatus.IN_PROGRESS, retryAfterMs: 20n },
+    { status: CacheStatus.IN_PROGRESS, retryAfterMs: 20n },
+  ];
+  const client = scriptedClient([hit(0), acquired(), acquired()], {
+    recordLease: () =>
+      answers.shift() ?? { status: CacheStatus.ACQUIRED, fencingToken: 99n, heartbeatIntervalMs: 60_000n },
   });
-  const ctx = session(client);
-  const warn = console.warn;
-  const warnings = [];
-  console.warn = (msg) => warnings.push(msg);
-  const started = Date.now();
+  const first = tool(async () => "a", { toolName: "first" });
+  const second = tool(async () => "b", { toolName: "second" });
+  let ticks = 0;
+  const ticker = setInterval(() => (ticks += 1), 5);
   try {
-    await runWithContext(ctx, async () => {
+    await runWithContext(session(client), async () => {
       await placeOrder({ orderId: "4417" });
-      await sendConfirmation({ orderId: "4417" });
+      await Promise.all([first(), second()]);
     });
   } finally {
-    console.warn = warn;
+    clearInterval(ticker);
   }
-  assert.ok(Date.now() - started < 5_000);
+  assert.ok(ticks >= 4, `the event loop ran ${ticks} ticks during the wait`);
   assert.deepEqual(
-    client.commits.map((c) => [c.sequence, c.name]),
-    [[1, "send_confirmation"]],
+    client.commits.map((c) => [c.sequence, c.name]).sort(),
+    [
+      [1, "place_order"],
+      [2, "first"],
+      [3, "second"],
+    ],
   );
-  assert.equal(ctx.historyKnown, false);
-  assert.match(warnings[0], /another writer committed or claimed it first/);
+  assert.equal(client.recordLeases.length, 3);
 });
 
 test("a deterministic Node error drops the record rather than retrying it forever", async () => {

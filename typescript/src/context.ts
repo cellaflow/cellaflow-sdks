@@ -23,13 +23,7 @@ interface PendingHit {
   receivedKey: string;
 }
 
-/** A live lease already holds a hit's record. See {@link WorkflowContext.writeRecord}. */
-class RecordHeldError extends Error {
-  constructor() {
-    super("a live lease holds this record");
-    this.name = "RecordHeldError";
-  }
-}
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * The session a tool call belongs to, plus the bookkeeping that keeps the local
@@ -254,7 +248,7 @@ export class WorkflowContext {
       if (this.pendingHit === pending) this.pendingHit = undefined;
       this.historyKnown = false;
       this.sequence = position;
-      const reason = isFailedPrecondition(err) || err instanceof RecordHeldError
+      const reason = isFailedPrecondition(err)
         ? "another writer committed or claimed it first"
         : hasStatusCode(err)
           ? `the engine refused it (${errorCode(err)})`
@@ -282,28 +276,32 @@ export class WorkflowContext {
    */
   private async writeRecord(pending: PendingHit): Promise<void> {
     const key = recordIdempotencyKey(this.sessionId, pending.sequence, pending.receivedKey);
-    const resp = await this.client.checkIdempotencyCache(
-      pending.agentId,
-      key,
-      undefined,
-      undefined,
-      this.sessionId,
-      pending.sequence,
-    );
-    // Written by an earlier attempt whose answer was lost.
-    if (resp.status === CacheStatus.HIT) return;
-    if (resp.status === CacheStatus.IN_PROGRESS) {
-      // A live lease on this record: an earlier attempt that could not release it,
-      // or a replica recording the same result. Not waited out, since every call
-      // in the session is waiting on this before it claims a position. The record
-      // is dropped instead. The position stays protected: while that lease lives,
-      // a call aimed at it is refused before running.
-      throw new RecordHeldError();
+    let token = 0;
+    for (;;) {
+      const resp = await this.client.checkIdempotencyCache(
+        pending.agentId,
+        key,
+        undefined,
+        undefined,
+        this.sessionId,
+        pending.sequence,
+      );
+      // Written by an earlier attempt whose answer was lost.
+      if (resp.status === CacheStatus.HIT) return;
+      if (resp.status === CacheStatus.IN_PROGRESS) {
+        // A live lease on this record: an earlier attempt that could not release
+        // it, or a replica writing the same record. It commits or lapses, so wait
+        // and ask again. The await leaves the event loop free; only this session's
+        // calls wait, behind the record, as they must.
+        await sleep(Number(resp.retryAfterMs ?? 1000n));
+        continue;
+      }
+      if (resp.status !== CacheStatus.ACQUIRED) {
+        throw new Error(`unexpected cache status ${resp.status} leasing the record`);
+      }
+      token = Number(resp.fencingToken ?? 0n);
+      break;
     }
-    if (resp.status !== CacheStatus.ACQUIRED) {
-      throw new Error(`unexpected cache status ${resp.status} leasing the record`);
-    }
-    const token = Number(resp.fencingToken ?? 0n);
     try {
       await this.client.commitStep(
         this.sessionId,
