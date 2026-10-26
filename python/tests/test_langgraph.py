@@ -1131,6 +1131,25 @@ def test_durable_tools_does_not_seed_positional_replay() -> None:
     )
 
 
+def test_a_resumed_durable_tools_thread_does_not_record_hits() -> None:
+    """A resumed thread re-runs only its pending node, so the run has not seen
+    what the session holds and must not record cache hits into it: a hit may be
+    a step the session already recorded. A fresh thread may."""
+    for recovered in (False, True):
+        client = LeasingMockClient()
+        session = tool_session_id(f"t-hits-{recovered}")
+        with patch("cellaflow.durable.CellaflowClient", return_value=client):
+            with patch.object(client, "start_session") as start:
+                start.return_value = MagicMock(
+                    session_id=session, version="1.0.0", is_recovered=recovered,
+                    coordination_id=None,
+                )
+                thread = f"t-hits-{recovered}"
+                cfg: RunnableConfig = {"configurable": {"thread_id": thread}}
+                with durable_tools(cfg) as ctx:
+                    assert ctx.history_known is (not recovered)
+
+
 def test_a_second_tool_node_resumes_at_its_own_identity() -> None:
     """The case the original crash test missed.
 

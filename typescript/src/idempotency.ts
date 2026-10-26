@@ -175,3 +175,23 @@ export function deriveIdempotencyKey(opts: DeriveKeyOptions): string {
 
   return `${sessionId}:${workflowVersion}:${seqPart}:${agentPart}:${toolName}:${inputsHash}`;
 }
+
+/**
+ * The key a session records a result it received under, at `sequence`.
+ *
+ * The record is leased like any step, so the engine arbitrates its position: a
+ * record is refused at a position another lease has claimed, and a later lease is
+ * refused at a position the record holds. The key names the session and the
+ * position, so each session records its own copy, and the received result's key,
+ * so two different results contending for one position are told apart. The same
+ * record sent again finds its own completed entry. Matches the Python SDK, so
+ * either can find the other's record.
+ */
+export function recordIdempotencyKey(
+  sessionId: string,
+  sequence: number,
+  receivedKey: string,
+): string {
+  const digest = createHash("sha256").update(receivedKey, "utf8").digest("hex");
+  return `${sessionId}:record:${sequence}:${digest}`;
+}

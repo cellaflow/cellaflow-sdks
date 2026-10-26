@@ -16,6 +16,7 @@ from cellaflow.context import (
     get_context,
     session_coordination_id,
 )
+from cellaflow.history import iter_session_steps
 from cellaflow.idempotency import (
     derive_idempotency_key,
     normalize_coordination_id,
@@ -59,7 +60,12 @@ def workflow(
 
             replayed_steps = {}
             if resp.is_recovered:
-                steps, _ = client.get_graph(resp.session_id)
+                # Every page: a step left out would run again instead of
+                # replaying. The engine just reported the session as recovered, so
+                # NOT_FOUND here is a failure, not an empty history.
+                steps = iter_session_steps(
+                    client, resp.session_id, limit=1000, missing_ok=False
+                )
                 for step_info in steps:
                     # Keep the name, not just the payload. Replay is
                     # keyed on position, and without the name there is no way to
@@ -77,6 +83,9 @@ def workflow(
                 sequence=0,
                 replayed_steps=replayed_steps,
                 coordination_id=session_coordination_id(resp, coordination_id),
+                # A fresh session holds nothing, and a recovered one is replayed
+                # from the start, so the run accounts for every position.
+                history_known=True,
             )
             token = set_context(ctx)
             try:
@@ -103,7 +112,12 @@ def workflow(
 
             replayed_steps = {}
             if resp.is_recovered:
-                steps, _ = client.get_graph(resp.session_id)
+                # Every page: a step left out would run again instead of
+                # replaying. The engine just reported the session as recovered, so
+                # NOT_FOUND here is a failure, not an empty history.
+                steps = iter_session_steps(
+                    client, resp.session_id, limit=1000, missing_ok=False
+                )
                 for step_info in steps:
                     # Keep the name, not just the payload. Replay is
                     # keyed on position, and without the name there is no way to
@@ -121,6 +135,9 @@ def workflow(
                 sequence=0,
                 replayed_steps=replayed_steps,
                 coordination_id=session_coordination_id(resp, coordination_id),
+                # A fresh session holds nothing, and a recovered one is replayed
+                # from the start, so the run accounts for every position.
+                history_known=True,
             )
             token = set_context(ctx)
             try:
@@ -136,17 +153,17 @@ def workflow(
 
 
 class DivergentStepError(RuntimeError):
-    """Raised when the engine refuses a lease because the position is committed.
+    """Raised when the engine refuses a lease because its position is taken.
 
     Two replicas of one agent reached the same step with *different* arguments.
     Different arguments hash to different idempotency keys, so from the engine's
-    view these are unrelated operations and neither blocks the other — the
+    view these are unrelated operations and neither blocks the other. The
     divergence is only detectable against the graph position they both target.
 
-    The first replica committed there. This one is refused *before* running its
-    tool body, so only one replica reaches the side effect.
-    was only rejected at commit time, after the irreversible action had already
-    happened.
+    Another writer holds that position: it committed there, or holds a live lease
+    that claimed it. This call is refused *before* running its tool body, so only
+    one replica reaches the side effect. Without the claim, the refusal came only
+    at commit time, after the irreversible action had already happened.
 
     The fix is in the workflow, not the call: whatever the replicas disagreed
     about must itself be a leased step, so they converge on one value before
@@ -206,6 +223,38 @@ def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
     payload = recorded.get("payload")
     if payload is None:
         return None
+    return payload.get("result")
+
+
+def _take_hit(
+    ctx: WorkflowContext,
+    resp: Any,
+    seq: int,
+    name: str,
+    call_coordination: Optional[str],
+    agent_id: str,
+    ikey: str,
+) -> Any:
+    """Returns a cache hit's result and keeps this session's history in step.
+
+    A hit returns without executing. When nothing is recorded at `seq` yet, the
+    result is recorded there before the next step runs, so a resumed session
+    replays it like any other step. `WorkflowContext.take_hit` decides which.
+    """
+    payload: Dict[str, Any] = {"result": None}
+    if resp.cached_result and resp.cached_result.output_payload:
+        payload = deserialize(resp.cached_result.output_payload)
+
+    if resp.HasField("current_sequence"):
+        ctx.take_hit(
+            seq,
+            name,
+            payload,
+            resp.current_sequence,
+            call_coordination,
+            agent_id=agent_id,
+            received_key=ikey,
+        )
     return payload.get("result")
 
 
@@ -293,130 +342,131 @@ def step(
         # deduplicated under the same domain it is recorded under.
         call_coordination = _pop_call_coordination(kwargs)
         coordination_id = call_coordination or ctx.coordination_id
-        # A cache hit may have left this counter ahead of the
-        # engine's. Adopt the position it reported before claiming the next
-        # sequence, or this commit fails the ordering check and names the wrong
-        # step. Deferred to here rather than done on the hit itself so a workflow
-        # that ends on a hit does no extra work.
-        ctx.reconcile_sequence()
-        ctx.sequence += 1
-        seq = ctx.sequence
-
-        if seq in ctx.replayed_steps:
-            return _replay(ctx, seq, actual_tool_name)
-
-        # Derive idempotency key
-        ikey = idempotency_key
-        if not ikey:
-            if shared_on is not None:
-                # Bind first: the caller may have passed the identifying
-                # arguments positionally, and only names can select them.
-                bound = inspect.signature(func).bind_partial(*args, **kwargs)
-                bound.apply_defaults()
-                ikey = derive_idempotency_key(
-                    ctx.session_id,
-                    ctx.workflow_version,
-                    seq,
-                    agent_id,
-                    actual_tool_name,
-                    scope,
-                    coordination_id,
-                    _shared_on=shared_on,
-                    **bound.arguments,
-                )
-            else:
-                ikey = derive_idempotency_key(
-                    ctx.session_id,
-                    ctx.workflow_version,
-                    seq,
-                    agent_id,
-                    actual_tool_name,
-                    scope,
-                    coordination_id,
-                    *args,
-                    **kwargs,
-                )
-
-        fencing_token = 0
-        hb: Optional[LeaseHeartbeat] = None
-
-        while True:
-            try:
-                resp = ctx.client.check_idempotency_cache(
-                    agent_id=agent_id,
-                    idempotency_key=ikey,
-                    session_id=ctx.session_id,
-                    # Tell the engine where this call intends to write,
-                    # so a lease at an already-committed position is refused
-                    # before the tool body runs rather than after.
-                    sequence=seq,
-                )
-            except grpc.RpcError as exc:
-                if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
-                    raise DivergentStepError(
-                        f"Step '{actual_tool_name}' at sequence {seq} was refused: "
-                        f"{exc.details()}"
-                    ) from exc
-                raise
-            if resp.status == CACHE_STATUS_HIT:
-                # This path returns without committing, so record where
-                # the engine says the session sits. The next step adopts it.
-                if resp.HasField("current_sequence"):
-                    ctx.record_engine_sequence(resp.current_sequence)
-                if resp.cached_result and resp.cached_result.output_payload:
-                    deserialized = deserialize(resp.cached_result.output_payload)
-                    return deserialized.get("result")
-                return None
-            elif resp.status == CACHE_STATUS_IN_PROGRESS:
-                retry_ms = resp.retry_after_ms or 1000
-                logger.info(
-                    "Step %s is in progress by another worker. Sleeping %d ms...",
-                    actual_tool_name,
-                    retry_ms,
-                )
-                await asyncio.sleep(retry_ms / 1000.0)
-            elif resp.status == CACHE_STATUS_ACQUIRED:
-                fencing_token = resp.fencing_token or 0
-                interval_ms = resp.heartbeat_interval_ms or 5000
-                hb = LeaseHeartbeat(
-                    client=ctx.client,
-                    agent_id=agent_id,
-                    idempotency_key=ikey,
-                    fencing_token=fencing_token,
-                    heartbeat_interval_ms=interval_ms,
-                )
-                hb.start_async()
-                break
-            else:
-                break
-
+        # A cache hit may have left this counter ahead of the engine's, or left
+        # a result to record at its position. Both are settled before claiming
+        # the next sequence, or this commit fails the ordering check and names
+        # the wrong step. Deferred to here rather than done on the hit itself so
+        # a workflow that ends on a hit does no extra work.
+        seq = await ctx.begin_call_async()
         try:
-            result = await func(*args, **kwargs)
-            ctx.client.commit_step(
-                session_id=ctx.session_id,
-                sequence=seq,
-                name=actual_tool_name,
-                status=STEP_STATUS_SUCCESS,
-                output_payload={"result": result},
-                idempotency_key=ikey,
-                idempotency_fencing_token=fencing_token,
-                # Omitted when the call names none, so the engine records the
-                # session's default.
-                coordination_id=call_coordination,
-            )
-            return result
-        except Exception as e:
-            if fencing_token > 0:
-                ctx.client.release_lease(
-                    agent_id=agent_id,
+            if seq in ctx.replayed_steps:
+                return _replay(ctx, seq, actual_tool_name)
+
+            # Derive idempotency key
+            ikey = idempotency_key
+            if not ikey:
+                if shared_on is not None:
+                    # Bind first: the caller may have passed the identifying
+                    # arguments positionally, and only names can select them.
+                    bound = inspect.signature(func).bind_partial(*args, **kwargs)
+                    bound.apply_defaults()
+                    ikey = derive_idempotency_key(
+                        ctx.session_id,
+                        ctx.workflow_version,
+                        seq,
+                        agent_id,
+                        actual_tool_name,
+                        scope,
+                        coordination_id,
+                        _shared_on=shared_on,
+                        **bound.arguments,
+                    )
+                else:
+                    ikey = derive_idempotency_key(
+                        ctx.session_id,
+                        ctx.workflow_version,
+                        seq,
+                        agent_id,
+                        actual_tool_name,
+                        scope,
+                        coordination_id,
+                        *args,
+                        **kwargs,
+                    )
+
+            fencing_token = 0
+            hb: Optional[LeaseHeartbeat] = None
+
+            while True:
+                try:
+                    resp = ctx.client.check_idempotency_cache(
+                        agent_id=agent_id,
+                        idempotency_key=ikey,
+                        session_id=ctx.session_id,
+                        # Tell the engine where this call intends to write,
+                        # so a lease at an already-committed position is refused
+                        # before the tool body runs rather than after.
+                        sequence=seq,
+                    )
+                except grpc.RpcError as exc:
+                    if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
+                        raise DivergentStepError(
+                            f"Step '{actual_tool_name}' at sequence {seq} was refused: "
+                            f"{exc.details()}"
+                        ) from exc
+                    raise
+                if resp.status == CACHE_STATUS_HIT:
+                    return _take_hit(
+                        ctx,
+                        resp,
+                        seq,
+                        actual_tool_name,
+                        call_coordination,
+                        agent_id,
+                        ikey,
+                    )
+                elif resp.status == CACHE_STATUS_IN_PROGRESS:
+                    retry_ms = resp.retry_after_ms or 1000
+                    logger.info(
+                        "Step %s is in progress by another worker. Sleeping %d ms...",
+                        actual_tool_name,
+                        retry_ms,
+                    )
+                    await asyncio.sleep(retry_ms / 1000.0)
+                elif resp.status == CACHE_STATUS_ACQUIRED:
+                    fencing_token = resp.fencing_token or 0
+                    interval_ms = resp.heartbeat_interval_ms or 5000
+                    hb = LeaseHeartbeat(
+                        client=ctx.client,
+                        agent_id=agent_id,
+                        idempotency_key=ikey,
+                        fencing_token=fencing_token,
+                        heartbeat_interval_ms=interval_ms,
+                    )
+                    hb.start_async()
+                    break
+                else:
+                    break
+
+            try:
+                result = await func(*args, **kwargs)
+                ctx.client.commit_step(
+                    session_id=ctx.session_id,
+                    sequence=seq,
+                    name=actual_tool_name,
+                    status=STEP_STATUS_SUCCESS,
+                    output_payload={"result": result},
                     idempotency_key=ikey,
-                    fencing_token=fencing_token,
-                    reason="TOOL_ERROR",
+                    idempotency_fencing_token=fencing_token,
+                    # Omitted when the call names none, so the engine records the
+                    # session's default.
+                    coordination_id=call_coordination,
                 )
-            raise e
+                return result
+            except Exception as e:
+                if fencing_token > 0:
+                    ctx.client.release_lease(
+                        agent_id=agent_id,
+                        idempotency_key=ikey,
+                        fencing_token=fencing_token,
+                        reason="TOOL_ERROR",
+                    )
+                raise e
+            finally:
+                if hb:
+                    await hb.stop_async()
         finally:
-            if hb:
-                await hb.stop_async()
+            ctx.end_call()
 
     @functools.wraps(func)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -427,130 +477,131 @@ def step(
         # deduplicated under the same domain it is recorded under.
         call_coordination = _pop_call_coordination(kwargs)
         coordination_id = call_coordination or ctx.coordination_id
-        # A cache hit may have left this counter ahead of the
-        # engine's. Adopt the position it reported before claiming the next
-        # sequence, or this commit fails the ordering check and names the wrong
-        # step. Deferred to here rather than done on the hit itself so a workflow
-        # that ends on a hit does no extra work.
-        ctx.reconcile_sequence()
-        ctx.sequence += 1
-        seq = ctx.sequence
-
-        if seq in ctx.replayed_steps:
-            return _replay(ctx, seq, actual_tool_name)
-
-        # Derive idempotency key
-        ikey = idempotency_key
-        if not ikey:
-            if shared_on is not None:
-                # Bind first: the caller may have passed the identifying
-                # arguments positionally, and only names can select them.
-                bound = inspect.signature(func).bind_partial(*args, **kwargs)
-                bound.apply_defaults()
-                ikey = derive_idempotency_key(
-                    ctx.session_id,
-                    ctx.workflow_version,
-                    seq,
-                    agent_id,
-                    actual_tool_name,
-                    scope,
-                    coordination_id,
-                    _shared_on=shared_on,
-                    **bound.arguments,
-                )
-            else:
-                ikey = derive_idempotency_key(
-                    ctx.session_id,
-                    ctx.workflow_version,
-                    seq,
-                    agent_id,
-                    actual_tool_name,
-                    scope,
-                    coordination_id,
-                    *args,
-                    **kwargs,
-                )
-
-        fencing_token = 0
-        hb: Optional[LeaseHeartbeat] = None
-
-        while True:
-            try:
-                resp = ctx.client.check_idempotency_cache(
-                    agent_id=agent_id,
-                    idempotency_key=ikey,
-                    session_id=ctx.session_id,
-                    # Tell the engine where this call intends to write,
-                    # so a lease at an already-committed position is refused
-                    # before the tool body runs rather than after.
-                    sequence=seq,
-                )
-            except grpc.RpcError as exc:
-                if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
-                    raise DivergentStepError(
-                        f"Step '{actual_tool_name}' at sequence {seq} was refused: "
-                        f"{exc.details()}"
-                    ) from exc
-                raise
-            if resp.status == CACHE_STATUS_HIT:
-                # This path returns without committing, so record where
-                # the engine says the session sits. The next step adopts it.
-                if resp.HasField("current_sequence"):
-                    ctx.record_engine_sequence(resp.current_sequence)
-                if resp.cached_result and resp.cached_result.output_payload:
-                    deserialized = deserialize(resp.cached_result.output_payload)
-                    return deserialized.get("result")
-                return None
-            elif resp.status == CACHE_STATUS_IN_PROGRESS:
-                retry_ms = resp.retry_after_ms or 1000
-                logger.info(
-                    "Step %s is in progress by another worker. Sleeping %d ms...",
-                    actual_tool_name,
-                    retry_ms,
-                )
-                time.sleep(retry_ms / 1000.0)
-            elif resp.status == CACHE_STATUS_ACQUIRED:
-                fencing_token = resp.fencing_token or 0
-                interval_ms = resp.heartbeat_interval_ms or 5000
-                hb = LeaseHeartbeat(
-                    client=ctx.client,
-                    agent_id=agent_id,
-                    idempotency_key=ikey,
-                    fencing_token=fencing_token,
-                    heartbeat_interval_ms=interval_ms,
-                )
-                hb.start_sync()
-                break
-            else:
-                break
-
+        # A cache hit may have left this counter ahead of the engine's, or left
+        # a result to record at its position. Both are settled before claiming
+        # the next sequence, or this commit fails the ordering check and names
+        # the wrong step. Deferred to here rather than done on the hit itself so
+        # a workflow that ends on a hit does no extra work.
+        seq = ctx.begin_call()
         try:
-            result = func(*args, **kwargs)
-            ctx.client.commit_step(
-                session_id=ctx.session_id,
-                sequence=seq,
-                name=actual_tool_name,
-                status=STEP_STATUS_SUCCESS,
-                output_payload={"result": result},
-                idempotency_key=ikey,
-                idempotency_fencing_token=fencing_token,
-                # Omitted when the call names none, so the engine records the
-                # session's default.
-                coordination_id=call_coordination,
-            )
-            return result
-        except Exception as e:
-            if fencing_token > 0:
-                ctx.client.release_lease(
-                    agent_id=agent_id,
+            if seq in ctx.replayed_steps:
+                return _replay(ctx, seq, actual_tool_name)
+
+            # Derive idempotency key
+            ikey = idempotency_key
+            if not ikey:
+                if shared_on is not None:
+                    # Bind first: the caller may have passed the identifying
+                    # arguments positionally, and only names can select them.
+                    bound = inspect.signature(func).bind_partial(*args, **kwargs)
+                    bound.apply_defaults()
+                    ikey = derive_idempotency_key(
+                        ctx.session_id,
+                        ctx.workflow_version,
+                        seq,
+                        agent_id,
+                        actual_tool_name,
+                        scope,
+                        coordination_id,
+                        _shared_on=shared_on,
+                        **bound.arguments,
+                    )
+                else:
+                    ikey = derive_idempotency_key(
+                        ctx.session_id,
+                        ctx.workflow_version,
+                        seq,
+                        agent_id,
+                        actual_tool_name,
+                        scope,
+                        coordination_id,
+                        *args,
+                        **kwargs,
+                    )
+
+            fencing_token = 0
+            hb: Optional[LeaseHeartbeat] = None
+
+            while True:
+                try:
+                    resp = ctx.client.check_idempotency_cache(
+                        agent_id=agent_id,
+                        idempotency_key=ikey,
+                        session_id=ctx.session_id,
+                        # Tell the engine where this call intends to write,
+                        # so a lease at an already-committed position is refused
+                        # before the tool body runs rather than after.
+                        sequence=seq,
+                    )
+                except grpc.RpcError as exc:
+                    if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
+                        raise DivergentStepError(
+                            f"Step '{actual_tool_name}' at sequence {seq} was refused: "
+                            f"{exc.details()}"
+                        ) from exc
+                    raise
+                if resp.status == CACHE_STATUS_HIT:
+                    return _take_hit(
+                        ctx,
+                        resp,
+                        seq,
+                        actual_tool_name,
+                        call_coordination,
+                        agent_id,
+                        ikey,
+                    )
+                elif resp.status == CACHE_STATUS_IN_PROGRESS:
+                    retry_ms = resp.retry_after_ms or 1000
+                    logger.info(
+                        "Step %s is in progress by another worker. Sleeping %d ms...",
+                        actual_tool_name,
+                        retry_ms,
+                    )
+                    time.sleep(retry_ms / 1000.0)
+                elif resp.status == CACHE_STATUS_ACQUIRED:
+                    fencing_token = resp.fencing_token or 0
+                    interval_ms = resp.heartbeat_interval_ms or 5000
+                    hb = LeaseHeartbeat(
+                        client=ctx.client,
+                        agent_id=agent_id,
+                        idempotency_key=ikey,
+                        fencing_token=fencing_token,
+                        heartbeat_interval_ms=interval_ms,
+                    )
+                    hb.start_sync()
+                    break
+                else:
+                    break
+
+            try:
+                result = func(*args, **kwargs)
+                ctx.client.commit_step(
+                    session_id=ctx.session_id,
+                    sequence=seq,
+                    name=actual_tool_name,
+                    status=STEP_STATUS_SUCCESS,
+                    output_payload={"result": result},
                     idempotency_key=ikey,
-                    fencing_token=fencing_token,
-                    reason="TOOL_ERROR",
+                    idempotency_fencing_token=fencing_token,
+                    # Omitted when the call names none, so the engine records the
+                    # session's default.
+                    coordination_id=call_coordination,
                 )
-            raise e
+                return result
+            except Exception as e:
+                if fencing_token > 0:
+                    ctx.client.release_lease(
+                        agent_id=agent_id,
+                        idempotency_key=ikey,
+                        fencing_token=fencing_token,
+                        reason="TOOL_ERROR",
+                    )
+                raise e
+            finally:
+                if hb:
+                    hb.stop_sync()
         finally:
-            if hb:
-                hb.stop_sync()
+            ctx.end_call()
 
     if inspect.iscoroutinefunction(func):
         return cast(F, async_wrapper)

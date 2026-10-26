@@ -2,6 +2,34 @@
 
 All notable changes to the CellaFlow Python SDK.
 
+## Unreleased
+
+### Fixed
+
+- **A session that received a shared result can be resumed.** When a `SCOPE_SHARED` step was
+  answered from another session's result, nothing was recorded at its position in the receiving
+  session, so the next step took that position. Resuming the session then found the next step where
+  the shared one was expected and raised `NondeterministicWorkflowError`. The shared result is now
+  recorded at its own position, under the tool's name, when the next step starts. It is leased
+  under its own key like any step, so the engine refuses it at a position another lease in the
+  session has claimed. A workflow that ends on the shared step still makes no extra call.
+
+  Recording happens only while the run has accounted for everything the session holds and no other
+  step of the session is in flight. A `durable_tools` thread that resumes, a run that finds the
+  session further along than it counted, and steps running concurrently in one session (on threads
+  or as `asyncio` tasks) keep the previous behaviour, so a resume never writes a second record of a
+  step.
+
+  If writing the record fails with an error that may pass on a retry, it is kept and sent again
+  before the next step claims a position. If another writer in the session committed or claimed the
+  position first, or the engine does not accept the record, the run logs a warning and records no
+  further received results for the rest of the run.
+
+- **A resumed `@workflow` reads its whole history, however long,** following the engine's pages.
+- **Steps on several threads in one session claim distinct positions.** Claiming a position is now
+  a single locked step, so tools a framework runs on a thread pool inside one `durable_tools` block
+  never claim the same position.
+
 ## 0.8.0
 
 ### Added & Changed

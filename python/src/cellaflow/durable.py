@@ -195,6 +195,9 @@ def durable_tools(
         workflow_version=resp.version,
         sequence=0,
         coordination_id=session_coordination_id(resp, coordination_id),
+        # A resumed thread re-runs only its pending node, so this run never sees
+        # what the session already holds, and must not record cache hits into it.
+        history_known=not resp.is_recovered,
     )
     # Registered as well as set: the ContextVar covers frameworks that dispatch
     # tools on the calling context, and the registry covers those that do not.
