@@ -1939,3 +1939,59 @@ def test_a_record_waits_out_its_own_earlier_lease(
 
     assert ctx.begin_call() == 2
     assert _sent(mock_stub) == [(1, "place_order", True)]
+
+
+def test_a_hit_after_a_later_call_failed_is_not_recorded(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """Call A claims 1 and waits. Call B claims 2, fails without committing and
+    returns, so A is alone again when its hit arrives. The counter is at 2, so a
+    record at 1 would make the next call claim 3 while the session expects 2. The
+    hit is not recorded, and the next call claims 1, as before hits were."""
+    from cellaflow.client import CellaflowClient
+    from cellaflow.context import WorkflowContext
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(),
+        session_id="sess-early-end",
+        workflow_version="1.0.0",
+        history_known=True,
+    )
+    a = ctx.begin_call()
+    ctx.begin_call()
+    ctx.end_call()  # B failed and returned
+    ctx.take_hit(a, "place_order", {"result": "ORD-1"}, 0, None)
+    ctx.end_call()
+
+    assert ctx.begin_call() == 1
+    mock_stub.CommitStep.assert_not_called()
+    mock_stub.CheckIdempotencyCache.assert_not_called()
+
+
+def test_a_recovered_workflow_whose_history_is_gone_fails(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The engine reported the session as recovered, so a history that then reads
+    as NOT_FOUND is a failure. Treating it as empty would run every step again."""
+    import grpc
+
+    class NotFound(grpc.RpcError):  # type: ignore[misc]
+        def code(self) -> grpc.StatusCode:
+            return grpc.StatusCode.NOT_FOUND
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-gone", version="1.0.0", is_recovered=True
+    )
+    mock_stub.GetGraph.side_effect = NotFound()
+
+    @step
+    def charge() -> str:
+        raise AssertionError("must not run")
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        return charge()  # type: ignore[no-any-return]
+
+    with pytest.raises(grpc.RpcError):
+        wf(_session_id="sess-gone")  # type: ignore[call-arg]
+    mock_stub.CheckIdempotencyCache.assert_not_called()

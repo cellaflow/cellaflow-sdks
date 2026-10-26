@@ -61,8 +61,11 @@ def workflow(
             replayed_steps = {}
             if resp.is_recovered:
                 # Every page: a step left out would run again instead of
-                # replaying.
-                steps = iter_session_steps(client, resp.session_id, limit=1000)
+                # replaying. The engine just reported the session as recovered, so
+                # NOT_FOUND here is a failure, not an empty history.
+                steps = iter_session_steps(
+                    client, resp.session_id, limit=1000, missing_ok=False
+                )
                 for step_info in steps:
                     # Keep the name, not just the payload. Replay is
                     # keyed on position, and without the name there is no way to
@@ -110,8 +113,11 @@ def workflow(
             replayed_steps = {}
             if resp.is_recovered:
                 # Every page: a step left out would run again instead of
-                # replaying.
-                steps = iter_session_steps(client, resp.session_id, limit=1000)
+                # replaying. The engine just reported the session as recovered, so
+                # NOT_FOUND here is a failure, not an empty history.
+                steps = iter_session_steps(
+                    client, resp.session_id, limit=1000, missing_ok=False
+                )
                 for step_info in steps:
                     # Keep the name, not just the payload. Replay is
                     # keyed on position, and without the name there is no way to
@@ -147,17 +153,17 @@ def workflow(
 
 
 class DivergentStepError(RuntimeError):
-    """Raised when the engine refuses a lease because the position is committed.
+    """Raised when the engine refuses a lease because its position is taken.
 
     Two replicas of one agent reached the same step with *different* arguments.
     Different arguments hash to different idempotency keys, so from the engine's
-    view these are unrelated operations and neither blocks the other — the
+    view these are unrelated operations and neither blocks the other. The
     divergence is only detectable against the graph position they both target.
 
-    The first replica committed there. This one is refused *before* running its
-    tool body, so only one replica reaches the side effect.
-    was only rejected at commit time, after the irreversible action had already
-    happened.
+    Another writer holds that position: it committed there, or holds a live lease
+    that claimed it. This call is refused *before* running its tool body, so only
+    one replica reaches the side effect. Without the claim, the refusal came only
+    at commit time, after the irreversible action had already happened.
 
     The fix is in the workflow, not the call: whatever the replicas disagreed
     about must itself be a leased step, so they converge on one value before

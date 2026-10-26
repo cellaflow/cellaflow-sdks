@@ -106,16 +106,21 @@ class WorkflowContext:
         """Decides what a cache hit at `sequence` leaves in this session.
 
         The hit is recorded at its position only when nothing else could have
-        moved the session meanwhile: it is the only call in flight, the run knows
-        everything the session holds, and the engine reports the session exactly
-        one position behind it. Otherwise the run adopts the position the engine
+        moved the session meanwhile: it is the only call in flight and no later
+        position was claimed while it waited, the run knows everything the session
+        holds, and the engine reports the session exactly one position behind it.
+        Otherwise the run adopts the position the engine
         reported and stops recording hits: a peer in this session already wrote
         it, the run is resuming into history it did not replay, or other calls in
         flight may commit in any order.
         """
         with self._lock:
             behind_by_one = reported == sequence - 1
-            if self._in_flight == 1 and self.history_known and behind_by_one:
+            # No other call is in flight now, and none claimed a later position
+            # while this one waited: one that did and then failed without
+            # committing leaves the counter past `sequence`.
+            alone = self._in_flight == 1 and self.sequence == sequence
+            if alone and self.history_known and behind_by_one:
                 self.defer_hit_record(
                     sequence, name, payload, coordination_id, agent_id, received_key
                 )

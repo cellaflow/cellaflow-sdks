@@ -13,6 +13,7 @@ def iter_session_steps(
     session_id: str,
     from_sequence: Optional[int] = None,
     limit: Optional[int] = None,
+    missing_ok: bool = True,
 ) -> Iterator[Dict[str, Any]]:
     """Yields a session's steps in order, from `from_sequence` on.
 
@@ -28,21 +29,22 @@ def iter_session_steps(
     read, which is a different thing entirely and is allowed to propagate.
     Treating it as no history would start a run with history over from the
     beginning.
+
+    `missing_ok=False` is for a caller that knows the session exists, such as one
+    the engine just reported as recovered. NOT_FOUND then propagates too, rather
+    than reading as no history and running every step again.
     """
     cursor = str(from_sequence) if from_sequence is not None else None
     yielded = False
     while True:
         try:
-            if limit is None:
-                steps, cursor = client.get_graph(session_id=session_id, cursor=cursor)
-            else:
-                steps, cursor = client.get_graph(
-                    session_id=session_id, limit=limit, cursor=cursor
-                )
+            steps, cursor = client.get_graph(
+                session_id=session_id, limit=limit, cursor=cursor
+            )
         except grpc.RpcError as exc:
             # NOT_FOUND partway through means the session went away while it was
             # being read, which is a failure rather than an empty session.
-            if exc.code() == grpc.StatusCode.NOT_FOUND and not yielded:
+            if exc.code() == grpc.StatusCode.NOT_FOUND and missing_ok and not yielded:
                 return
             raise
 
