@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional
 import contextvars
 import logging
 import threading
-import time
 
 import grpc
 
@@ -15,6 +14,11 @@ from cellaflow.idempotency import record_idempotency_key
 from cellaflow.v1 import common_pb2, idempotency_pb2, service_pb2
 
 logger = logging.getLogger(__name__)
+
+
+class _RecordHeld(Exception):
+    """A live lease already holds a hit's record. See `_write_record`."""
+
 
 #: Failures writing a hit's record that may succeed if sent again. The record is
 #: kept for the next step to retry; any other failure drops it. INTERNAL is how
@@ -161,8 +165,9 @@ class WorkflowContext:
         that ends on a hit still does no extra work.
 
         `received_key` is the idempotency key the hit answered, and `agent_id`
-        the agent that asked. The record is leased under its own key, derived
-        from both. See `record_idempotency_key`.
+        the agent that asked. The record is leased by `agent_id`, under its own
+        key derived from the session, `sequence` and `received_key`. See
+        `record_idempotency_key`.
         """
         self._pending_hit = {
             "sequence": sequence,
@@ -224,7 +229,9 @@ class WorkflowContext:
                 self._pending_hit = None
                 self.history_known = False
                 self.sequence = position
-                if code == grpc.StatusCode.FAILED_PRECONDITION:
+                if code == grpc.StatusCode.FAILED_PRECONDITION or isinstance(
+                    exc, _RecordHeld
+                ):
                     reason = "another writer committed or claimed it first"
                 elif code is not None:
                     reason = f"the engine refused it ({code.name})"
@@ -261,25 +268,27 @@ class WorkflowContext:
             self.session_id, pending["sequence"], pending["received_key"]
         )
         agent_id = pending["agent_id"]
-        while True:
-            resp = self.client.check_idempotency_cache(
-                agent_id=agent_id,
-                idempotency_key=key,
-                session_id=self.session_id,
-                sequence=pending["sequence"],
+        resp = self.client.check_idempotency_cache(
+            agent_id=agent_id,
+            idempotency_key=key,
+            session_id=self.session_id,
+            sequence=pending["sequence"],
+        )
+        if resp.status == idempotency_pb2.CACHE_STATUS_HIT:
+            # Written by an earlier attempt whose answer was lost.
+            return
+        if resp.status == idempotency_pb2.CACHE_STATUS_IN_PROGRESS:
+            # A live lease on this record: an earlier attempt that could not
+            # release it, or a replica recording the same result. Not waited out:
+            # this runs before a step claims its position, on the event loop for
+            # an async step, and waiting would stall every task on it. The record
+            # is dropped instead. The position stays protected: while that lease
+            # lives, a step aimed at it is refused before running.
+            raise _RecordHeld()
+        if resp.status != idempotency_pb2.CACHE_STATUS_ACQUIRED:
+            raise RuntimeError(
+                f"unexpected cache status {resp.status} leasing the record"
             )
-            if resp.status == idempotency_pb2.CACHE_STATUS_HIT:
-                # Written by an earlier attempt whose answer was lost.
-                return
-            if resp.status == idempotency_pb2.CACHE_STATUS_IN_PROGRESS:
-                # An earlier attempt's lease, not yet released or lapsed.
-                time.sleep((resp.retry_after_ms or 1000) / 1000.0)
-                continue
-            if resp.status != idempotency_pb2.CACHE_STATUS_ACQUIRED:
-                raise RuntimeError(
-                    f"unexpected cache status {resp.status} leasing the record"
-                )
-            break
         token = resp.fencing_token or 0
         try:
             self.client.commit_step(

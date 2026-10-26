@@ -21,13 +21,11 @@ All notable changes to the CellaFlow Python SDK.
   step.
 
   If writing the record fails with an error that may pass on a retry, it is kept and sent again
-  before the next step claims a position. If another writer in the session took the position first,
-  or the engine does not accept the record, the run logs a warning, stops recording, and continues
-  from the session's real position.
+  before the next step claims a position. If another writer in the session committed or claimed the
+  position first, or the engine does not accept the record, the run logs a warning and records no
+  further received results for the rest of the run.
 
-- **A resumed `@workflow` replays its whole history.** Resuming read only the first page of the
-  session's history (100 steps), so in a longer session the steps after it ran again instead of
-  replaying. It now reads every page.
+- **A resumed `@workflow` reads its whole history, however long,** following the engine's pages.
 - **Steps on several threads in one session claim distinct positions.** Claiming a position is now
   a single locked step, so tools a framework runs on a thread pool inside one `durable_tools` block
   never claim the same position.

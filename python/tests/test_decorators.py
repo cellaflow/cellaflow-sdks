@@ -1924,21 +1924,25 @@ def test_a_record_whose_commit_fails_releases_its_lease(
     assert release.fencing_token == 456
 
 
-def test_a_record_waits_out_its_own_earlier_lease(
-    mock_stub: MagicMock, mock_client: None
+def test_a_record_held_by_a_live_lease_is_dropped_without_waiting(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
 ) -> None:
-    """An earlier attempt's lease that was not released is waited out, then the
-    record is written."""
-    ctx = _ctx_with_record("sess-wait", 1)
-    mock_stub.CheckIdempotencyCache.side_effect = [
-        idempotency_pb2.CheckCacheResponse(
-            status=idempotency_pb2.CACHE_STATUS_IN_PROGRESS, retry_after_ms=1
-        ),
-        _acquired(),
-    ]
+    """A live lease on the record is not waited out: this runs before a step claims
+    its position, on the event loop for an async step. The record is dropped, and
+    while that lease lives the position stays protected by its claim."""
+    ctx = _ctx_with_record("sess-held", 1)
+    mock_stub.CheckIdempotencyCache.return_value = idempotency_pb2.CheckCacheResponse(
+        status=idempotency_pb2.CACHE_STATUS_IN_PROGRESS, retry_after_ms=60_000
+    )
+    mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(next_cursor="")
 
-    assert ctx.begin_call() == 2
-    assert _sent(mock_stub) == [(1, "place_order", True)]
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert ctx.begin_call() == 1
+
+    assert mock_stub.CheckIdempotencyCache.call_count == 1
+    mock_stub.CommitStep.assert_not_called()
+    assert not ctx.history_known
+    assert "another writer committed or claimed it first" in caplog.text
 
 
 def test_a_hit_after_a_later_call_failed_is_not_recorded(
