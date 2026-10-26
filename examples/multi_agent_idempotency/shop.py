@@ -1,9 +1,10 @@
-"""A stand-in for a real, irreversible side effect.
+"""A stand-in for a real, irreversible side effect: a shop that places orders.
 
 The point of this module is that it is deliberately *not* idempotent and knows
-nothing about Cellaflow. Every call to :func:`issue_refund` appends one line to a
-ledger file. Counting the lines afterwards is how the demo proves how many times
-the side effect actually happened -- no trust in log statements required.
+nothing about Cellaflow. Like most order, booking and checkout endpoints, it takes
+no idempotency key, so every call places one more order. Each call appends one
+line to a ledger file, and counting the lines afterwards is how the demo proves
+how many orders were actually placed -- no trust in log statements required.
 
 The ledger is a plain append-only file guarded by ``flock`` so that agents running
 as separate OS processes can share it safely.
@@ -21,10 +22,10 @@ from typing import Any, Dict, List
 
 DEFAULT_LEDGER = Path(__file__).parent / ".ledger.jsonl"
 
-# How long a "refund" takes. This is the race window: it has to be wide enough
-# that every agent is inside the critical section at the same time, otherwise the
-# naive run might accidentally serialize and understate the problem.
-REFUND_LATENCY_S = 0.4
+# How long placing an order takes. This is the race window: it has to be wide
+# enough that every agent is inside the critical section at the same time,
+# otherwise the naive run might accidentally serialize and understate the problem.
+ORDER_LATENCY_S = 0.4
 
 
 def ledger_path() -> Path:
@@ -45,21 +46,21 @@ def read_ledger() -> List[Dict[str, Any]]:
     return [json.loads(ln) for ln in lines]
 
 
-def issue_refund(ticket_id: str, amount_cents: int, charged_by: str) -> Dict[str, Any]:
-    """Move real money. Not idempotent, not retry-safe, not reversible.
+def place_order(order_id: str, total_cents: int, placed_by: str) -> Dict[str, Any]:
+    """Place the order and bill the customer. Not idempotent, not retry-safe.
 
     Returns a fresh confirmation id on every call -- which is what makes the
     coordinated run legible: if all agents report the *same* confirmation id, they
-    are all looking at a single charge rather than at N charges that happen to
-    have equal amounts.
+    are all looking at a single order rather than at N orders that happen to
+    have equal totals.
     """
-    time.sleep(REFUND_LATENCY_S)
+    time.sleep(ORDER_LATENCY_S)
 
     entry = {
-        "confirmation_id": f"rf_{uuid.uuid4().hex[:12]}",
-        "ticket_id": ticket_id,
-        "amount_cents": amount_cents,
-        "charged_by": charged_by,
+        "confirmation_id": f"ord_{uuid.uuid4().hex[:12]}",
+        "order_id": order_id,
+        "total_cents": total_cents,
+        "placed_by": placed_by,
         "at": time.time(),
     }
 
@@ -77,10 +78,10 @@ def issue_refund(ticket_id: str, amount_cents: int, charged_by: str) -> Dict[str
     # (plain str/int) because this becomes a committed step payload.
     return {
         "confirmation_id": entry["confirmation_id"],
-        "ticket_id": ticket_id,
-        "amount_cents": amount_cents,
-        # Carried back so a caller can tell whether it performed this charge or
+        "order_id": order_id,
+        "total_cents": total_cents,
+        # Carried back so a caller can tell whether it placed this order or
         # received someone else's. The SDK itself does not report which path a
         # step took, so the demo infers it from the payload -- see README.
-        "charged_by": charged_by,
+        "placed_by": placed_by,
     }

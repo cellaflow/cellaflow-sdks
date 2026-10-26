@@ -317,8 +317,8 @@ If that process dies after the charge and a new one resumes the thread,
 LangGraph re-runs the pending node, the tool is reached a second time, and the
 lease answers from the recorded result instead of calling the gateway. The
 customer is charged once. `examples/multi_agent_idempotency` scenario 5
-demonstrates exactly this, killing the process between the charge and the
-checkpoint.
+demonstrates the same pattern with an order, killing the process after the
+leased call returns and before the node's checkpoint lands.
 
 **Use the context manager rather than assembling the equivalent yourself.** A
 tool's idempotency key is derived from its session id, and `durable_tools`
@@ -677,10 +677,9 @@ mypy src tests
 
 Runnable programs live in [`examples/`](../examples/) at the repository root.
 
-[`multi_agent_idempotency/`](../examples/multi_agent_idempotency/) shows five replicas of one
-agent racing on the same refund: uncoordinated they charge five times, and through the engine
-one charge reaches the payment provider while the other four receive its result. It survives an
-engine restart.
+[`multi_agent_idempotency/`](../examples/multi_agent_idempotency/) shows five agents racing to
+place the same customer order: uncoordinated they place five orders, and through the engine one
+order reaches the shop while the others receive its confirmation. It survives an engine restart.
 
 ---
 
