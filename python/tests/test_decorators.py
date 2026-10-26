@@ -1924,25 +1924,112 @@ def test_a_record_whose_commit_fails_releases_its_lease(
     assert release.fencing_token == 456
 
 
-def test_a_record_held_by_a_live_lease_is_dropped_without_waiting(
-    mock_stub: MagicMock, mock_client: None, caplog: Any
+def _record_held_then_free(times: int, retry_ms: int = 50) -> Callable[..., Any]:
+    """Answers the record's lease IN_PROGRESS `times` times, then ACQUIRED."""
+    import threading
+
+    lock = threading.Lock()
+    left = [times]
+
+    def check(req: Any, **_: Any) -> Any:
+        with lock:
+            left[0] -= 1
+            if left[0] >= 0:
+                return idempotency_pb2.CheckCacheResponse(
+                    status=idempotency_pb2.CACHE_STATUS_IN_PROGRESS,
+                    retry_after_ms=retry_ms,
+                )
+        return _acquired()
+
+    return check
+
+
+def test_a_record_held_by_a_live_lease_is_waited_out_then_written(
+    mock_stub: MagicMock, mock_client: None
 ) -> None:
-    """A live lease on the record is not waited out: this runs before a step claims
-    its position, on the event loop for an async step. The record is dropped, and
-    while that lease lives the position stays protected by its claim."""
+    """A live lease on the record (an earlier attempt that could not release it,
+    or a replica writing the same record) commits or lapses. The step waits for
+    it, then writes the record and claims the next position."""
     ctx = _ctx_with_record("sess-held", 1)
-    mock_stub.CheckIdempotencyCache.return_value = idempotency_pb2.CheckCacheResponse(
-        status=idempotency_pb2.CACHE_STATUS_IN_PROGRESS, retry_after_ms=60_000
-    )
-    mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(next_cursor="")
+    mock_stub.CheckIdempotencyCache.side_effect = _record_held_then_free(2)
 
-    with caplog.at_level("WARNING", logger="cellaflow.context"):
-        assert ctx.begin_call() == 1
+    assert ctx.begin_call() == 2
+    assert _sent(mock_stub) == [(1, "place_order", True)]
+    assert ctx.history_known
 
-    assert mock_stub.CheckIdempotencyCache.call_count == 1
-    mock_stub.CommitStep.assert_not_called()
-    assert not ctx.history_known
-    assert "another writer committed or claimed it first" in caplog.text
+
+def test_an_async_step_waits_for_a_held_record_without_blocking_the_loop(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """Other tasks keep running while the step waits, heartbeats of in-flight
+    leases among them."""
+    import asyncio
+
+    ctx = _ctx_with_record("sess-async-held", 1)
+    mock_stub.CheckIdempotencyCache.side_effect = _record_held_then_free(3)
+    ticks: List[int] = []
+
+    async def ticker() -> None:
+        for i in range(5):
+            ticks.append(i)
+            await asyncio.sleep(0.01)
+
+    async def main() -> int:
+        claim = asyncio.ensure_future(ctx.begin_call_async())
+        await ticker()
+        # The ticks ran while the claim was still waiting, not after it.
+        assert not claim.done()
+        position: int = await claim
+        return position
+
+    assert asyncio.run(main()) == 2
+    assert ticks == [0, 1, 2, 3, 4]
+    assert _sent(mock_stub) == [(1, "place_order", True)]
+
+
+def test_the_session_lock_is_free_while_a_record_is_waited_on(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """A thread finishing its own step is not held up by another thread waiting
+    on the record."""
+    import threading
+    import time
+
+    ctx = _ctx_with_record("sess-lock", 1)
+    ctx._in_flight = 1  # a step already running on another thread
+    mock_stub.CheckIdempotencyCache.side_effect = _record_held_then_free(4, 100)
+    waiter = threading.Thread(target=ctx.begin_call)
+    waiter.start()
+    time.sleep(0.05)
+
+    started = time.monotonic()
+    ctx.end_call()
+    assert time.monotonic() - started < 0.05
+    waiter.join(timeout=5)
+    assert _sent(mock_stub) == [(1, "place_order", True)]
+
+
+def test_steps_waiting_on_a_held_record_claim_after_it_once(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """Every step finds the same record pending and waits behind it, so it is
+    written once and no step claims a position ahead of it."""
+    import threading
+
+    ctx = _ctx_with_record("sess-queue", 1)
+    mock_stub.CheckIdempotencyCache.side_effect = _record_held_then_free(3)
+    claimed: List[int] = []
+    threads = [
+        threading.Thread(target=lambda: claimed.append(ctx.begin_call()))
+        for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert sorted(claimed) == [2, 3]
+    assert _sent(mock_stub) == [(1, "place_order", True)]
 
 
 def test_a_hit_after_a_later_call_failed_is_not_recorded(

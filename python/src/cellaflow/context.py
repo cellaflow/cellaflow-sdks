@@ -1,10 +1,12 @@
+import asyncio
 import contextlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import contextvars
 import logging
 import threading
+import time
 
 import grpc
 
@@ -17,7 +19,11 @@ logger = logging.getLogger(__name__)
 
 
 class _RecordHeld(Exception):
-    """A live lease already holds a hit's record. See `_write_record`."""
+    """A live lease holds a hit's record. Wait `retry_after_s` and ask again."""
+
+    def __init__(self, retry_after_s: float) -> None:
+        super().__init__(f"the record is leased; retry in {retry_after_s}s")
+        self.retry_after_s = retry_after_s
 
 
 #: Failures writing a hit's record that may succeed if sent again. The record is
@@ -82,15 +88,39 @@ class WorkflowContext:
     def begin_call(self) -> int:
         """Counts a step as in flight and claims the next position for it.
 
-        One locked step, so calls on different threads never claim the same
-        position, and a pending record is always written before any later
-        position is claimed. Every call to this is paired with `end_call`.
+        Claiming is one locked step, so calls on different threads never claim
+        the same position, and a pending record is always written before any
+        later position is claimed. Every call to this is paired with `end_call`.
+
+        If the pending record's lease is held by another live lease, the call
+        waits for it without holding the lock, then tries again. Every other
+        call in the session finds the same record pending and waits too, so
+        none claims a later position before it lands.
         """
+        while True:
+            position, wait = self._try_claim()
+            if position is not None:
+                return position
+            time.sleep(wait)
+
+    async def begin_call_async(self) -> int:
+        """`begin_call` for an async step: waits without blocking the event loop."""
+        while True:
+            position, wait = self._try_claim()
+            if position is not None:
+                return position
+            await asyncio.sleep(wait)
+
+    def _try_claim(self) -> Tuple[Optional[int], float]:
+        """One attempt to claim a position: the position, or how long to wait."""
         with self._lock:
-            self.reconcile_sequence()
+            try:
+                self.reconcile_sequence()
+            except _RecordHeld as held:
+                return None, held.retry_after_s
             self.sequence += 1
             self._in_flight += 1
-            return self.sequence
+            return self.sequence, 0.0
 
     def end_call(self) -> None:
         """Marks a step claimed by `begin_call` as returned."""
@@ -204,6 +234,9 @@ class WorkflowContext:
         if pending is not None:
             try:
                 self._write_record(pending)
+            except _RecordHeld:
+                # Kept, and waited out by the caller. See `begin_call`.
+                raise
             except Exception as exc:
                 code = exc.code() if isinstance(exc, grpc.RpcError) else None
                 if code in _RETRYABLE_CODES:
@@ -229,9 +262,7 @@ class WorkflowContext:
                 self._pending_hit = None
                 self.history_known = False
                 self.sequence = position
-                if code == grpc.StatusCode.FAILED_PRECONDITION or isinstance(
-                    exc, _RecordHeld
-                ):
+                if code == grpc.StatusCode.FAILED_PRECONDITION:
                     reason = "another writer committed or claimed it first"
                 elif code is not None:
                     reason = f"the engine refused it ({code.name})"
@@ -279,12 +310,9 @@ class WorkflowContext:
             return
         if resp.status == idempotency_pb2.CACHE_STATUS_IN_PROGRESS:
             # A live lease on this record: an earlier attempt that could not
-            # release it, or a replica recording the same result. Not waited out:
-            # this runs before a step claims its position, on the event loop for
-            # an async step, and waiting would stall every task on it. The record
-            # is dropped instead. The position stays protected: while that lease
-            # lives, a step aimed at it is refused before running.
-            raise _RecordHeld()
+            # release it, or a replica writing the same record. It commits or
+            # lapses, so the caller waits and asks again, outside the lock.
+            raise _RecordHeld((resp.retry_after_ms or 1000) / 1000.0)
         if resp.status != idempotency_pb2.CACHE_STATUS_ACQUIRED:
             raise RuntimeError(
                 f"unexpected cache status {resp.status} leasing the record"

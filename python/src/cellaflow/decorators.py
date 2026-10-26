@@ -347,7 +347,7 @@ def step(
         # the next sequence, or this commit fails the ordering check and names
         # the wrong step. Deferred to here rather than done on the hit itself so
         # a workflow that ends on a hit does no extra work.
-        seq = ctx.begin_call()
+        seq = await ctx.begin_call_async()
         try:
             if seq in ctx.replayed_steps:
                 return _replay(ctx, seq, actual_tool_name)
