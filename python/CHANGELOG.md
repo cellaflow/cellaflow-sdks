@@ -24,6 +24,9 @@ All notable changes to the CellaFlow Python SDK.
   or the engine does not accept the record, the run logs a warning, stops recording, and continues
   from the session's real position.
 
+- **A resumed `@workflow` replays its whole history.** Resuming read only the first page of the
+  session's history (100 steps), so in a longer session the steps after it ran again instead of
+  replaying. It now reads every page.
 - **Steps on several threads in one session claim distinct positions.** Claiming a position is now
   a single locked step, so tools a framework runs on a thread pool inside one `durable_tools` block
   never claim the same position.

@@ -1667,7 +1667,10 @@ def test_a_failed_position_read_keeps_the_record(
     from cellaflow.context import WorkflowContext
 
     ctx = WorkflowContext(
-        client=CellaflowClient(), session_id="sess-read", workflow_version="1.0.0"
+        client=CellaflowClient(),
+        session_id="sess-read",
+        workflow_version="1.0.0",
+        history_known=True,
     )
     ctx.sequence = 1
     ctx.defer_hit_record(1, "place_order", {"result": "ORD-1"}, None)
@@ -1684,3 +1687,87 @@ def test_a_failed_position_read_keeps_the_record(
     assert ctx.begin_call() == 2
     sent = _sent(mock_stub)
     assert sent == [(1, "place_order", False)] * 2
+
+
+def test_a_record_that_cannot_be_sent_is_dropped(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
+) -> None:
+    """A failure before the record reaches the engine, such as a payload that does
+    not serialize, fails the same way on every retry. Keeping the record would
+    fail every later step of the run, so it is dropped like a refused one."""
+    from cellaflow.client import CellaflowClient
+    from cellaflow.context import WorkflowContext
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(),
+        session_id="sess-unsendable",
+        workflow_version="1.0.0",
+        history_known=True,
+    )
+    ctx.sequence = 2
+    ctx.defer_hit_record(2, "place_order", {"result": "ORD-1"}, None)
+    mock_stub.CommitStep.side_effect = TypeError("cannot serialize")
+    mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(next_cursor="")
+
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert ctx.begin_call() == 2
+    ctx.end_call()
+    assert ctx.begin_call() == 3
+    assert mock_stub.CommitStep.call_count == 1
+    assert "it could not be sent (TypeError: cannot serialize)" in caplog.text
+
+
+def test_a_context_built_by_hand_does_not_record_hits(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """A context that never read its session's history cannot know a hit's position
+    is free, so recording is opt-in."""
+    from cellaflow.client import CellaflowClient
+    from cellaflow.context import WorkflowContext
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(), session_id="sess-hand", workflow_version="1.0.0"
+    )
+    seq = ctx.begin_call()
+    ctx.take_hit(seq, "place_order", {"result": "ORD-1"}, 0, None)
+    ctx.end_call()
+    assert ctx.begin_call() == 1
+    mock_stub.CommitStep.assert_not_called()
+
+
+def test_a_resumed_workflow_replays_every_page_of_history(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The engine returns history a page at a time. A step on a later page that was
+    not replayed would run again."""
+    from cellaflow.v1 import common_pb2
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-long", version="1.0.0", is_recovered=True
+    )
+
+    def page(req: Any, **_: Any) -> Any:
+        start = int(req.cursor) if req.cursor else 1
+        stop = min(start + 100, 251)
+        return service_pb2.GetGraphResponse(
+            steps=[
+                common_pb2.StepResult(
+                    sequence=i, name="tick", output_payload=serialize({"result": i})
+                )
+                for i in range(start, stop)
+            ],
+            next_cursor=str(stop) if stop <= 250 else "",
+        )
+
+    mock_stub.GetGraph.side_effect = page
+
+    @step
+    def tick() -> int:
+        raise AssertionError("a recorded step must replay, not run")
+
+    @workflow(version="1.0.0")
+    def wf() -> List[int]:
+        return [tick() for _ in range(250)]
+
+    assert wf(_session_id="sess-long") == list(range(1, 251))  # type: ignore[call-arg]
+    mock_stub.CommitStep.assert_not_called()

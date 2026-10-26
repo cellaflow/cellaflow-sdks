@@ -51,7 +51,10 @@ class WorkflowContext:
     # is what `durable_tools` and any hit-based resume do. Only while it holds can
     # a cache hit be recorded in this session without risking a second record of
     # a step the session already holds. See `defer_hit_record`.
-    history_known: bool = True
+    #
+    # False unless the caller says otherwise: a context built for a session whose
+    # history it never read must not record into it.
+    history_known: bool = False
     # A cache hit's result, waiting to be recorded at its position in this
     # session. Written when the next step starts. See `defer_hit_record`.
     _pending_hit: Optional[Dict[str, Any]] = None
@@ -180,16 +183,18 @@ class WorkflowContext:
                     output_payload=pending["payload"],
                     coordination_id=pending["coordination_id"],
                 )
-            except grpc.RpcError as exc:
-                if exc.code() in _RETRYABLE_CODES:
+            except Exception as exc:
+                code = exc.code() if isinstance(exc, grpc.RpcError) else None
+                if code in _RETRYABLE_CODES:
                     # Kept, so the step that hit this is retried with it. If the
                     # write did land, the engine takes an identical re-send at the
                     # same position as a retry.
                     raise
                 # The record will not be accepted: another writer in this session
-                # took the position first, or the engine refused the write itself.
-                # Read where the session is before changing anything, so a failed
-                # read leaves the record to be tried again.
+                # took the position first, the engine refused the write itself, or
+                # it failed before reaching the engine and would fail the same way
+                # on every retry. Read where the session is before changing
+                # anything, so a failed read leaves the record to be tried again.
                 position = max(
                     pending["sequence"] - 1,
                     latest_session_sequence(
@@ -204,10 +209,12 @@ class WorkflowContext:
                 self._pending_hit = None
                 self.history_known = False
                 self.sequence = position
-                if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
+                if code == grpc.StatusCode.FAILED_PRECONDITION:
                     reason = "another writer committed there first"
+                elif code is not None:
+                    reason = f"the engine refused it ({code.name})"
                 else:
-                    reason = f"the engine refused it ({exc.code().name})"
+                    reason = f"it could not be sent ({type(exc).__name__}: {exc})"
                 logger.warning(
                     "Cellaflow: the result of %r was not recorded at position %d "
                     "of session %s, because %s. Continuing from position %d. A "

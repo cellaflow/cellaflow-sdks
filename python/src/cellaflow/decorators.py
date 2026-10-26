@@ -16,6 +16,7 @@ from cellaflow.context import (
     get_context,
     session_coordination_id,
 )
+from cellaflow.history import iter_session_steps
 from cellaflow.idempotency import (
     derive_idempotency_key,
     normalize_coordination_id,
@@ -59,7 +60,9 @@ def workflow(
 
             replayed_steps = {}
             if resp.is_recovered:
-                steps, _ = client.get_graph(resp.session_id)
+                # Every page: a step left out would run again instead of
+                # replaying.
+                steps = iter_session_steps(client, resp.session_id, limit=1000)
                 for step_info in steps:
                     # Keep the name, not just the payload. Replay is
                     # keyed on position, and without the name there is no way to
@@ -77,6 +80,9 @@ def workflow(
                 sequence=0,
                 replayed_steps=replayed_steps,
                 coordination_id=session_coordination_id(resp, coordination_id),
+                # A fresh session holds nothing, and a recovered one is replayed
+                # from the start, so the run accounts for every position.
+                history_known=True,
             )
             token = set_context(ctx)
             try:
@@ -103,7 +109,9 @@ def workflow(
 
             replayed_steps = {}
             if resp.is_recovered:
-                steps, _ = client.get_graph(resp.session_id)
+                # Every page: a step left out would run again instead of
+                # replaying.
+                steps = iter_session_steps(client, resp.session_id, limit=1000)
                 for step_info in steps:
                     # Keep the name, not just the payload. Replay is
                     # keyed on position, and without the name there is no way to
@@ -121,6 +129,9 @@ def workflow(
                 sequence=0,
                 replayed_steps=replayed_steps,
                 coordination_id=session_coordination_id(resp, coordination_id),
+                # A fresh session holds nothing, and a recovered one is replayed
+                # from the start, so the run accounts for every position.
+                history_known=True,
             )
             token = set_context(ctx)
             try:
