@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { CellaflowClient } from "./client.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
-import { recordIdempotencyKey } from "./idempotency.js";
+import { failureIdempotencyKey, recordIdempotencyKey } from "./idempotency.js";
 import {
   errorCode,
   hasStatusCode,
@@ -13,13 +13,16 @@ import {
 
 /** A cache hit's result, waiting to be recorded at its position in the session. */
 interface PendingHit {
+  /** A result received from a hit, or a step's failure. */
+  kind: "result" | "failure";
+  status: StepStatus;
   sequence: number;
   name: string;
   payload: Record<string, unknown>;
   coordinationId?: string;
   /** The agent whose call was answered by the hit. */
   agentId: string;
-  /** The idempotency key the hit answered. */
+  /** The idempotency key the hit answered, or the failed step's own key. */
   receivedKey: string;
 }
 
@@ -116,7 +119,57 @@ export class WorkflowContext {
     agentId = "default",
     receivedKey = "",
   ): void {
-    this.pendingHit = { sequence, name, payload, coordinationId, agentId, receivedKey };
+    this.pendingHit = {
+      kind: "result",
+      status: StepStatus.SUCCESS,
+      sequence,
+      name,
+      payload,
+      coordinationId,
+      agentId,
+      receivedKey,
+    };
+  }
+
+  /**
+   * Holds a call's failure to be recorded at `sequence` in this session.
+   *
+   * A call that fails leaves its position empty. A caller that catches the error
+   * and carries on would otherwise put its next call one position past the gap,
+   * where the engine refuses the commit after that call's side effect has run.
+   * Recording the failure fills the position. Written when the next call claims
+   * a position, so a failure nothing follows costs nothing.
+   *
+   * Only while the call is the session's only one in flight and no later position
+   * was claimed meanwhile, as for a hit. Otherwise nothing is recorded, as before.
+   */
+  deferFailureRecord(
+    sequence: number,
+    name: string,
+    err: unknown,
+    coordinationId?: string,
+    agentId = "default",
+    stepKey = "",
+  ): void {
+    if (!(this.inFlight === 1 && this.sequence === sequence)) return;
+    const e = err as { name?: unknown; message?: unknown; stack?: unknown } | undefined;
+    this.pendingHit = {
+      kind: "failure",
+      status: StepStatus.FAILED,
+      sequence,
+      name,
+      payload: {
+        error: {
+          format: 1,
+          type: typeof e?.name === "string" ? e.name : typeof err,
+          message: typeof e?.message === "string" ? e.message : String(err),
+          traceback: typeof e?.stack === "string" ? e.stack : "",
+        },
+      },
+      coordinationId,
+      agentId,
+      receivedKey: stepKey,
+    };
   }
 
   /**
@@ -254,7 +307,7 @@ export class WorkflowContext {
           ? `the engine refused it (${errorCode(err)})`
           : `it could not be sent (${errorCode(err)})`;
       console.warn(
-        `Cellaflow: the result of '${pending.name}' was not recorded at position ` +
+        `Cellaflow: the ${pending.kind} of '${pending.name}' was not recorded at position ` +
           `${pending.sequence} of session ${this.sessionId}, because ${reason}. ` +
           `Continuing from position ${this.sequence}. A later resume of this ` +
           "session may not replay that step.",
@@ -275,7 +328,10 @@ export class WorkflowContext {
    * lease before its side effect runs.
    */
   private async writeRecord(pending: PendingHit): Promise<void> {
-    const key = recordIdempotencyKey(this.sessionId, pending.sequence, pending.receivedKey);
+    const key =
+      pending.kind === "failure"
+        ? failureIdempotencyKey(this.sessionId, pending.sequence, pending.name, pending.receivedKey)
+        : recordIdempotencyKey(this.sessionId, pending.sequence, pending.receivedKey);
     let token = 0;
     for (;;) {
       const resp = await this.client.checkIdempotencyCache(
@@ -307,7 +363,7 @@ export class WorkflowContext {
         this.sessionId,
         pending.sequence,
         pending.name,
-        StepStatus.SUCCESS,
+        pending.status,
         pending.payload,
         key,
         token,

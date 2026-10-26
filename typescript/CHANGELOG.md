@@ -4,6 +4,14 @@ All notable changes to the CellaFlow TypeScript SDK.
 
 ## Unreleased
 
+### Added
+
+- **A call's failure is recorded at its position.** When a caller catches a leased tool's error and
+  carries on, the failure is recorded at the call's position as a step with status `FAILED`,
+  carrying the error's name and message, and the next call takes the following position. A
+  failure nothing follows, or one while another call of the session is in flight, is not recorded.
+  Matches the Python SDK.
+
 ### Fixed
 
 - **A session's history includes shared results it received.** When a `SHARED` tool was answered

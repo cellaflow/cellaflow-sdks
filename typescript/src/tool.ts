@@ -149,8 +149,17 @@ export function tool<A extends unknown[], R>(
       await ctx.settleRecording();
     }
     const seq = ctx.claimPosition();
+    const known: { key?: string } = {};
     try {
-      return await runAt(ctx, seq, args, callCoordination, coordinationId);
+      return await runAt(ctx, seq, args, callCoordination, coordinationId, known);
+    } catch (err) {
+      // A failed call leaves its position empty; record the failure there so the
+      // next call does not land past the gap. Not for a refused lease: another
+      // writer owns that position and fills it.
+      if (!(err instanceof DivergentStepError)) {
+        ctx.deferFailureRecord(seq, toolName, err, callCoordination, agentId, known.key ?? "");
+      }
+      throw err;
     } finally {
       ctx.endCall();
     }
@@ -163,6 +172,7 @@ export function tool<A extends unknown[], R>(
     args: A,
     callCoordination: string | undefined,
     coordinationId: string | undefined,
+    known: { key?: string },
   ): Promise<R> {
 
     let ikey = idempotencyKey;
@@ -191,6 +201,7 @@ export function tool<A extends unknown[], R>(
         sharedOn,
       });
     }
+    known.key = ikey;
 
     let fencingToken = 0;
     let hb: LeaseHeartbeat | undefined;
