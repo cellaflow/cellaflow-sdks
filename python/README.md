@@ -15,7 +15,7 @@ The official Python SDK for the [CellaFlow Engine](https://www.cellaflow.com) �
 - 🔄 **Durable Execution & Transparent Replay**: Workflows survive process restarts and infrastructure crashes without re-executing completed steps.
 - ⚡ **Zero-Friction Decorators**: Annotate standard Python functions with `@workflow`, `@step`, and `@tool` (supporting both `def` and `async def`).
 - 🧠 **LangGraph Drop-in Checkpointer**: Native `CellaflowSaver` checkpointer for LangGraph workflows with immutable MessagePack state snapshots, time-travel, and crash recovery.
-- 💳 **Leased Tool Calls Inside LangGraph Nodes**: `durable_tools` makes a node's irreversible side effect happen at most once — across a crash, a restart, or a resumed thread. A checkpointer makes your state durable; this makes your *charges* durable.
+- 💳 **Leased Tool Calls Inside LangGraph Nodes**: `durable_tools` leases a node's irreversible side effect, such as placing an order, so a resumed or concurrent run of the same thread reuses its recorded result instead of performing it again. A checkpointer makes your state durable; this makes your *side effects* durable.
 - 🛡️ **Deterministic Idempotency**: Automatic input hashing via RFC 8785 Canonical JSON and SHA-256 guarantees cross-language determinism across multi-agent swarms.
 - 🤝 **Cross-Session Coordination**: `SCOPE_SHARED` lets heterogeneous agents — different workflows, different sessions, different versions — converge on a single execution of a shared side effect.
 - 🔒 **Background Lease Management**: Non-blocking heartbeat management keeps engine locks alive and eliminates split-brain execution using fencing tokens.
@@ -178,21 +178,21 @@ keyed by it, so it converges with any other agent using the same domain, whateve
 session default:
 
 ```python
-@tool(tool_name="refund", scope=IdempotencyScope.SCOPE_SHARED, shared_on=["customer"])
-def refund(customer: str, amount: int) -> dict:
-    return payments.refund(customer, amount)
+@tool(tool_name="place_order", scope=IdempotencyScope.SCOPE_SHARED, shared_on=["order_id"])
+def place_order(order_id: str, total_cents: int) -> dict:
+    return shop.place_order(order_id, total_cents)
 
 @workflow(version="1.0.0")
-def ticket_agent(ticket: str, customer: str) -> dict:
-    # Works the ticket, but refunds under the customer's domain.
-    return refund(customer, 25, _coordination_id=customer)
+def support_agent(ticket: str, order_id: str) -> dict:
+    # Works the ticket, but places the order under the order's domain.
+    return place_order(order_id, 2499, _coordination_id=order_id)
 
 @workflow(version="1.0.0")
-def billing_agent(customer: str) -> dict:
-    return refund(customer, 25)
+def checkout_agent(order_id: str) -> dict:
+    return place_order(order_id, 2499)
 
-ticket_agent("T-4417", "customer-88", _coordination_id="T-4417")
-billing_agent("customer-88", _coordination_id="customer-88")   # one refund, not two
+support_agent("T-4417", "order-88", _coordination_id="T-4417")
+checkout_agent("order-88", _coordination_id="order-88")   # one order, not two
 ```
 
 The override is popped before your function is called. Compute it from the workflow's inputs, not
@@ -288,37 +288,37 @@ for checkpoint_tuple in checkpointer.list(config):
 ### 6. Leased Tool Calls Inside LangGraph Nodes (`durable_tools`)
 
 A checkpointer makes your graph's **state** durable. It does nothing for a
-node's **side effects** — if a node charges a customer and the pod dies before
-the next checkpoint lands, the resumed run re-enters that node and charges
-again.
+node's **side effects**: if a node places an order and the pod dies before the
+next checkpoint lands, the resumed run re-enters that node and places it again.
 
-`durable_tools` closes that window. Wrap the invocation, and any `@tool` called
-inside a node body is leased: it runs at most once per thread, across crashes
-and restarts.
+`durable_tools` leases those side effects. Wrap the invocation, and any `@tool`
+called inside a node body is leased per thread: a resumed run, or a concurrent
+one on the same thread, gets the recorded result instead of running the tool
+again.
 
 ```python
 from cellaflow import CellaflowSaver, durable_tools, tool
 
-@tool(tool_name="issue_refund")
-def issue_refund(ticket_id: str, cents: int) -> dict:
-    return payment_gateway.charge(ticket_id, cents)   # irreversible
+@tool(tool_name="place_order")
+def place_order(order_id: str, total_cents: int) -> dict:
+    return shop.place_order(order_id, total_cents)   # irreversible
 
-def refund_node(state):
-    return {"receipt": issue_refund(state["ticket"], state["amount"])}
+def order_node(state):
+    return {"receipt": place_order(state["order_id"], state["total_cents"])}
 
 app = builder.compile(checkpointer=CellaflowSaver(target="localhost:50051"))
-config = {"configurable": {"thread_id": "ticket-4417"}}
+config = {"configurable": {"thread_id": "thread-4417"}}
 
 with durable_tools(config):
-    app.invoke({"ticket": "T-4417", "amount": 2499}, config)
+    app.invoke({"order_id": "ORDER-4417", "total_cents": 2499}, config)
 ```
 
-If that process dies after the charge and a new one resumes the thread,
-LangGraph re-runs the pending node, the tool is reached a second time, and the
-lease answers from the recorded result instead of calling the gateway. The
-customer is charged once. `examples/multi_agent_idempotency` scenario 5
-demonstrates the same pattern with an order, killing the process after the
-leased call returns and before the node's checkpoint lands.
+If that process dies after the order is recorded and a new one resumes the
+thread, LangGraph re-runs the pending node, the tool is reached a second time,
+and the lease answers from the recorded result instead of calling the shop. One
+order is placed. `examples/multi_agent_idempotency` scenario 5 runs exactly
+this, killing the process after the leased call returns and before the node's
+checkpoint lands.
 
 **Use the context manager rather than assembling the equivalent yourself.** A
 tool's idempotency key is derived from its session id, and `durable_tools`
@@ -371,14 +371,14 @@ engine can tell, a distinct operation.
 Passing an explicit key makes them converge:
 
 ```python
-@tool(tool_name="issue_refund", idempotency_key=f"refund-{ticket_id}")
+@tool(tool_name="place_order", idempotency_key=f"order-{order_id}")
 ```
 
-That prevents the double charge, with a trade-off to state plainly: the replica
+That prevents the duplicate order, with a trade-off to state plainly: the replica
 that loses receives a result computed from arguments it did not supply. If the
-replicas disagreed about the amount, the loser is handed a refund for someone
-else's number. The durable fix is to make the disputed value itself a leased
-step, so they agree on it before reaching the step that spends it.
+replicas disagreed about the total, the loser is handed an order placed at
+someone else's total. The durable fix is to make the disputed value itself a
+leased step, so they agree on it before reaching the step that places the order.
 
 ---
 
@@ -474,8 +474,8 @@ is the graph position they both intend to write.
 The engine refuses the second one **before its body runs**:
 
 ```
-DivergentStepError: Step 'issue_refund' at sequence 1 was refused: Sequence 1 in
-session 'refund-4417' is already committed; the session is at 1. The lease was
+DivergentStepError: Step 'place_order' at sequence 1 was refused: Sequence 1 in
+session 'session-4417' is already committed; the session is at 1. The lease was
 refused before execution because this position already holds a different step...
 ```
 
@@ -484,16 +484,16 @@ so they converge on one value before reaching the step that acts on it:
 
 ```python
 @tool
-def decide_amount(ticket_id: str) -> int:
-    return llm.decide(ticket_id)      # nondeterministic, but leased -> one winner
+def decide_total(order_id: str) -> int:
+    return llm.price(order_id)        # nondeterministic, but leased -> one winner
 
 @tool
-def issue_refund(ticket_id: str, amount_cents: int) -> dict:
-    return gateway.charge(...)        # now sees identical arguments in every replica
+def place_order(order_id: str, total_cents: int) -> dict:
+    return shop.place_order(...)      # now sees identical arguments in every replica
 ```
 
-One replica wins the lease on `decide_amount` and the rest receive its result from cache, so every
-replica calls `issue_refund` with identical arguments and identical keys — and takes the ordinary
+One replica wins the lease on `decide_total` and the rest receive its result from cache, so every
+replica calls `place_order` with identical arguments and identical keys, and takes the ordinary
 cache-hit path instead of a refusal.
 
 ---
@@ -558,8 +558,8 @@ Decorators for atomic units of execution within a workflow:
 
 > **A lease is only as durable as its session.** The key is derived from the session id, and
 > `@workflow` generates a fresh session per call unless you pass `_session_id` — so without a
-> stable session id, a `@tool` deduplicates *within* a run but not across a restart. If you are
-> using `@tool` to make a side effect happen at most once across a crash, pass a stable
+> stable session id, a `@tool` deduplicates *within* a run but not across a restart. If you want a
+> resumed run to reuse a side effect's result rather than repeat it, pass a stable
 > `_session_id`. Inside LangGraph, use `durable_tools`, which derives one from the thread.
 
 ### `durable_tools(config, *, workflow_id="langgraph", version="1.0.0", target=..., secure=False, coordination_id=None)`

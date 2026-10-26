@@ -1,7 +1,7 @@
 """A stand-in for a real, irreversible side effect: a shop that places orders.
 
 The point of this module is that it is deliberately *not* idempotent and knows
-nothing about Cellaflow. Like most order, booking and checkout endpoints, it takes
+nothing about Cellaflow. Like many order, booking and checkout endpoints, it takes
 no idempotency key, so every call places one more order. Each call appends one
 line to a ledger file, and counting the lines afterwards is how the demo proves
 how many orders were actually placed -- no trust in log statements required.
@@ -46,7 +46,7 @@ def read_ledger() -> List[Dict[str, Any]]:
     return [json.loads(ln) for ln in lines]
 
 
-def place_order(order_id: str, total_cents: int, placed_by: str) -> Dict[str, Any]:
+def place_order(order_id: str, total_cents: int, placed_by: str = "agent") -> Dict[str, Any]:
     """Place the order and bill the customer. Not idempotent, not retry-safe.
 
     Returns a fresh confirmation id on every call -- which is what makes the

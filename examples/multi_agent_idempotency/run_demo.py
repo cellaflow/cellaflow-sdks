@@ -29,6 +29,13 @@ import swarm
 ORDER_ID = "ORDER-4417"
 TOTAL_CENTS = 24_99
 
+# Ids are built from these, one prefix per kind, so a session id, the coordination
+# domain the agents share, and a LangGraph thread id are never mistaken for each
+# other in the output.
+SESSION_PREFIX = "session-4417"
+DOMAIN_PREFIX = "order-4417"
+THREAD_PREFIX = "thread-4417"
+
 
 def _worker(fn: Callable[..., Dict[str, Any]], args: tuple, queue: Any) -> None:
     queue.put(fn(*args))
@@ -125,7 +132,7 @@ def scenario_coordinated(
     print("\n" + "=" * 72)
     print(f"  SCENARIO 2 - {n_agents} agents, coordinated through Cellaflow")
     print("=" * 72)
-    session_id = session_id or f"{ORDER_ID.lower()}-{uuid.uuid4().hex[:8]}"
+    session_id = session_id or f"{SESSION_PREFIX}-{uuid.uuid4().hex[:8]}"
     # Resumed is a property of the engine's state, not of whether the caller
     # passed an id -- a supplied id may well be brand new.
     resumed = _committed_steps(session_id) > 0
@@ -174,7 +181,7 @@ def scenario_divergent(n_agents: int) -> tuple[int, int]:
     )
 
     shop.reset_ledger()
-    session_id = f"divergent-{ORDER_ID}-{uuid.uuid4().hex[:8]}"
+    session_id = f"{SESSION_PREFIX}-{uuid.uuid4().hex[:8]}"
     # Deliberately spread: 24.99, 25.00, 25.01, ... Every replica is confident.
     args = [
         (f"agent-{i}", session_id, ORDER_ID, TOTAL_CENTS + (i - 1))
@@ -222,7 +229,7 @@ def scenario_heterogeneous(n_agents: int) -> tuple[int, int]:
     )
 
     shop.reset_ledger()
-    coordination_id = f"{ORDER_ID.lower()}-{uuid.uuid4().hex[:6]}"
+    coordination_id = f"{DOMAIN_PREFIX}-{uuid.uuid4().hex[:6]}"
     roles = [
         ("checkout-agent", "complete_checkout", "1.0.0"),
         ("cart-recovery", "recover_abandoned_cart", "2.4.1"),
@@ -314,7 +321,7 @@ def scenario_langgraph() -> tuple[int, int]:
     )
 
     shop.reset_ledger()
-    thread_id = f"lg-{ORDER_ID}-{uuid.uuid4().hex[:6]}"
+    thread_id = f"{THREAD_PREFIX}-{uuid.uuid4().hex[:6]}"
     ctx = mp.get_context("spawn")
 
     # Phase 1: crash after the order. Runs in its own process because it exits

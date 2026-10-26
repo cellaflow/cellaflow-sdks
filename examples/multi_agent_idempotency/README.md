@@ -3,9 +3,9 @@
 Several agents decide the same customer order should be placed, at the same moment. Only one
 order reaches the shop. Every other agent receives that order's confirmation.
 
-The shop here stands in for most real order, booking and checkout endpoints: it takes no
-idempotency key, so every request it receives places one more order. Nothing on the shop's side
-can tell a retry from a new purchase.
+The shop here takes no idempotency key, like many order, booking and checkout endpoints, so
+every request it receives places one more order. Nothing on the shop's side can tell a retry
+from a new purchase.
 
 Five scenarios, each a different way an order gets placed twice:
 
@@ -18,11 +18,6 @@ Five scenarios, each a different way an order gets placed twice:
 | 5 | One LangGraph agent, killed **after** the order is placed | A lease scoped to the thread. The resumed run reuses the order. |
 
 Scenario 5 is the one a checkpointer cannot do: the side effect happens inside a LangGraph node.
-
-None of this is exactly-once, and nothing is. A crash between the request leaving the process
-and the record of it landing repeats the order, because the shop does not take part in the
-arbitration. What a lease decides is at-most-once: whether a *second* agent is allowed to reach
-the shop at all. `examples/crash_benchmark` measures the case that stays open.
 
 Every agent runs as its own OS process, released simultaneously, so they genuinely race.
 
@@ -73,9 +68,9 @@ python run_demo.py --scenario langgraph   # the crash-mid-run one
 ## Survives a restart
 
 ```bash
-python run_demo.py --agents 6 --session-id order-4417   # 1 order
+python run_demo.py --agents 6 --session-id session-4417   # 1 order
 docker restart cellaflow-demo
-python run_demo.py --agents 6 --session-id order-4417   # 0 orders
+python run_demo.py --agents 6 --session-id session-4417   # 0 orders
 ```
 
 The second run places nothing and returns the same confirmation id from before the restart.
@@ -95,7 +90,7 @@ def place_order_step(order_id: str, total_cents: int) -> dict:
 def handle_order_request(order_id: str, total_cents: int) -> dict:
     return place_order_step(order_id, total_cents)
 
-handle_order_request("ORDER-4417", 2499, _session_id="order-4417")
+handle_order_request("ORDER-4417", 2499, _session_id="session-4417")
 ```
 
 `SCOPE_SESSION_WIDE` leaves agent identity out of the derived key, so every replica in the
@@ -113,7 +108,7 @@ before its function body runs:
 
 ```
 DivergentStepError: Step 'place_order' at sequence 1 was refused: Sequence 1 in
-session 'order-4417' is already claimed by a different step identity ...
+session 'session-4417-3f9a2c1b' is already claimed by a different step identity ...
 ```
 
 The durable fix is in the workflow rather than at the call site: put the value the replicas
@@ -204,9 +199,6 @@ graph reached: placed -> confirmed ord_91000dc621d8
 ```
 
 The node ran twice and the order was placed once.
-
-A crash a moment earlier, after the shop accepted the order but before Cellaflow recorded it, is
-the case that stays open, as described at the top.
 
 `durable_tools` is doing one specific thing: deriving the session that owns the thread's leased
 calls. It has to be **stable** across restarts, or the resumed run derives a different idempotency

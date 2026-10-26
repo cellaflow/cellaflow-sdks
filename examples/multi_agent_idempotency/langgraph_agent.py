@@ -12,10 +12,6 @@ the graph does not know the node finished. On resume, LangGraph re-runs the
 pending node, so the tool is reached a second time, and the engine answers it from
 that record instead of letting it place the order again.
 
-A crash a moment earlier, after the shop accepted the order but before Cellaflow
-recorded it, is the case that stays open: see the README and
-``examples/crash_benchmark``.
-
 Each phase runs in its own OS process, so the resume genuinely starts from cold
 -- no in-memory state carries over, exactly as a pod restart would.
 """
