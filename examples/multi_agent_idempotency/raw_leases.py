@@ -3,7 +3,7 @@
 
 ``run_demo.py`` shows the outcome. This shows the mechanism: every call the SDK
 would have made on your behalf, in order, with the engine's actual replies
-printed. Run it when you want to know *why* only one agent charged the customer,
+printed. Run it when you want to know *why* only one agent placed the order,
 or when you are building a client for another language.
 
     python raw_leases.py
@@ -51,7 +51,7 @@ def main() -> int:
     # The key is what the two workers must agree on. The SDK derives this for you
     # from (session, version, scope, tool name, hashed inputs); here it is spelled
     # out so nothing is hidden. The engine treats it as an opaque string.
-    key = f"{session_id}:1.0.0:session_wide:session_wide:issue_refund:demo"
+    key = f"{session_id}:1.0.0:session_wide:session_wide:place_order:demo"
 
     a = CellaflowClient(target=TARGET)
     b = CellaflowClient(target=TARGET)
@@ -102,11 +102,11 @@ def main() -> int:
         reply(f"renewed={rr.renewed} new_expires_at_ms={rr.new_expires_at_ms}")
 
         step(5, "worker-a", "CommitStep -- result and graph event, one transaction")
-        payload = {"result": {"confirmation_id": "rf_deadbeef", "amount_cents": 2499}}
+        payload = {"result": {"confirmation_id": "ord_deadbeef", "total_cents": 2499}}
         rc = a.commit_step(
             session_id=session_id,
             sequence=1,
-            name="issue_refund",
+            name="place_order",
             status=STEP_STATUS_SUCCESS,
             output_payload=payload,
             idempotency_key=key,
@@ -124,7 +124,7 @@ def main() -> int:
         if rb2.status == CACHE_STATUS_HIT and rb2.cached_result.output_payload:
             cached = deserialize(rb2.cached_result.output_payload)
             reply(f"cached_result={cached}")
-            print("   worker-b never called the payment gateway.")
+            print("   worker-b never called the shop.")
 
         step(7, "worker-a", "RenewLease again -- the lease is gone now")
         rr2 = a.renew_lease(
@@ -145,9 +145,9 @@ def main() -> int:
             rc2 = a.commit_step(
                 session_id=session_id,
                 sequence=2,
-                name="issue_refund",
+                name="place_order",
                 status=STEP_STATUS_SUCCESS,
-                output_payload={"result": {"confirmation_id": "rf_duplicate"}},
+                output_payload={"result": {"confirmation_id": "ord_duplicate"}},
                 idempotency_key=key,
                 # A token from an earlier, superseded attempt.
                 idempotency_fencing_token=max(token - 1, 1),

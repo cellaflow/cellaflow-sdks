@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Run the same refund ticket through an agent swarm, twice.
+"""Send the same customer order through an agent swarm, twice.
 
     python run_demo.py                 # 5 agents, both scenarios
     python run_demo.py --agents 8
     python run_demo.py --scenario coordinated
 
-Scenario 1 has no coordination and charges the customer once per replica.
-Scenario 2 routes the same work through Cellaflow, and one charge reaches the
-gateway.
+Scenario 1 has no coordination and places the order once per replica.
+Scenario 2 routes the same work through Cellaflow, and one order reaches the
+shop.
 
-The verdict is read off the gateway's append-only ledger file, not off anything
+The verdict is read off the shop's append-only ledger file, not off anything
 the agents report about themselves.
 """
 
@@ -23,11 +23,18 @@ import time
 import uuid
 from typing import Any, Callable, Dict, List
 
-import gateway
+import shop
 import swarm
 
-TICKET_ID = "TICKET-4417"
-AMOUNT_CENTS = 24_99
+ORDER_ID = "ORDER-4417"
+TOTAL_CENTS = 24_99
+
+# Ids are built from these, one prefix per kind, so a session id, the coordination
+# domain the agents share, and a LangGraph thread id are never mistaken for each
+# other in the output.
+SESSION_PREFIX = "session-4417"
+DOMAIN_PREFIX = "order-4417"
+THREAD_PREFIX = "thread-4417"
 
 
 def _worker(fn: Callable[..., Dict[str, Any]], args: tuple, queue: Any) -> None:
@@ -38,7 +45,7 @@ def _committed_steps(session_id: str) -> int:
     """How many steps this session already has on disk.
 
     Used to decide what the run *should* do: a session the engine has never seen
-    must produce exactly one charge, whereas one that already recorded the refund
+    must produce exactly one order, whereas one that already recorded the order
     must produce none. The engine answers NOT_FOUND for an unknown session.
     """
     import grpc
@@ -78,10 +85,10 @@ def _run_swarm(
 
 def _print_results(title: str, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     # The ledger was reset immediately before this run, so anything in it was
-    # charged by this run. That -- not what an agent says about itself -- decides
-    # who actually moved money.
-    charges = gateway.read_ledger()
-    charged_now = {(c["confirmation_id"], c["charged_by"]) for c in charges}
+    # placed by this run. That -- not what an agent says about itself -- decides
+    # who actually placed an order.
+    orders = shop.read_ledger()
+    placed_now = {(c["confirmation_id"], c["placed_by"]) for c in orders}
 
     print(f"\n  {title}")
     print(f"  {'-' * 68}")
@@ -91,15 +98,15 @@ def _print_results(title: str, results: List[Dict[str, Any]]) -> List[Dict[str, 
             outcome, conf = "FAILED", r["error"][:18]
         else:
             conf = r["confirmation_id"]
-            mine = (conf, r["agent_id"]) in charged_now
-            outcome = "charged the customer" if mine else "reused cached charge"
+            mine = (conf, r["agent_id"]) in placed_now
+            outcome = "placed the order" if mine else "reused the placed order"
         print(f"  {r['agent_id']:<10} {outcome:<26} {conf:<20} {r['elapsed_s']:>6}")
 
     print(f"  {'-' * 68}")
-    print(f"  REAL CHARGES ON THE LEDGER: {len(charges)}")
-    total = sum(c["amount_cents"] for c in charges)
+    print(f"  REAL ORDERS AT THE SHOP:    {len(orders)}")
+    total = sum(c["total_cents"] for c in orders)
     print(f"  Customer was billed:        ${total / 100:,.2f}")
-    return charges
+    return orders
 
 
 def scenario_naive(n_agents: int) -> int:
@@ -107,50 +114,50 @@ def scenario_naive(n_agents: int) -> int:
     print(f"  SCENARIO 1 - {n_agents} agents, no coordination")
     print("=" * 72)
     print(
-        "\n  Every replica picked up the same ticket and refunded it directly.\n"
+        "\n  Every replica picked up the same order and placed it directly.\n"
         "  Nothing tells any of them the others exist."
     )
 
-    gateway.reset_ledger()
-    args = [(f"agent-{i}", TICKET_ID, AMOUNT_CENTS) for i in range(1, n_agents + 1)]
+    shop.reset_ledger()
+    args = [(f"agent-{i}", ORDER_ID, TOTAL_CENTS) for i in range(1, n_agents + 1)]
     results = _run_swarm(swarm.run_naive_agent, args)
-    charges = _print_results("Result", results)
-    return len(charges)
+    orders = _print_results("Result", results)
+    return len(orders)
 
 
 def scenario_coordinated(
     n_agents: int, session_id: str | None = None
 ) -> tuple[int, int]:
-    """Returns (charges made, charges expected)."""
+    """Returns (orders placed, orders expected)."""
     print("\n" + "=" * 72)
     print(f"  SCENARIO 2 - {n_agents} agents, coordinated through Cellaflow")
     print("=" * 72)
-    session_id = session_id or f"refund-{TICKET_ID}-{uuid.uuid4().hex[:8]}"
+    session_id = session_id or f"{SESSION_PREFIX}-{uuid.uuid4().hex[:8]}"
     # Resumed is a property of the engine's state, not of whether the caller
     # passed an id -- a supplied id may well be brand new.
     resumed = _committed_steps(session_id) > 0
     if resumed:
         print(
-            "\n  Resuming an existing session. The refund already happened, so no\n"
-            "  agent should reach the gateway at all -- the engine answers from\n"
+            "\n  Resuming an existing session. The order was already placed, so no\n"
+            "  agent should reach the shop at all -- the engine answers from\n"
             f"  durable state.\n\n  session_id = {session_id}"
         )
     else:
         print(
-            "\n  Identical agent code. The only change: the refund is a @tool, and\n"
+            "\n  Identical agent code. The only change: placing the order is a @tool, and\n"
             f"  every replica joins the same session.\n\n  session_id = {session_id}"
         )
 
-    gateway.reset_ledger()
+    shop.reset_ledger()
     # Every replica gets byte-identical arguments. That is what makes them
     # converge: the derived idempotency key hashes the step inputs, so identical
     # inputs produce one shared key and the engine can pick a single winner.
     args = [
-        (f"agent-{i}", session_id, TICKET_ID, AMOUNT_CENTS)
+        (f"agent-{i}", session_id, ORDER_ID, TOTAL_CENTS)
         for i in range(1, n_agents + 1)
     ]
     results = _run_swarm(swarm.run_coordinated_agent, args)
-    charges = _print_results("Result", results)
+    orders = _print_results("Result", results)
 
     confirmations = {r["confirmation_id"] for r in results if r["ok"]}
     if len(confirmations) == 1:
@@ -158,212 +165,212 @@ def scenario_coordinated(
             f"  All {sum(1 for r in results if r['ok'])} agents returned the same "
             f"confirmation id."
         )
-    return len(charges), (0 if resumed else 1)
+    return len(orders), (0 if resumed else 1)
 
 
 def scenario_divergent(n_agents: int) -> tuple[int, int]:
-    """Replicas that disagree about the amount. Returns (charges, expected)."""
+    """Replicas that disagree about the total. Returns (orders, expected)."""
     print("\n" + "=" * 72)
-    print(f"  SCENARIO 3 - {n_agents} agents that disagree about the amount")
+    print(f"  SCENARIO 3 - {n_agents} agents that disagree about the total")
     print("=" * 72)
     print(
-        "\n  Same ticket, same session -- but each replica reasoned its way to a\n"
-        "  different refund amount, as agents reading the same ticket do. Different\n"
+        "\n  Same order, same session -- but each replica priced it differently\n"
+        "  (shipping, tax, a coupon), as agents reading the same cart do. Different\n"
         "  arguments mean different idempotency keys, so nothing about the operation\n"
         "  itself makes them contend. Only the graph position they both target does."
     )
 
-    gateway.reset_ledger()
-    session_id = f"divergent-{TICKET_ID}-{uuid.uuid4().hex[:8]}"
+    shop.reset_ledger()
+    session_id = f"{SESSION_PREFIX}-{uuid.uuid4().hex[:8]}"
     # Deliberately spread: 24.99, 25.00, 25.01, ... Every replica is confident.
     args = [
-        (f"agent-{i}", session_id, TICKET_ID, AMOUNT_CENTS + (i - 1))
+        (f"agent-{i}", session_id, ORDER_ID, TOTAL_CENTS + (i - 1))
         for i in range(1, n_agents + 1)
     ]
     results = _run_swarm(swarm.run_divergent_agent, args)
 
-    charges = gateway.read_ledger()
+    orders = shop.read_ledger()
     print(f"\n  Result")
     print(f"  {'-' * 68}")
     print(f"  {'agent':<10} {'proposed':>9}  {'outcome':<38}")
     for r in results:
         if r.get("refused"):
-            outcome = "REFUSED before reaching the gateway"
+            outcome = "REFUSED before reaching the shop"
         elif r["ok"]:
-            outcome = "charged the customer"
+            outcome = "placed the order"
         else:
             outcome = f"FAILED: {r['error'][:34]}"
-        print(f"  {r['agent_id']:<10} {r['amount_cents'] / 100:>8.2f}  {outcome:<38}")
+        print(f"  {r['agent_id']:<10} {r['total_cents'] / 100:>8.2f}  {outcome:<38}")
 
     print(f"  {'-' * 68}")
-    print(f"  REAL CHARGES ON THE LEDGER: {len(charges)}")
-    print(f"  Customer was billed:        ${sum(c['amount_cents'] for c in charges) / 100:,.2f}")
+    print(f"  REAL ORDERS AT THE SHOP:    {len(orders)}")
+    print(f"  Customer was billed:        ${sum(c['total_cents'] for c in orders) / 100:,.2f}")
     refused = sum(1 for r in results if r.get("refused"))
     print(
-        f"\n  {refused} of {n_agents} were stopped *before* charging. Without this they\n"
-        f"  would each have charged, and only then been told the position was taken."
+        f"\n  {refused} of {n_agents} were stopped *before* placing an order. Without this\n"
+        f"  they would each have placed one, and only then been told the position was taken."
     )
-    return len(charges), 1
+    return len(orders), 1
 
 
 def scenario_heterogeneous(n_agents: int) -> tuple[int, int]:
-    """Different agents, different sessions, one shared refund."""
+    """Different agents, different sessions, one shared order."""
     print("\n" + "=" * 72)
     print(f"  SCENARIO 4 - {n_agents} different agents, {n_agents} separate sessions")
     print("=" * 72)
     print(
-        "\n  Not replicas this time. A support agent, a fraud detector and a billing\n"
-        "  reconciler each concluded independently that this order needs refunding.\n"
+        "\n  Not replicas this time. A checkout agent, a cart-recovery agent and a\n"
+        "  reorder bot each concluded independently that this order should be placed.\n"
         "  Different workflows, different versions, no shared session -- so there is\n"
         "  no shared graph position to arbitrate.\n\n"
-        "  They also disagree about the amount, because they reasoned separately.\n"
+        "  They also disagree about the total, because they priced it separately.\n"
         "  What they share is a coordination domain they each name, and a\n"
         "  declaration of which argument identifies the work."
     )
 
-    gateway.reset_ledger()
-    coordination_id = f"refund-{TICKET_ID}-{uuid.uuid4().hex[:6]}"
+    shop.reset_ledger()
+    coordination_id = f"{DOMAIN_PREFIX}-{uuid.uuid4().hex[:6]}"
     roles = [
-        ("support-agent", "handle_support_ticket", "1.0.0"),
-        ("fraud-detector", "review_flagged_order", "2.4.1"),
-        ("billing-recon", "reconcile_billing_run", "3.0.0"),
-        ("csat-followup", "close_the_loop", "1.2.0"),
+        ("checkout-agent", "complete_checkout", "1.0.0"),
+        ("cart-recovery", "recover_abandoned_cart", "2.4.1"),
+        ("reorder-bot", "run_scheduled_reorder", "3.0.0"),
+        ("support-agent", "handle_support_ticket", "1.2.0"),
         ("ops-sweeper", "sweep_stuck_orders", "0.9.0"),
     ]
-    # Each agent reasoned its own amount. Five agents that independently
-    # concluded this order needs refunding will not have concluded the same
-    # number -- that is what makes them independent. Handing them an identical
-    # amount would test a weaker version of this scenario's own premise, and it
+    # Each agent priced the order itself. Five agents that independently
+    # concluded this order should be placed will not have arrived at the same
+    # total -- that is what makes them independent. Handing them an identical
+    # total would test a weaker version of this scenario's own premise, and it
     # is what let a real defect through: the derived key hashed every argument,
-    # so divergent amounts split the key and every agent charged.
+    # so divergent totals split the key and every agent placed an order.
     args = [
-        (name, wf, ver, coordination_id, TICKET_ID, AMOUNT_CENTS + i)
+        (name, wf, ver, coordination_id, ORDER_ID, TOTAL_CENTS + i)
         for i, (name, wf, ver) in enumerate(roles[:n_agents])
     ]
     results = _run_swarm(swarm.run_shared_agent, args)
 
-    charges = gateway.read_ledger()
-    charged_now = {(c["confirmation_id"], c["charged_by"]) for c in charges}
+    orders = shop.read_ledger()
+    placed_now = {(c["confirmation_id"], c["placed_by"]) for c in orders}
 
     print(f"\n  coordination_id = {coordination_id}\n")
-    print(f"  {'agent':<16} {'workflow':<20} {'proposed':>9}  {'outcome':<22}")
-    print(f"  {'-' * 72}")
+    print(f"  {'agent':<16} {'workflow':<23} {'proposed':>9}  {'outcome':<22}")
+    print(f"  {'-' * 75}")
     for r in results:
         role = next((x for x in roles if x[0] == r["agent_id"]), None)
         wf = role[1] if role else "?"
         proposed = next(
-            (a[5] for a in args if a[0] == r["agent_id"]), AMOUNT_CENTS
+            (a[5] for a in args if a[0] == r["agent_id"]), TOTAL_CENTS
         )
         if not r["ok"]:
             outcome = f"FAILED: {r['error'][:14]}"
         else:
-            mine = (r["confirmation_id"], r["agent_id"]) in charged_now
-            outcome = "charged the customer" if mine else "adopted the winner's"
+            mine = (r["confirmation_id"], r["agent_id"]) in placed_now
+            outcome = "placed the order" if mine else "adopted the winner's"
         print(
-            f"  {r['agent_id']:<16} {wf:<20} {proposed / 100:>8.2f}  {outcome:<22}"
+            f"  {r['agent_id']:<16} {wf:<23} {proposed / 100:>8.2f}  {outcome:<22}"
         )
 
-    print(f"  {'-' * 72}")
-    print(f"  REAL CHARGES ON THE LEDGER: {len(charges)}")
+    print(f"  {'-' * 75}")
+    print(f"  REAL ORDERS AT THE SHOP:    {len(orders)}")
     succeeded = [r for r in results if r["ok"]]
     confirmations = {r["confirmation_id"] for r in succeeded}
     if len(confirmations) == 1:
         print(f"  All {len(succeeded)} agents hold the same confirmation id.")
 
     # The part that is easy to leave out, and should not be. `shared_on` says
-    # the ticket identifies the work and the amount does not -- so the agents
-    # that lost are holding a confirmation for a number they never proposed.
+    # the order id identifies the work and the total does not -- so the agents
+    # that lost are holding a confirmation for a total they never proposed.
     # That is the trade-off convergence buys, not a free win, and a demo that
-    # prints only "1 charge" is hiding it.
-    if charges:
-        won = charges[0]["amount_cents"]
+    # prints only "1 order" is hiding it.
+    if orders:
+        won = orders[0]["total_cents"]
         adopted = [
-            a[0] for a in args if a[5] != won and a[0] != charges[0]["charged_by"]
+            a[0] for a in args if a[5] != won and a[0] != orders[0]["placed_by"]
         ]
         if adopted:
             print(
-                f"\n  {len(adopted)} agent(s) proposed a different amount and adopted "
+                f"\n  {len(adopted)} agent(s) proposed a different total and adopted "
                 f"${won / 100:,.2f}:"
             )
             print(f"    {', '.join(adopted)}")
             print(
                 "  Convergence means they accept a result computed from arguments\n"
                 "  they did not supply. If that is wrong for your workflow, make the\n"
-                "  disputed value its own leased step so they agree before spending."
+                "  disputed value its own leased step so they agree before ordering."
             )
-    return len(charges), 1
+    return len(orders), 1
 
 
 def scenario_langgraph() -> tuple[int, int]:
-    """A LangGraph node charges the customer, dies, and resumes."""
+    """A LangGraph node places the order, dies, and resumes."""
     # Imported here, not at module scope: LangGraph is an optional extra and the
     # other four scenarios must still run without it installed.
     import langgraph_agent
 
     print("\n" + "=" * 72)
-    print("  SCENARIO 5 - a LangGraph node that crashes after moving money")
+    print("  SCENARIO 5 - a LangGraph node that crashes after placing the order")
     print("=" * 72)
     print(
-        "\n  The refund now happens inside a LangGraph node, which is where a real\n"
-        "  agent's side effects live. The first process is killed the instant after\n"
-        "  the gateway is charged and before the checkpoint recording it lands --\n"
-        "  so the money has moved and nothing durable says so.\n\n"
+        "\n  The order is now placed inside a LangGraph node, which is where a real\n"
+        "  agent's side effects live. The first process is killed after the leased\n"
+        "  call returns and before LangGraph's checkpoint for the node lands -- so\n"
+        "  the order exists, Cellaflow has recorded it, and the graph does not know.\n\n"
         "  A second process then resumes the same thread from cold. LangGraph\n"
-        "  re-runs the pending node, so the tool is reached again and has to\n"
-        "  decline."
+        "  re-runs the pending node, so the tool is reached again, and the engine\n"
+        "  answers it from the record instead of placing a second order."
     )
 
-    gateway.reset_ledger()
-    thread_id = f"lg-{TICKET_ID}-{uuid.uuid4().hex[:6]}"
+    shop.reset_ledger()
+    thread_id = f"{THREAD_PREFIX}-{uuid.uuid4().hex[:6]}"
     ctx = mp.get_context("spawn")
 
-    # Phase 1: crash after the charge. Runs in its own process because it exits
+    # Phase 1: crash after the order. Runs in its own process because it exits
     # hard -- there is no returning from it.
     crash_env = dict(os.environ, **{langgraph_agent.CRASH_ENV: "1"})
     proc = ctx.Process(
         target=_crash_worker,
-        args=(thread_id, TICKET_ID, AMOUNT_CENTS, "lg-agent", crash_env),
+        args=(thread_id, ORDER_ID, TOTAL_CENTS, "lg-agent", crash_env),
     )
     proc.start()
     proc.join(timeout=120)
 
-    after_crash = len(gateway.read_ledger())
+    after_crash = len(shop.read_ledger())
     print(f"\n  phase 1: process exited with {proc.exitcode}, "
-          f"ledger has {after_crash} charge(s)")
+          f"shop has {after_crash} order(s)")
 
     # Phase 2: a cold process resumes the thread.
     queue: Any = ctx.Queue()
     resume = ctx.Process(
         target=_worker,
         args=(langgraph_agent.run_phase,
-              (thread_id, TICKET_ID, AMOUNT_CENTS, "lg-agent"), queue),
+              (thread_id, ORDER_ID, TOTAL_CENTS, "lg-agent"), queue),
     )
     resume.start()
     result = queue.get(timeout=120)
     resume.join(timeout=30)
 
-    charges = gateway.read_ledger()
-    print(f"  phase 2: resumed and completed, ledger has {len(charges)} charge(s)")
+    orders = shop.read_ledger()
+    print(f"  phase 2: resumed and completed, shop has {len(orders)} order(s)")
     print(f"\n  {'-' * 68}")
     print(f"  thread:              {thread_id}")
     print(f"  confirmation:        {result['confirmation_id']}")
     print(f"  graph reached:       {' -> '.join(result['notes']) or '(none)'}")
     print(f"  {'-' * 68}")
-    print(f"  REAL CHARGES ON THE LEDGER: {len(charges)}")
-    if len(charges) == 1 and after_crash == 1:
-        print("  The node ran twice. The customer was charged once.")
-    return len(charges), 1
+    print(f"  REAL ORDERS AT THE SHOP:    {len(orders)}")
+    if len(orders) == 1 and after_crash == 1:
+        print("  The node ran twice. The order was placed once.")
+    return len(orders), 1
 
 
 def _crash_worker(
-    thread_id: str, ticket_id: str, amount: int, agent_id: str, env: Dict[str, str]
+    thread_id: str, order_id: str, total: int, agent_id: str, env: Dict[str, str]
 ) -> None:
     """Runs phase 1 with the crash flag set, in a process expected to die."""
     import langgraph_agent
 
     os.environ.update(env)
     try:
-        langgraph_agent.run_phase(thread_id, ticket_id, amount, agent_id)
+        langgraph_agent.run_phase(thread_id, order_id, total, agent_id)
     except SystemExit:
         raise
     except Exception:
@@ -386,7 +393,7 @@ def main() -> int:
         help=(
             "resume an existing session instead of starting a fresh one. Re-run "
             "with the same value -- optionally after restarting the engine -- to "
-            "show the refund is not repeated. Implies --scenario coordinated."
+            "show the order is not placed again. Implies --scenario coordinated."
         ),
     )
     args = parser.parse_args()
@@ -402,68 +409,65 @@ def main() -> int:
         )
 
     print(f"\n  engine: {swarm.ENGINE_TARGET}")
-    print(f"  ledger: {gateway.ledger_path()}")
+    print(f"  ledger: {shop.ledger_path()}")
 
-    naive_charges = None
-    coordinated_charges = expected = None
+    naive_orders = None
+    coordinated_orders = expected = None
     started = time.time()
 
     if args.scenario in ("both", "all", "naive"):
-        naive_charges = scenario_naive(args.agents)
+        naive_orders = scenario_naive(args.agents)
     if args.scenario in ("both", "all", "coordinated"):
-        coordinated_charges, expected = scenario_coordinated(
+        coordinated_orders, expected = scenario_coordinated(
             args.agents, args.session_id
         )
 
-    divergent_charges = heterogeneous_charges = langgraph_charges = None
+    divergent_orders = heterogeneous_orders = langgraph_orders = None
     if args.scenario in ("all", "divergent"):
-        divergent_charges, _ = scenario_divergent(args.agents)
+        divergent_orders, _ = scenario_divergent(args.agents)
     if args.scenario in ("all", "heterogeneous"):
-        heterogeneous_charges, _ = scenario_heterogeneous(args.agents)
+        heterogeneous_orders, _ = scenario_heterogeneous(args.agents)
     if args.scenario in ("all", "langgraph"):
-        langgraph_charges, _ = scenario_langgraph()
+        langgraph_orders, _ = scenario_langgraph()
 
     print("\n" + "=" * 72)
     print("  VERDICT")
     print("=" * 72)
-    if naive_charges is not None:
-        print(f"  Without Cellaflow: {naive_charges} charges for 1 refund request")
-    if coordinated_charges is not None:
-        noun = "charge" if coordinated_charges == 1 else "charges"
-        suffix = " (already refunded before this run)" if expected == 0 else ""
+    if naive_orders is not None:
+        print(f"  Without Cellaflow: {naive_orders} orders for 1 purchase")
+    if coordinated_orders is not None:
+        noun = "order" if coordinated_orders == 1 else "orders"
+        suffix = " (already placed before this run)" if expected == 0 else ""
+        print(f"  With Cellaflow:    {coordinated_orders} {noun} for 1 purchase{suffix}")
+    if divergent_orders is not None:
         print(
-            f"  With Cellaflow:    {coordinated_charges} {noun} for 1 refund "
-            f"request{suffix}"
+            f"  Replicas that disagreed: {divergent_orders} order for "
+            f"{args.agents} proposed totals"
         )
-    if divergent_charges is not None:
+    if heterogeneous_orders is not None:
         print(
-            f"  Replicas that disagreed: {divergent_charges} charge for "
-            f"{args.agents} proposed amounts"
-        )
-    if heterogeneous_charges is not None:
-        print(
-            f"  {args.agents} unrelated agents:  {heterogeneous_charges} charge across "
+            f"  {args.agents} unrelated agents:  {heterogeneous_orders} order across "
             f"{args.agents} separate sessions"
         )
-    if langgraph_charges is not None:
+    if langgraph_orders is not None:
         print(
-            f"  LangGraph node:    {langgraph_charges} charge, across a crash "
+            f"  LangGraph node:    {langgraph_orders} order, across a crash "
             f"and a resume"
         )
     print(f"\n  ({time.time() - started:.1f}s total)\n")
 
-    for label, got in (("divergent", divergent_charges),
-                       ("heterogeneous", heterogeneous_charges),
-                       ("langgraph", langgraph_charges)):
+    for label, got in (("divergent", divergent_orders),
+                       ("heterogeneous", heterogeneous_orders),
+                       ("langgraph", langgraph_orders)):
         if got is not None and got != 1:
-            print(f"  UNEXPECTED: {label} scenario produced {got} charges, expected 1.\n")
+            print(f"  UNEXPECTED: {label} scenario produced {got} orders, expected 1.\n")
             return 1
 
-    if coordinated_charges is not None and coordinated_charges != expected:
-        # A fresh session must produce one charge; an already-refunded one must
-        # not reach the gateway at all.
+    if coordinated_orders is not None and coordinated_orders != expected:
+        # A fresh session must produce one order; one that already placed it must
+        # not reach the shop at all.
         print(
-            f"  UNEXPECTED: coordinated run produced {coordinated_charges} charges, "
+            f"  UNEXPECTED: coordinated run produced {coordinated_orders} orders, "
             f"expected exactly {expected}.\n"
         )
         return 1
