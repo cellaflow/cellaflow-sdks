@@ -18,9 +18,9 @@ All notable changes to the CellaFlow TypeScript SDK.
   Python SDK.
 
   If writing the record fails with an error that may pass on a retry, it is kept and sent again
-  before the next step claims a position. If another writer in the session took the position first,
-  or the engine does not accept the record, the run logs a warning, stops recording, and continues
-  from the session's real position.
+  before the next step claims a position. If another writer in the session committed or claimed the
+  position first, or the engine does not accept the record, the run logs a warning and records no
+  further received results for the rest of the run.
 
 ## 0.8.0
 

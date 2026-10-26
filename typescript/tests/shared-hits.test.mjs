@@ -462,22 +462,50 @@ test("a record that already landed is not written twice", async () => {
   assert.equal(ctx.historyKnown, true);
 });
 
-test("a record waits out its own earlier lease", async () => {
-  const answers = [{ status: CacheStatus.IN_PROGRESS, retryAfterMs: 1n }];
+test("a record held by a live lease is dropped without waiting", async () => {
+  // Waiting would hold up every call in the session, which waits on the record
+  // before claiming. While that lease lives, its claim protects the position.
   const client = scriptedClient([hit(0), acquired()], {
-    recordLease: () =>
-      answers.shift() ?? { status: CacheStatus.ACQUIRED, fencingToken: 99n, heartbeatIntervalMs: 60_000n },
+    recordLease: () => ({ status: CacheStatus.IN_PROGRESS, retryAfterMs: 60_000n }),
   });
-  await runWithContext(session(client), async () => {
-    await placeOrder({ orderId: "4417" });
-    await sendConfirmation({ orderId: "4417" });
-  });
+  const ctx = session(client);
+  const warn = console.warn;
+  const warnings = [];
+  console.warn = (msg) => warnings.push(msg);
+  const started = Date.now();
+  try {
+    await runWithContext(ctx, async () => {
+      await placeOrder({ orderId: "4417" });
+      await sendConfirmation({ orderId: "4417" });
+    });
+  } finally {
+    console.warn = warn;
+  }
+  assert.ok(Date.now() - started < 5_000);
   assert.deepEqual(
     client.commits.map((c) => [c.sequence, c.name]),
-    [
-      [1, "place_order"],
-      [2, "send_confirmation"],
-    ],
+    [[1, "send_confirmation"]],
+  );
+  assert.equal(ctx.historyKnown, false);
+  assert.match(warnings[0], /another writer committed or claimed it first/);
+});
+
+test("a deterministic Node error drops the record rather than retrying it forever", async () => {
+  const client = scriptedClient([hit(0), acquired()], { refuseFirstCommit: true, refuseCode: "ERR_INVALID_ARG_TYPE" });
+  const ctx = session(client);
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    await runWithContext(ctx, async () => {
+      await placeOrder({ orderId: "4417" });
+      assert.equal(await sendConfirmation({ orderId: "4417" }), "emailed");
+    });
+  } finally {
+    console.warn = warn;
+  }
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [[1, "send_confirmation"]],
   );
 });
 

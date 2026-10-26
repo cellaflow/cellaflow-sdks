@@ -51,16 +51,26 @@ export function hasStatusCode(err: unknown): boolean {
 }
 
 /**
+ * Node's codes for a network failure: the connection was refused, reset or timed
+ * out, or the host could not be reached or resolved. Its other codes, such as
+ * `ERR_INVALID_ARG_TYPE`, fail the same way every time.
+ */
+const NETWORK_ERROR_CODES = new Set<unknown>([
+  "ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "EPIPE",
+  "EHOSTUNREACH", "ENETUNREACH", "ENETDOWN", "ENOTFOUND", "EAI_AGAIN",
+]);
+
+/**
  * Whether an engine call failed in a way that may pass if it is sent again: one
- * of the retryable status codes, or a network error from Node, such as a reset
- * connection. An error with no code at all was thrown before the call reached
- * the engine, such as a payload that does not serialize, and fails the same way
- * every time.
+ * of the retryable status codes, or a network failure Node reports with its own
+ * code. Anything else, including an error with no code at all, was thrown before
+ * the call reached the engine, such as a payload that does not serialize, and
+ * fails the same way every time.
  */
 export function isRetryable(err: unknown): boolean {
   const code = codeOf(err);
   if (hasStatusCode(err)) return RETRYABLE_CODES.has(code);
-  return typeof code === "string";
+  return NETWORK_ERROR_CODES.has(code);
 }
 
 /** Whether an engine call answered NOT_FOUND. */
