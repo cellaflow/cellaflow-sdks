@@ -15,6 +15,7 @@ function scriptedClient(
     refuseFirstCommit = false,
     refuseCode = 9,
     failFirstCommit = false,
+    failCode = 14,
     history = [],
     failGraph = false,
     unknownSession = false,
@@ -52,7 +53,7 @@ function scriptedClient(
       }
       if (failFirstCommit && !failed) {
         failed = true;
-        throw Object.assign(new Error("engine unavailable"), { code: 14 });
+        throw Object.assign(new Error("engine unavailable"), { code: failCode });
       }
       await new Promise((r) => setTimeout(r, 5));
       order.push(`commit:${sequence}:${name}`);
@@ -367,3 +368,27 @@ test("a context built by hand does not record hits", async () => {
     [[1, "send_confirmation"]],
   );
 });
+
+for (const [label, failCode] of [
+  ["the engine's failed storage write (INTERNAL)", 13],
+  ["a reset connection", "ECONNRESET"],
+]) {
+  test(`a record that fails with ${label} is kept and sent again`, async () => {
+    const client = scriptedClient([hit(0), acquired()], { failFirstCommit: true, failCode });
+    const ctx = session(client);
+    await runWithContext(ctx, async () => {
+      await placeOrder({ orderId: "4417" });
+      await assert.rejects(sendConfirmation({ orderId: "4417" }), /unavailable/);
+    });
+    assert.equal(ctx.historyKnown, true);
+    assert.deepEqual(client.graphCursors, []);
+    await runWithContext(ctx, () => sendConfirmation({ orderId: "4417" }));
+    assert.deepEqual(
+      client.commits.map((c) => [c.sequence, c.name]),
+      [
+        [1, "place_order"],
+        [2, "send_confirmation"],
+      ],
+    );
+  });
+}
