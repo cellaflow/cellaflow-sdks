@@ -9,16 +9,25 @@ import { serialize } from "../dist/serialization.js";
 import { runWithContext } from "../dist/context.js";
 
 /** Answers checks from `answers` in order, and records every commit. */
-function scriptedClient(answers, { refuseFirstCommit = false, failFirstCommit = false, history = [] } = {}) {
+function scriptedClient(
+  answers,
+  { refuseFirstCommit = false, refuseCode = 9, failFirstCommit = false, history = [], failGraph = false } = {},
+) {
   const commits = [];
   const order = [];
+  const graphCursors = [];
   let refused = false;
   let failed = false;
   return {
     commits,
     order,
-    async getGraph() {
-      return [history.map((sequence) => ({ sequence: BigInt(sequence) })), undefined];
+    graphCursors,
+    async getGraph(sessionId, limit, cursor) {
+      graphCursors.push(cursor);
+      if (failGraph) throw Object.assign(new Error("engine unavailable"), { code: 14 });
+      const from = cursor === undefined ? 1 : Number(cursor);
+      const steps = history.filter((sequence) => sequence >= from);
+      return [steps.map((sequence) => ({ sequence: BigInt(sequence) })), undefined];
     },
     async checkIdempotencyCache() {
       order.push("check");
@@ -29,7 +38,7 @@ function scriptedClient(answers, { refuseFirstCommit = false, failFirstCommit = 
     async commitStep(sessionId, sequence, name, status, payload, key, token, coordinationId) {
       if (refuseFirstCommit && !refused) {
         refused = true;
-        throw Object.assign(new Error("sequence already committed"), { code: 9 });
+        throw Object.assign(new Error("refused"), { code: refuseCode });
       }
       if (failFirstCommit && !failed) {
         failed = true;
@@ -205,4 +214,91 @@ test("concurrent calls after a hit wait for its record and keep call order", asy
 test("reconcileSequence stays synchronous", () => {
   const ctx = session(scriptedClient([]));
   assert.equal(ctx.reconcileSequence(), undefined);
+});
+
+// Calls in flight together. A hit is recorded only while it is the only call in
+// flight. With overlap, the run behaves as it did before hits were recorded: it
+// adopts the position the engine reported, and the next call claims from there.
+
+test("two hits in flight together record nothing, and the next call claims the real position", async () => {
+  const client = scriptedClient([hit(0), hit(0, "emailed"), acquired()]);
+  const mine = tool(async () => "mine", { toolName: "mine" });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    await Promise.all([placeOrder({ orderId: "4417" }), sendConfirmation({ orderId: "4417" })]);
+    assert.equal(await mine(), "mine");
+  });
+  assert.equal(ctx.historyKnown, false);
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [[1, "mine"]],
+  );
+});
+
+test("a hit while another call runs is not recorded", async () => {
+  let release;
+  const released = new Promise((r) => (release = r));
+  const slow = tool(
+    async () => {
+      await released;
+      return "slow";
+    },
+    { toolName: "slow" },
+  );
+  const client = scriptedClient([acquired(), hit(0)]);
+  await runWithContext(session(client), async () => {
+    const running = slow();
+    assert.equal(await placeOrder({ orderId: "4417" }), "ORD-1");
+    release();
+    assert.equal(await running, "slow");
+  });
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [[1, "slow"]],
+  );
+});
+
+test("a record the engine refuses is dropped, and the run continues from the session's tail", async () => {
+  // INVALID_ARGUMENT will never pass, so keeping the record would fail every
+  // later call in the session.
+  const client = scriptedClient([hit(0), acquired()], { refuseFirstCommit: true, refuseCode: 3 });
+  const ctx = session(client);
+  const warn = console.warn;
+  const warnings = [];
+  console.warn = (msg) => warnings.push(msg);
+  try {
+    await runWithContext(ctx, async () => {
+      await placeOrder({ orderId: "4417" });
+      assert.equal(await sendConfirmation({ orderId: "4417" }), "emailed");
+    });
+  } finally {
+    console.warn = warn;
+  }
+  // Only the tail from the record's position was read.
+  assert.deepEqual(client.graphCursors, ["1"]);
+  assert.equal(ctx.historyKnown, false);
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [[1, "send_confirmation"]],
+  );
+  assert.match(warnings[0], /the engine refused it \(3\)/);
+});
+
+test("a failed position read keeps the record for the next call", async () => {
+  const client = scriptedClient([hit(0), acquired()], { refuseFirstCommit: true, failGraph: true });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    await placeOrder({ orderId: "4417" });
+    await assert.rejects(sendConfirmation({ orderId: "4417" }), /unavailable/);
+  });
+  assert.equal(ctx.historyKnown, true);
+  assert.equal(ctx.sequence, 1);
+  await runWithContext(ctx, () => sendConfirmation({ orderId: "4417" }));
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [
+      [1, "place_order"],
+      [2, "send_confirmation"],
+    ],
+  );
 });

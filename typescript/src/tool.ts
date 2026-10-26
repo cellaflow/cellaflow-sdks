@@ -1,7 +1,7 @@
 import { isFailedPrecondition } from "./errors.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
-import { getContext } from "./context.js";
+import { getContext, type WorkflowContext } from "./context.js";
 import { IdempotencyScope, deriveIdempotencyKey, normalizeCoordinationId } from "./idempotency.js";
 import { LeaseHeartbeat } from "./lease.js";
 import { deserialize } from "./serialization.js";
@@ -131,20 +131,39 @@ export function tool<A extends unknown[], R>(
     // would deduplicate the call in one domain and record it in another.
     const coordinationId = callCoordination ?? ctx.coordinationId;
 
-    // A cache hit may have left this counter ahead of the engine's. Adopt the
-    // position it reported before claiming the next sequence, or this commit
-    // fails the ordering check and names the wrong step. Deferred to here rather
-    // than done on the hit itself so a run that ends on a hit does no extra work.
-    ctx.reconcileSequence();
-    // A shared result may be being recorded at an earlier position, by this call
-    // or a concurrent one. Wait for it before claiming a position: nothing may
-    // reach the engine ahead of it, and if it fails, this call fails having
-    // claimed nothing. Waiting calls resume in the order they arrived, so
-    // positions are still claimed in call order. With nothing in flight there is
-    // no await, and the claim stays synchronous as before.
-    if (ctx.recordingInFlight) await ctx.settleRecording();
-    ctx.sequence += 1;
-    const seq = ctx.sequence;
+    // A cache hit may have left this counter ahead of the engine's, or left a
+    // result to record at its position. Both are settled before claiming the next
+    // sequence, or this commit fails the ordering check and names the wrong step.
+    // Deferred to here rather than done on the hit itself so a run that ends on a
+    // hit does no extra work.
+    //
+    // The record is written by this call or a concurrent one. Wait for it before
+    // claiming a position: nothing may reach the engine ahead of it, and if it
+    // fails, this call fails having claimed nothing. Waiting calls resume in the
+    // order they arrived, so positions are still claimed in call order, and each
+    // settles again in case anything changed while it waited. With nothing being
+    // written there is no await, and the claim stays synchronous as before.
+    for (;;) {
+      ctx.reconcileSequence();
+      if (!ctx.recordingInFlight) break;
+      await ctx.settleRecording();
+    }
+    const seq = ctx.claimPosition();
+    try {
+      return await runAt(ctx, seq, args, callCoordination, coordinationId);
+    } finally {
+      ctx.endCall();
+    }
+  }
+
+  /** Runs one call at the position it claimed. */
+  async function runAt(
+    ctx: WorkflowContext,
+    seq: number,
+    args: A,
+    callCoordination: string | undefined,
+    coordinationId: string | undefined,
+  ): Promise<R> {
 
     let ikey = idempotencyKey;
     if (!ikey) {
@@ -204,31 +223,21 @@ export function tool<A extends unknown[], R>(
       }
 
       if (resp.status === CacheStatus.HIT) {
-        // A hit returns without executing. If the session sits exactly one
-        // position behind this call and the run knows everything before it,
-        // nothing is recorded at `seq` yet, so the result is recorded there
-        // before the next step runs. Otherwise the run adopts the position the
-        // engine reported, as before: a peer in this session already wrote it,
-        // or the run is resuming into history it did not see.
+        // A hit returns without executing. When nothing is recorded at `seq` yet,
+        // the result is recorded there before the next step runs, so the history
+        // matches the work. The context decides which.
         const raw = resp.cachedResult?.outputPayload;
         const envelope = (
           raw && raw.length > 0 ? deserialize(raw) : { result: undefined }
         ) as { result?: R };
         if (resp.currentSequence !== undefined) {
-          const reported = Number(resp.currentSequence);
-          if (ctx.historyKnown && reported === seq - 1) {
-            ctx.deferHitRecord(
-              seq,
-              toolName,
-              envelope as Record<string, unknown>,
-              callCoordination,
-            );
-          } else {
-            // The session's position and this run's count disagree, so the run
-            // cannot tell what the session already holds.
-            if (reported !== seq - 1) ctx.historyKnown = false;
-            ctx.recordEngineSequence(reported);
-          }
+          ctx.takeHit(
+            seq,
+            toolName,
+            envelope as Record<string, unknown>,
+            Number(resp.currentSequence),
+            callCoordination,
+          );
         }
         return envelope?.result as R;
       }
@@ -300,8 +309,3 @@ export const step = tool;
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
-
-/**
- * Connect and gRPC surface `FAILED_PRECONDITION` differently depending on
- * transport, so match on the code rather than the class.
- */

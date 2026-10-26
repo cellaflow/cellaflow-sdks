@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { CellaflowClient } from "./client.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
-import { isFailedPrecondition } from "./errors.js";
+import { errorCode, isFailedPrecondition, isRetryable } from "./errors.js";
 
 /** A cache hit's result, waiting to be recorded at its position in the session. */
 interface PendingHit {
@@ -52,6 +52,13 @@ export class WorkflowContext {
    */
   private recording?: Promise<void>;
 
+  /**
+   * Calls in this session that have claimed a position and not yet returned.
+   * Calls overlap whenever tools run concurrently, such as under `Promise.all`.
+   * See {@link takeHit}.
+   */
+  private inFlight = 0;
+
   constructor(init: {
     client: CellaflowClient;
     sessionId: string;
@@ -88,6 +95,50 @@ export class WorkflowContext {
     coordinationId?: string,
   ): void {
     this.pendingHit = { sequence, name, payload, coordinationId };
+  }
+
+  /**
+   * Claims the next position for a call and counts it as in flight. Called after
+   * {@link reconcileSequence} and {@link settleRecording}, with no await between,
+   * so a pending record is always written before any later position is claimed.
+   * Every call to this is paired with {@link endCall}.
+   */
+  claimPosition(): number {
+    this.sequence += 1;
+    this.inFlight += 1;
+    return this.sequence;
+  }
+
+  /** Marks a call claimed by {@link claimPosition} as returned. */
+  endCall(): void {
+    this.inFlight -= 1;
+  }
+
+  /**
+   * Decides what a cache hit at `sequence` leaves in this session.
+   *
+   * The hit is recorded at its position only when nothing else could have moved
+   * the session meanwhile: it is the only call in flight, the run knows
+   * everything the session holds, and the engine reports the session exactly one
+   * position behind it. Otherwise the run adopts the position the engine
+   * reported and stops recording hits: a peer in this session already wrote it,
+   * the run is resuming into history it did not see, or other calls in flight
+   * may commit in any order.
+   */
+  takeHit(
+    sequence: number,
+    name: string,
+    payload: Record<string, unknown>,
+    reported: number,
+    coordinationId?: string,
+  ): void {
+    if (this.inFlight === 1 && this.historyKnown && reported === sequence - 1) {
+      this.deferHitRecord(sequence, name, payload, coordinationId);
+      return;
+    }
+    // The run can no longer tell what the session holds.
+    this.historyKnown = false;
+    this.recordEngineSequence(reported);
   }
 
   /**
@@ -131,6 +182,7 @@ export class WorkflowContext {
       this.reportedSequence = undefined;
     }
   }
+
   /** Whether a deferred record is being written. */
   get recordingInFlight(): boolean {
     return this.recording !== undefined;
@@ -158,33 +210,46 @@ export class WorkflowContext {
         undefined,
         pending.coordinationId,
       );
-      this.pendingHit = undefined;
+      if (this.pendingHit === pending) this.pendingHit = undefined;
     } catch (err) {
-      // Kept on any other error, so the next call sends it again. If the write
-      // did land, the engine takes an identical re-send at the same position as
-      // a retry.
-      if (!isFailedPrecondition(err)) throw err;
-      // Another writer in this session took the position first. The run no
-      // longer knows what the session holds: it stops recording hits and
-      // continues from the session's real position.
-      this.pendingHit = undefined;
+      // Kept, so the next call sends it again. If the write did land, the engine
+      // takes an identical re-send at the same position as a retry.
+      if (isRetryable(err)) throw err;
+      // The record will not be accepted: another writer in this session took the
+      // position first, or the engine refused the write itself. Read where the
+      // session is before changing anything, so a failed read leaves the record
+      // to be tried again.
+      const position = Math.max(
+        pending.sequence - 1,
+        await this.enginePosition(pending.sequence),
+      );
+      // The run no longer knows what the session holds: it stops recording hits
+      // and continues from the session's real position.
+      if (this.pendingHit === pending) this.pendingHit = undefined;
       this.historyKnown = false;
-      this.sequence = await this.enginePosition();
+      this.sequence = position;
+      const reason = isFailedPrecondition(err)
+        ? "another writer committed there first"
+        : `the engine refused it (${errorCode(err)})`;
       console.warn(
         `Cellaflow: the result of '${pending.name}' was not recorded at position ` +
-          `${pending.sequence} of session ${this.sessionId}, because another writer ` +
-          `committed there first. Continuing from position ${this.sequence}. A later ` +
-          "resume of this session may not replay that step.",
+          `${pending.sequence} of session ${this.sessionId}, because ${reason}. ` +
+          `Continuing from position ${this.sequence}. A later resume of this ` +
+          "session may not replay that step.",
       );
     } finally {
       this.recording = undefined;
     }
   }
 
-  /** The session's highest committed position, read from its history. */
-  private async enginePosition(): Promise<number> {
+  /**
+   * The session's highest committed position at or after `fromSequence`, or 0 if
+   * there is none. The engine's page cursor is the first sequence to read and is
+   * inclusive, so only the tail of the session is read.
+   */
+  private async enginePosition(fromSequence: number): Promise<number> {
     let highest = 0;
-    let cursor: string | undefined;
+    let cursor: string | undefined = String(fromSequence);
     for (;;) {
       const [steps, next] = await this.client.getGraph(this.sessionId, 1000, cursor);
       for (const step of steps) highest = Math.max(highest, Number(step.sequence ?? 0));
@@ -192,7 +257,6 @@ export class WorkflowContext {
       cursor = next;
     }
   }
-
 }
 
 const storage = new AsyncLocalStorage<WorkflowContext>();

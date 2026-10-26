@@ -10,13 +10,16 @@ All notable changes to the CellaFlow TypeScript SDK.
   from another session's result, nothing was recorded at its position in the receiving session, so
   the next step took that position and the session's history left the shared step out. The result
   is now recorded at its own position, as a plain step under the tool's name, when the next step
-  starts. A run that ends on the shared tool still makes no extra call. A resumed `durableTools`
-  session, or one further along than the run counted, keeps the previous behaviour, so a resume
-  never writes a second record of a step. Matches the Python SDK.
+  starts. A run that ends on the shared tool still makes no extra call. Recording happens only
+  while no other call of the session is in flight. A resumed `durableTools` session, one further
+  along than the run counted, and calls running concurrently in one session (under `Promise.all`,
+  say) keep the previous behaviour, so a resume never writes a second record of a step. Matches the
+  Python SDK.
 
-  If writing the record fails, it is kept and sent again before the next step claims a position.
-  If another writer in the session took the position first, the run logs a warning, stops
-  recording, and continues from the session's real position.
+  If writing the record fails with an error that may pass on a retry, it is kept and sent again
+  before the next step claims a position. If another writer in the session took the position first,
+  or the engine does not accept the record, the run logs a warning, stops recording, and continues
+  from the session's real position.
 
 ## 0.8.0
 
