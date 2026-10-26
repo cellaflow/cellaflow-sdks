@@ -134,7 +134,7 @@ export function tool<A extends unknown[], R>(
     // position it reported before claiming the next sequence, or this commit
     // fails the ordering check and names the wrong step. Deferred to here rather
     // than done on the hit itself so a run that ends on a hit does no extra work.
-    ctx.reconcileSequence();
+    await ctx.reconcileSequence();
     ctx.sequence += 1;
     const seq = ctx.sequence;
 
@@ -196,17 +196,33 @@ export function tool<A extends unknown[], R>(
       }
 
       if (resp.status === CacheStatus.HIT) {
-        // Returns without committing, so record where the engine says the
-        // session sits. The next step adopts it.
+        // A hit returns without executing. If the session sits exactly one
+        // position behind this call and the run knows everything before it,
+        // nothing is recorded at `seq` yet, so the result is recorded there
+        // before the next step runs. Otherwise the run adopts the position the
+        // engine reported, as before: a peer in this session already wrote it,
+        // or the run is resuming into history it did not see.
+        const raw = resp.cachedResult?.outputPayload;
+        const envelope = (
+          raw && raw.length > 0 ? deserialize(raw) : { result: undefined }
+        ) as { result?: R };
         if (resp.currentSequence !== undefined) {
-          ctx.recordEngineSequence(Number(resp.currentSequence));
+          const reported = Number(resp.currentSequence);
+          if (ctx.historyKnown && reported === seq - 1) {
+            ctx.deferHitRecord(
+              seq,
+              toolName,
+              envelope as Record<string, unknown>,
+              callCoordination,
+            );
+          } else {
+            // The session's position and this run's count disagree, so the run
+            // cannot tell what the session already holds.
+            if (reported !== seq - 1) ctx.historyKnown = false;
+            ctx.recordEngineSequence(reported);
+          }
         }
-        const payload = resp.cachedResult?.outputPayload;
-        if (payload && payload.length > 0) {
-          const envelope = deserialize(payload) as { result?: R };
-          return envelope?.result as R;
-        }
-        return undefined as R;
+        return envelope?.result as R;
       }
 
       if (resp.status === CacheStatus.IN_PROGRESS) {

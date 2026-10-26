@@ -2,6 +2,18 @@
 
 All notable changes to the CellaFlow TypeScript SDK.
 
+## Unreleased
+
+### Fixed
+
+- **A session's history includes shared results it received.** When a `SHARED` tool was answered
+  from another session's result, nothing was recorded at its position in the receiving session, so
+  the next step took that position and the session's history left the shared step out. The result
+  is now recorded at its own position, as a plain step under the tool's name, when the next step
+  starts. A run that ends on the shared tool still makes no extra call. A resumed `durableTools`
+  session, or one further along than the run counted, keeps the previous behaviour, so a resume
+  never writes a second record of a step. Matches the Python SDK.
+
 ## 0.8.0
 
 ### Added & Changed

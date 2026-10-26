@@ -1,11 +1,11 @@
 import pytest
 from unittest.mock import MagicMock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Callable, Any, Dict, List, Optional, Tuple
 
 from cellaflow.decorators import workflow, step, tool
 from cellaflow.idempotency import IdempotencyScope
 from cellaflow.v1 import service_pb2
-from cellaflow.serialization import serialize
+from cellaflow.serialization import deserialize, serialize
 from cellaflow.v1 import idempotency_pb2
 
 
@@ -578,14 +578,16 @@ def _two_step_workflow() -> Any:
     return wf
 
 
-def test_adopts_engine_sequence_after_cross_session_hit(
+def test_records_a_cross_session_hit_at_its_position(
     mock_stub: MagicMock, mock_client: None
 ) -> None:
-    """A hit satisfied from another session must not desync the counter.
+    """A hit satisfied from another session is recorded at its own position.
 
-    The hit returns without committing, so this session's engine-side sequence is
-    still 0. Without adopting the reported position the next step would ask for 2
-    and be rejected — one step after the real cause.
+    The session sits at 0, so nothing in it holds position 1 yet. The shared
+    result is recorded there as a plain step before the next step runs, and the
+    next step takes position 2. Letting the next step take position 1 instead is
+    what made such a session impossible to resume: replay found it where the
+    shared step was expected.
     """
     mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
         session_id="sess-b", version="1.0.0", is_recovered=False
@@ -597,11 +599,18 @@ def test_adopts_engine_sequence_after_cross_session_hit(
 
     assert _two_step_workflow()() == "mine"
 
-    committed = mock_stub.CommitStep.call_args[0][0]
-    assert committed.step_result.sequence == 1, (
-        "after a cross-session hit the next commit must target sequence 1, "
-        f"got {committed.step_result.sequence}"
-    )
+    commits = [c[0][0] for c in mock_stub.CommitStep.call_args_list]
+    assert [(c.step_result.sequence, c.step_result.name) for c in commits] == [
+        (1, "shared"),
+        (2, "local_followup"),
+    ]
+    recorded = commits[0]
+    # A plain step: the result, under the tool's name, with no lease behind it.
+    assert deserialize(recorded.step_result.output_payload) == {
+        "result": "from-elsewhere"
+    }
+    assert not recorded.step_result.HasField("idempotency_key")
+    assert not recorded.HasField("idempotency_fencing_token")
     # And the engine must have been told which session was asking.
     assert (
         mock_stub.CheckIdempotencyCache.call_args_list[0][0][0].session_id == "sess-b"
@@ -826,11 +835,10 @@ def test_reconciliation_does_not_disturb_replayed_steps(
 
     assert wf() == "mine"
 
-    committed = mock_stub.CommitStep.call_args[0][0]
-    assert committed.step_result.sequence == 2, (
-        "reconciling to the session's own position must not rewind into replayed "
-        f"history; expected the next commit at 2, got {committed.step_result.sequence}"
-    )
+    # The session sits at 1 after the replayed step, so the hit is recorded at 2
+    # and the next step follows it at 3.
+    commits = [c[0][0].step_result for c in mock_stub.CommitStep.call_args_list]
+    assert [(c.sequence, c.name) for c in commits] == [(2, "shared"), (3, "mine")]
 
 
 def _recovered_session(mock_stub: MagicMock, session_id: str, names: List[str]) -> None:
@@ -1159,3 +1167,198 @@ def test_shared_scope_accepts_an_explicit_key_instead() -> None:
     )(issue_refund)
 
     assert wrapped is not None
+
+
+# --- Recording a shared result in the session that received it ---------------
+
+
+def _hit(sequence_now: int, result: str = "from-elsewhere") -> Any:
+    """A HIT from another session's commit, with this session at `sequence_now`."""
+    from cellaflow.v1 import common_pb2
+
+    r = idempotency_pb2.CheckCacheResponse(
+        status=idempotency_pb2.CACHE_STATUS_HIT,
+        cached_result=common_pb2.StepResult(
+            sequence=1,
+            name="place_order",
+            status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+            output_payload=serialize({"result": result}),
+        ),
+    )
+    r.current_sequence = sequence_now
+    return r
+
+
+def _acquired() -> Any:
+    return idempotency_pb2.CheckCacheResponse(
+        status=idempotency_pb2.CACHE_STATUS_ACQUIRED,
+        fencing_token=456,
+        heartbeat_interval_ms=10000,
+    )
+
+
+def test_a_workflow_ending_on_a_cross_session_hit_records_nothing(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The record is deferred to the next step, so a run ending on the hit costs
+    no extra call. Nothing follows it to take its position."""
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-end-0", version="1.0.0", is_recovered=False
+    )
+    mock_stub.CheckIdempotencyCache.side_effect = [_hit(0)]
+
+    @step
+    def place_order() -> str:
+        raise AssertionError("a cache hit must not execute")
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        return place_order()  # type: ignore[no-any-return]
+
+    assert wf() == "from-elsewhere"
+    mock_stub.CommitStep.assert_not_called()
+
+
+def test_a_session_with_a_recorded_hit_resumes_by_replay(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The reported bug: a session that received a shared result and then did
+    another step could not be resumed. With the hit recorded at its position,
+    the resumed run replays all three steps and calls nothing."""
+    from cellaflow.v1 import common_pb2
+
+    history = [
+        common_pb2.StepResult(
+            sequence=i,
+            name=name,
+            status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+            output_payload=serialize({"result": result}),
+        )
+        for i, (name, result) in enumerate(
+            [
+                ("price_cart", 2499),
+                ("place_order", "ORD-1"),
+                ("send_confirmation", "emailed"),
+            ],
+            start=1,
+        )
+    ]
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-resume", version="1.0.0", is_recovered=True
+    )
+    mock_stub.GetGraph.return_value = service_pb2.GetGraphResponse(
+        steps=history, next_cursor=""
+    )
+
+    @step
+    def price_cart() -> int:
+        raise AssertionError("replayed")
+
+    @step
+    def place_order() -> str:
+        raise AssertionError("replayed")
+
+    @step
+    def send_confirmation() -> str:
+        raise AssertionError("replayed")
+
+    @workflow(version="1.0.0")
+    def _agent() -> str:
+        price_cart()
+        place_order()
+        return send_confirmation()  # type: ignore[no-any-return]
+
+    # Typed loosely so the call can pass the `_session_id` the decorator consumes.
+    agent: Callable[..., str] = _agent
+    assert agent(_session_id="sess-resume") == "emailed"
+    mock_stub.CheckIdempotencyCache.assert_not_called()
+    mock_stub.CommitStep.assert_not_called()
+
+
+def test_a_position_taken_first_stops_recording_hits(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """If another writer in the session took the position before the record, the
+    run no longer knows what the session holds. It carries on without recording
+    later hits, rather than failing or writing a second record."""
+    import grpc
+
+    class Taken(grpc.RpcError):  # type: ignore[misc]
+        def code(self) -> grpc.StatusCode:
+            return grpc.StatusCode.FAILED_PRECONDITION
+
+        def details(self) -> str:
+            return "sequence already committed"
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-race", version="1.0.0", is_recovered=False
+    )
+    # place_order hits at 1; the record of it is refused; mine acquires at 2.
+    mock_stub.CheckIdempotencyCache.side_effect = [_hit(0), _acquired()]
+    mock_stub.CommitStep.side_effect = [
+        Taken(),
+        service_pb2.CommitStepResponse(session_id="sess-race", next_sequence=3),
+    ]
+
+    @step
+    def place_order() -> str:
+        raise AssertionError("a cache hit must not execute")
+
+    @step
+    def mine() -> str:
+        return "mine"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        place_order()
+        return mine()  # type: ignore[no-any-return]
+
+    assert wf() == "mine"
+    commits = [c[0][0].step_result for c in mock_stub.CommitStep.call_args_list]
+    assert [(c.sequence, c.name) for c in commits] == [
+        (1, "place_order"),
+        (2, "mine"),
+    ]
+
+
+def test_a_hit_into_history_the_run_did_not_count_is_not_recorded(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """A session further along than the run counted holds steps the run never
+    saw, so a later hit may already be recorded there. The run adopts the
+    engine's position and records nothing, as before."""
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-ahead", version="1.0.0", is_recovered=False
+    )
+    # First hit: the session is at 5 while this call is at 1. Second hit: the
+    # session is at 5 and this call at 6, which would otherwise look recordable.
+    mock_stub.CheckIdempotencyCache.side_effect = [
+        _hit(5),
+        _hit(5, "again"),
+        _acquired(),
+    ]
+    mock_stub.CommitStep.return_value = service_pb2.CommitStepResponse(
+        session_id="sess-ahead", next_sequence=7
+    )
+
+    @step
+    def first() -> str:
+        raise AssertionError("hit")
+
+    @step
+    def second() -> str:
+        raise AssertionError("hit")
+
+    @step
+    def mine() -> str:
+        return "mine"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        first()
+        second()
+        return mine()  # type: ignore[no-any-return]
+
+    assert wf() == "mine"
+    commits = [c[0][0].step_result for c in mock_stub.CommitStep.call_args_list]
+    assert [(c.sequence, c.name) for c in commits] == [(6, "mine")]

@@ -1,5 +1,14 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { CellaflowClient } from "./client.js";
+import { StepStatus } from "./cellaflow/v1/common_pb.js";
+
+/** A cache hit's result, waiting to be recorded at its position in the session. */
+interface PendingHit {
+  sequence: number;
+  name: string;
+  payload: Record<string, unknown>;
+  coordinationId?: string;
+}
 
 /**
  * The session a tool call belongs to, plus the bookkeeping that keeps the local
@@ -23,18 +32,56 @@ export class WorkflowContext {
    */
   private reportedSequence?: number;
 
+  /**
+   * Whether this run has accounted for every position the session holds up to
+   * {@link sequence}: true for a fresh session. False once the run resumes into
+   * history it did not see, which a resumed `durableTools` session always does,
+   * because it re-runs tools and lets the engine answer them rather than
+   * replaying by position. Only while it holds can a cache hit be recorded in
+   * this session without risking a second record of a step the session already
+   * holds. See {@link deferHitRecord}.
+   */
+  historyKnown: boolean;
+
+  private pendingHit?: PendingHit;
+
   constructor(init: {
     client: CellaflowClient;
     sessionId: string;
     workflowVersion: string;
     sequence?: number;
     coordinationId?: string;
+    historyKnown?: boolean;
   }) {
     this.client = init.client;
     this.sessionId = init.sessionId;
     this.workflowVersion = init.workflowVersion;
     this.sequence = init.sequence ?? 0;
     this.coordinationId = init.coordinationId;
+    this.historyKnown = init.historyKnown ?? true;
+  }
+
+  /**
+   * Holds a cache hit's result to be recorded at `sequence` in this session.
+   *
+   * A hit satisfied from another session leaves nothing at its position in this
+   * one. Without a record there, the next step takes that position, so the
+   * session's history no longer matches the work it did, and an SDK that
+   * resumes by position cannot replay it. Recording the result keeps the history
+   * the same shape as the work.
+   *
+   * Deferred to the next step, like {@link recordEngineSequence}: the record only
+   * matters once something would otherwise take its position, so a run that ends
+   * on a hit still does no extra work.
+   */
+  deferHitRecord(
+    sequence: number,
+    name: string,
+    payload: Record<string, unknown>,
+    coordinationId?: string,
+  ): void {
+    this.pendingHit = { sequence, name, payload, coordinationId };
+    this.sequence = sequence;
   }
 
   /**
@@ -49,7 +96,7 @@ export class WorkflowContext {
   }
 
   /**
-   * Adopts the position the engine reported on the last cache hit.
+   * Records a deferred hit, then adopts the position the engine reported.
    *
    * Every tool call increments this counter, but a cache hit returns *without
    * committing*. The engine's sequence therefore did not advance while the local
@@ -66,7 +113,31 @@ export class WorkflowContext {
    * the field. Behaviour then degrades to the original defect rather than to
    * something new.
    */
-  reconcileSequence(): void {
+  async reconcileSequence(): Promise<void> {
+    const pending = this.pendingHit;
+    this.pendingHit = undefined;
+    if (pending) {
+      try {
+        await this.client.commitStep(
+          this.sessionId,
+          pending.sequence,
+          pending.name,
+          StepStatus.SUCCESS,
+          pending.payload,
+          undefined,
+          undefined,
+          pending.coordinationId,
+        );
+      } catch (err) {
+        const code = (err as { code?: unknown } | undefined)?.code;
+        if (code !== 9 && code !== "failed_precondition") throw err;
+        // Another writer in this session took the position first. The run no
+        // longer knows what the session holds, so it stops recording hits and
+        // the counter stays where the hit left it.
+        this.historyKnown = false;
+      }
+      return;
+    }
     if (this.reportedSequence !== undefined) {
       this.sequence = this.reportedSequence;
       this.reportedSequence = undefined;

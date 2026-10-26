@@ -5,8 +5,10 @@ from typing import Any, Dict, List, Optional
 import contextvars
 import threading
 
+import grpc
+
 from cellaflow.client import CellaflowClient
-from cellaflow.v1 import service_pb2
+from cellaflow.v1 import common_pb2, service_pb2
 
 
 @dataclass
@@ -28,6 +30,16 @@ class WorkflowContext:
     # The session position the engine last reported, held from a cache hit
     # until the next step consumes it. See `reconcile_sequence`.
     _reported_sequence: Optional[int] = None
+    # Whether this run has accounted for every position the session holds up to
+    # `sequence`: true for a fresh session, and for one `@workflow` replayed from
+    # the start. False once the run resumes into history it did not replay, which
+    # is what `durable_tools` and any hit-based resume do. Only while it holds can
+    # a cache hit be recorded in this session without risking a second record of
+    # a step the session already holds. See `defer_hit_record`.
+    history_known: bool = True
+    # A cache hit's result, waiting to be recorded at its position in this
+    # session. Written when the next step starts. See `defer_hit_record`.
+    _pending_hit: Optional[Dict[str, Any]] = None
 
     def record_engine_sequence(self, sequence: int) -> None:
         """Notes the session position the engine reported alongside a cache hit.
@@ -39,8 +51,35 @@ class WorkflowContext:
         """
         self._reported_sequence = sequence
 
+    def defer_hit_record(
+        self,
+        sequence: int,
+        name: str,
+        payload: Dict[str, Any],
+        coordination_id: Optional[str],
+    ) -> None:
+        """Holds a cache hit's result to be recorded at `sequence` in this session.
+
+        A hit satisfied from another session leaves nothing at its position in
+        this one. Without a record there, the next step takes that position, and
+        a later resume of this session finds that step where the shared one was
+        expected and cannot replay. Recording the result keeps the session's
+        history the same shape as the work it did.
+
+        Deferred to the next step, like `record_engine_sequence`: the record only
+        matters once something would otherwise take its position, so a workflow
+        that ends on a hit still does no extra work.
+        """
+        self._pending_hit = {
+            "sequence": sequence,
+            "name": name,
+            "payload": payload,
+            "coordination_id": coordination_id,
+        }
+        self.sequence = sequence
+
     def reconcile_sequence(self) -> None:
-        """Adopts the position the engine reported on the last cache hit.
+        """Records a deferred hit, then adopts the position the engine reported.
 
         `@step` increments this counter before every step, but a cache hit
         returns *without committing*. The engine's sequence therefore did not
@@ -61,6 +100,25 @@ class WorkflowContext:
         field. Behaviour then degrades to the original defect rather than to
         something new.
         """
+        pending, self._pending_hit = self._pending_hit, None
+        if pending is not None:
+            try:
+                self.client.commit_step(
+                    session_id=self.session_id,
+                    sequence=pending["sequence"],
+                    name=pending["name"],
+                    status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+                    output_payload=pending["payload"],
+                    coordination_id=pending["coordination_id"],
+                )
+            except grpc.RpcError as exc:
+                if exc.code() != grpc.StatusCode.FAILED_PRECONDITION:
+                    raise
+                # Another writer in this session took the position first. The
+                # run no longer knows what the session holds, so it stops
+                # recording hits and the counter stays where the hit left it.
+                self.history_known = False
+            return
         if self._reported_sequence is not None:
             self.sequence = self._reported_sequence
             self._reported_sequence = None

@@ -182,6 +182,10 @@ export async function durableTools<T>(
     workflowVersion: resp.version,
     sequence: 0,
     coordinationId: sessionCoordinationId(resp, coordinationId),
+    // A resumed session re-runs tools rather than replaying them by position, so
+    // this run never sees what the session already holds and must not record
+    // cache hits into it.
+    historyKnown: !resp.isRecovered,
   });
 
   const session: DurableSession = {

@@ -209,6 +209,39 @@ def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
     return payload.get("result")
 
 
+def _take_hit(
+    ctx: WorkflowContext,
+    resp: Any,
+    seq: int,
+    name: str,
+    call_coordination: Optional[str],
+) -> Any:
+    """Returns a cache hit's result and keeps this session's history in step.
+
+    A hit returns without executing. If the session sits exactly one position
+    behind this call and the run knows everything before it, nothing is recorded
+    at `seq` yet, so the result is recorded there before the next step runs and
+    a resumed session replays it like any other step. Otherwise the run adopts
+    the position the engine reported, as before: a peer in this session already
+    wrote it, or the run is resuming into history it did not replay.
+    """
+    payload: Dict[str, Any] = {"result": None}
+    if resp.cached_result and resp.cached_result.output_payload:
+        payload = deserialize(resp.cached_result.output_payload)
+
+    if resp.HasField("current_sequence"):
+        reported = resp.current_sequence
+        if ctx.history_known and reported == seq - 1:
+            ctx.defer_hit_record(seq, name, payload, call_coordination)
+        else:
+            if reported != seq - 1:
+                # The session's position and this run's count disagree, so the
+                # run cannot tell what the session already holds.
+                ctx.history_known = False
+            ctx.record_engine_sequence(reported)
+    return payload.get("result")
+
+
 def _pop_call_coordination(kwargs: Dict[str, Any]) -> Optional[str]:
     """Takes a step's own coordination domain out of its call arguments.
 
@@ -359,14 +392,7 @@ def step(
                     ) from exc
                 raise
             if resp.status == CACHE_STATUS_HIT:
-                # This path returns without committing, so record where
-                # the engine says the session sits. The next step adopts it.
-                if resp.HasField("current_sequence"):
-                    ctx.record_engine_sequence(resp.current_sequence)
-                if resp.cached_result and resp.cached_result.output_payload:
-                    deserialized = deserialize(resp.cached_result.output_payload)
-                    return deserialized.get("result")
-                return None
+                return _take_hit(ctx, resp, seq, actual_tool_name, call_coordination)
             elif resp.status == CACHE_STATUS_IN_PROGRESS:
                 retry_ms = resp.retry_after_ms or 1000
                 logger.info(
@@ -493,14 +519,7 @@ def step(
                     ) from exc
                 raise
             if resp.status == CACHE_STATUS_HIT:
-                # This path returns without committing, so record where
-                # the engine says the session sits. The next step adopts it.
-                if resp.HasField("current_sequence"):
-                    ctx.record_engine_sequence(resp.current_sequence)
-                if resp.cached_result and resp.cached_result.output_payload:
-                    deserialized = deserialize(resp.cached_result.output_payload)
-                    return deserialized.get("result")
-                return None
+                return _take_hit(ctx, resp, seq, actual_tool_name, call_coordination)
             elif resp.status == CACHE_STATUS_IN_PROGRESS:
                 retry_ms = resp.retry_after_ms or 1000
                 logger.info(
