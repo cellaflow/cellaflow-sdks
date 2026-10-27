@@ -161,6 +161,8 @@ export class WorkflowContext {
       payload: {
         error: {
           format: 1,
+          // Which SDK wrote it: the Python SDK replays only its own records.
+          sdk: "typescript",
           type: typeof e?.name === "string" ? e.name : typeof err,
           message: typeof e?.message === "string" ? e.message : String(err),
           traceback: typeof e?.stack === "string" ? e.stack : "",
