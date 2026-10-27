@@ -12,7 +12,7 @@ import grpc
 
 from cellaflow.client import CellaflowClient
 from cellaflow.history import latest_session_sequence
-from cellaflow.failures import capture, importable
+from cellaflow.failures import capture, findable, unrecorded
 from cellaflow.idempotency import failure_idempotency_key, record_idempotency_key
 from cellaflow.v1 import common_pb2, idempotency_pb2, service_pb2
 
@@ -240,26 +240,76 @@ class WorkflowContext:
         with self._lock:
             if not (self._in_flight == 1 and self.sequence == sequence):
                 return
-            if not importable(type(exc)):
-                logger.warning(
-                    "Cellaflow: %s raised by %r cannot be imported by name, so a "
-                    "resumed run cannot raise it again and will refuse to resume "
-                    "past position %d. Define exceptions a step raises at module "
-                    "level.",
-                    type(exc).__qualname__,
-                    name,
-                    sequence,
-                )
+        # Captured outside the lock: formatting the traceback and encoding each
+        # value is work no other call in the session should wait on.
+        recorded = capture(exc)
+        with self._lock:
+            # Nothing claimed a later position meanwhile.
+            if not (self._in_flight == 1 and self.sequence == sequence):
+                return
             self._pending_hit = {
                 "kind": "failure",
                 "status": common_pb2.StepStatus.STEP_STATUS_FAILED,
                 "sequence": sequence,
                 "name": name,
-                "payload": {"error": capture(exc)},
+                "payload": {"error": recorded},
                 "coordination_id": coordination_id,
                 "agent_id": agent_id,
                 "received_key": step_key,
             }
+        self._warn_if_not_replayable(exc, name, sequence, recorded)
+
+    def _warn_if_not_replayable(
+        self, exc: BaseException, name: str, sequence: int, recorded: Dict[str, Any]
+    ) -> None:
+        """Says now, while the failure happens, what a resume could not reproduce."""
+        cls = type(exc)
+        if "grpc" in recorded:
+            return
+        if not findable(cls):
+            logger.warning(
+                "Cellaflow: %s raised by %r is not defined at module level, so a "
+                "resumed run cannot raise it again and will refuse to resume past "
+                "position %d. Define exceptions a step raises at module level.",
+                cls.__qualname__,
+                name,
+                sequence,
+            )
+        elif cls.__module__ == "__main__":
+            logger.warning(
+                "Cellaflow: %s raised by %r is defined in the script being run "
+                "(__main__). A run resumed from another entry point will not find "
+                "it and will refuse to resume past position %d. Define exceptions "
+                "a step raises in an importable module.",
+                cls.__qualname__,
+                name,
+                sequence,
+            )
+        missing = unrecorded(recorded)
+        if missing:
+            logger.warning(
+                "Cellaflow: %s raised by %r at position %d has values that cannot "
+                "be recorded (%s). A resumed run raises it without them, and "
+                "reading one raises AttributeError.",
+                cls.__qualname__,
+                name,
+                sequence,
+                ", ".join(missing),
+            )
+
+    def give_back_position(self, sequence: int) -> None:
+        """Returns the position of a step that was cancelled before committing.
+
+        A cancelled step is not recorded: replaying a cancellation as a raised
+        exception would not reproduce how it arrived. Its position is handed back
+        instead, so the next step takes it rather than landing one past an empty
+        position. Only while no later position was claimed meanwhile; if the step
+        did commit before the cancellation reached it, the next step's lease at
+        that position is refused before its body runs.
+        """
+        with self._lock:
+            if self._in_flight == 1 and self.sequence == sequence:
+                self.sequence = sequence - 1
 
     def record_pending_failure(self) -> None:
         """Records a failure the workflow caught and finished after.

@@ -433,11 +433,11 @@ def test_a_failure_whose_class_cannot_be_imported_refuses_the_resume(
 
     with caplog.at_level("WARNING", logger="cellaflow.context"):
         assert wf() == "fallback"
-    assert "cannot be imported by name" in caplog.text
+    assert "is not defined at module level" in caplog.text
 
     recorded = mock_stub.CommitStep.call_args_list[0][0][0].step_result
     _history(mock_stub, "sess-local", [recorded])
-    with pytest.raises(NondeterministicWorkflowError, match="cannot be imported"):
+    with pytest.raises(NondeterministicWorkflowError, match="not defined in any"):
         wf(_session_id="sess-local")  # type: ignore[call-arg]
 
 
@@ -490,30 +490,180 @@ def test_an_argument_that_cannot_be_recorded_cannot_be_used_on_replay() -> None:
 def test_a_location_that_is_not_an_exception_class_is_refused() -> None:
     from cellaflow.failures import ReplayedFailureError, rebuild
 
-    with pytest.raises(ReplayedFailureError, match="cannot be imported"):
+    with pytest.raises(ReplayedFailureError, match="not defined in any module"):
         rebuild({"type": "os:path", "args": []}, "step", 4)
-    with pytest.raises(ReplayedFailureError, match="cannot be imported"):
+    with pytest.raises(ReplayedFailureError, match="not defined in any module"):
         rebuild({"type": "no.such.module:Thing", "args": []}, "step", 4)
 
 
-class NeedsArguments(Exception):
-    """Its own __new__ takes nothing, so the arguments cannot go through it."""
+class OwnNew(Exception):
+    """Its own __new__ and __init__ have side effects. Replay never runs them."""
 
-    def __new__(cls) -> "NeedsArguments":
-        return super().__new__(cls)
+    calls: List[str] = []
+
+    def __new__(cls, *args: Any) -> "OwnNew":
+        OwnNew.calls.append("new")
+        return super().__new__(cls, *args)
+
+    def __init__(self, *args: Any) -> None:
+        OwnNew.calls.append("init")
+        super().__init__(*args)
 
 
-class Unbuildable(Exception):
-    def __new__(cls, *args: Any) -> "Unbuildable":
-        raise RuntimeError("never")
+def test_a_class_s_own_new_and_init_never_run_on_replay() -> None:
+    """Rebuilding runs no code the recorded data can choose: only Python's own
+    exception machinery, which stores fields."""
+    from cellaflow.failures import rebuild
+
+    OwnNew.calls.clear()
+    rebuilt = rebuild({"type": f"{__name__}:OwnNew", "args": ["x"]}, "step", 1)
+    assert type(rebuilt) is OwnNew and rebuilt.args == ("x",)
+    assert OwnNew.calls == []
 
 
-def test_a_class_with_its_own_new_is_rebuilt_or_refused() -> None:
+# --- Review fixes --------------------------------------------------------------
+
+
+def test_replay_never_imports_a_module(tmp_path: Any, monkeypatch: Any) -> None:
+    """The recorded type names a class; replay looks only among modules already
+    loaded. A module it would have to import is refused, and its code never runs."""
     from cellaflow.failures import ReplayedFailureError, rebuild
 
-    recorded = {"type": f"{__name__}:NeedsArguments", "args": ["x"]}
-    rebuilt = rebuild(recorded, "step", 1)
-    assert type(rebuilt) is NeedsArguments and rebuilt.args == ("x",)
+    (tmp_path / "side_effect_on_import.py").write_text(
+        "import builtins\nbuiltins.CELLAFLOW_IMPORTED = True\n"
+        "class Boom(Exception):\n    pass\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    import builtins
 
-    with pytest.raises(ReplayedFailureError, match="could not be recreated"):
-        rebuild({"type": f"{__name__}:Unbuildable", "args": []}, "step", 1)
+    with pytest.raises(ReplayedFailureError, match="not defined in any module"):
+        rebuild({"type": "side_effect_on_import:Boom", "args": []}, "step", 1)
+    assert not hasattr(builtins, "CELLAFLOW_IMPORTED")
+
+
+def test_a_cancelled_step_gives_its_position_back(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """A cancellation is not recorded: replayed as a raised exception it would not
+    arrive the way it did (wait_for turns a real one into TimeoutError). The
+    position is handed back and the lease released, so the next step takes the
+    position instead of landing past an empty one."""
+    _fresh(mock_stub, "sess-cancel")
+
+    @step
+    async def charge() -> str:
+        await asyncio.sleep(5)
+        return "charged"
+
+    @step
+    async def fallback() -> str:
+        return "fallback"
+
+    @workflow(version="1.0.0")
+    async def checkout() -> str:
+        try:
+            return await asyncio.wait_for(charge(), 0.05)
+        except asyncio.TimeoutError:
+            return await fallback()  # type: ignore[no-any-return]
+
+    assert asyncio.run(checkout()) == "fallback"
+    assert _commits(mock_stub) == [(1, "fallback", SUCCESS)]
+    mock_stub.ReleaseLease.assert_called_once()
+
+
+class Unavailable(grpc.RpcError):  # type: ignore[misc]
+    def code(self) -> grpc.StatusCode:
+        return grpc.StatusCode.UNAVAILABLE
+
+    def details(self) -> str:
+        return "engine restarting"
+
+
+def test_an_engine_error_replays_with_its_code_and_details() -> None:
+    from cellaflow.failures import ReplayedRpcError
+
+    rebuilt = _round_trip(Unavailable())
+    assert isinstance(rebuilt, grpc.RpcError) and isinstance(rebuilt, ReplayedRpcError)
+    assert rebuilt.code() == grpc.StatusCode.UNAVAILABLE
+    assert rebuilt.details() == "engine restarting"
+
+
+class WithStatus(Exception):
+    def __init__(self, status: Any) -> None:
+        super().__init__(f"status {int(status)}")
+        self.status = status
+
+
+def test_tuples_enums_and_plain_subclasses_are_recorded() -> None:
+    """Tuples come back as tuples. An enum or a subclass of a plain type comes
+    back as its plain value, so comparisons with it still hold."""
+    from http import HTTPStatus
+
+    key_error = _round_trip(KeyError(("a", 1)))
+    assert key_error.args == (("a", 1),) and str(key_error) == "('a', 1)"
+
+    with_status = _round_trip(WithStatus(HTTPStatus.NOT_FOUND))
+    assert isinstance(with_status, WithStatus)
+    assert with_status.status == 404
+
+
+def test_values_that_cannot_be_recorded_are_named_when_the_failure_happens(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
+) -> None:
+    _fresh(mock_stub, "sess-unrecorded")
+
+    @step
+    def fetch() -> str:
+        raise WithResponse("boom")
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            fetch()
+        except WithResponse:
+            return "fallback"
+        return "fetched"
+
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert wf() == "fallback"
+    assert "cannot be recorded (response)" in caplog.text
+
+
+def test_a_class_defined_in_main_is_warned_about(
+    mock_stub: MagicMock, mock_client: None, caplog: Any, monkeypatch: Any
+) -> None:
+    """Found by the process that raised it, but not by a resume started from
+    another entry point."""
+    import __main__
+
+    class InMain(Exception):
+        pass
+
+    InMain.__module__ = "__main__"
+    InMain.__qualname__ = "InMain"
+    monkeypatch.setattr(__main__, "InMain", InMain, raising=False)
+    _fresh(mock_stub, "sess-main")
+
+    @step
+    def charge() -> str:
+        raise InMain("x")
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            charge()
+        except InMain:
+            return "fallback"
+        return "charged"
+
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert wf() == "fallback"
+    assert "(__main__)" in caplog.text
+
+
+def test_a_failure_recorded_by_another_sdk_is_refused() -> None:
+    from cellaflow.failures import ReplayedFailureError, rebuild
+
+    recorded = {"sdk": "typescript", "type": "PaymentDeclined", "message": "x"}
+    with pytest.raises(ReplayedFailureError, match="recorded by the typescript SDK"):
+        rebuild(recorded, "charge", 1)

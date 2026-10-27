@@ -11,16 +11,22 @@ All notable changes to the CellaFlow Python SDK.
   `STEP_STATUS_FAILED`, and the next step takes the following position. A resumed `@workflow`
   raises the same exception there instead of running the step again, so it takes the same branch.
 
-  The exception comes back as an instance of its own class, with its arguments and attributes,
-  rebuilt without calling its constructor, so `except` clauses and `isinstance` checks behave as
-  they did. Its class must be importable by name: defined at module level, and still present when
-  the run resumes. Otherwise the resume stops with `NondeterministicWorkflowError` rather than run
-  the step again, and the original run logs a warning when the failure happens. Attributes whose
-  values cannot be serialized, such as an HTTP response object, are not recorded; reading one on
-  replay raises `AttributeError`.
+  The exception comes back as an instance of its own class, with its arguments and attributes, so
+  `except` clauses and `isinstance` checks behave as they did. Rebuilding it runs no code the
+  record can choose: the class is looked up only among modules already loaded, nothing is
+  imported, and the class's own `__new__` and `__init__` are not called. Its class must be defined
+  at module level in a module the workflow imports, as it is when an `except` clause names it.
+  Otherwise the resume stops with `NondeterministicWorkflowError` rather than run the step again.
+  The original run logs a warning when the failure happens if the class cannot be found by name,
+  is defined in `__main__`, or has values that cannot be recorded, such as an HTTP response
+  object; reading one on replay raises `AttributeError`. Tuples, enums and subclasses of plain
+  types are recorded, the last two as their plain value. An engine call's gRPC error comes back as
+  a `grpc.RpcError` with the same `code()` and `details()`.
 
   A failure the workflow lets propagate is not recorded, so resuming retries the step. A failure
-  while another step of the session is in flight is not recorded either.
+  while another step of the session is in flight is not recorded either. A cancelled step
+  (`asyncio.CancelledError`) is not recorded: it gives its position back and releases its lease,
+  so the next step takes that position.
 
 ### Fixed
 

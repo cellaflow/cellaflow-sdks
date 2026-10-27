@@ -257,8 +257,15 @@ def _note_failure(
     """Holds a live step's failure to be recorded at its position.
 
     Not for a refused lease: another writer owns that position and fills it.
+    Not for cancellation or a process exit (`asyncio.CancelledError`,
+    `KeyboardInterrupt`): replayed as a raised exception, a cancellation would not
+    arrive the way it did the first time (`asyncio.wait_for` turns a real one into
+    `TimeoutError`), so the step gives its position back instead.
     """
     if isinstance(exc, DivergentStepError):
+        return
+    if not isinstance(exc, Exception):
+        ctx.give_back_position(seq)
         return
     ctx.defer_failure_record(
         seq, name, exc, call_coordination, agent_id=agent_id, step_key=ikey or ""
@@ -497,7 +504,9 @@ def step(
                     coordination_id=call_coordination,
                 )
                 return result
-            except Exception as e:
+            except BaseException as e:
+                # Cancellation too: a lease left held would refuse the step that
+                # takes this position next until it lapsed.
                 if fencing_token > 0:
                     ctx.client.release_lease(
                         agent_id=agent_id,
@@ -643,7 +652,9 @@ def step(
                     coordination_id=call_coordination,
                 )
                 return result
-            except Exception as e:
+            except BaseException as e:
+                # Cancellation too: a lease left held would refuse the step that
+                # takes this position next until it lapsed.
                 if fencing_token > 0:
                     ctx.client.release_lease(
                         agent_id=agent_id,
