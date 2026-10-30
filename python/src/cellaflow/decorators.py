@@ -183,31 +183,57 @@ class DivergentStepError(RuntimeError):
 
 
 class NondeterministicWorkflowError(RuntimeError):
-    """Raised when a resumed run reaches a step that does not match history.
+    """A resumed run cannot be replayed against its recorded history.
 
     Replay is positional: the step at sequence N is answered from whatever was
     committed at sequence N. That is only sound if the resumed run performs the
     same steps in the same order, which is why the workflow body must be
-    deterministic given the session's inputs — all nondeterminism belongs inside
+    deterministic given the session's inputs: all nondeterminism belongs inside
     step bodies, never in the code deciding what to call.
 
-    Reaching this means the two diverged. Continuing would hand back another
-    step's result, so the run stops instead.
+    The base of `ReplayDivergedError` and `FailureNotReplayableError`; catch this
+    to handle both. Raised as itself only for a record that cannot be verified.
     """
 
 
-def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
-    """Returns the recorded result at `seq`, or raises if it is a different step.
+class ReplayDivergedError(NondeterministicWorkflowError):
+    """The resumed run called a different step than its history records here.
 
-    Replay is positional, so the step recorded at a sequence is only the right
-    answer if the resumed run reached that sequence by the same path. Matching on
-    the step name establishes that before the recorded result is returned.
-
-    A record whose name is empty is treated as unverifiable and rejected rather
-    than replayed.
+    The run went a different way than it did the first time: the code changed
+    since then, or it branched on something that was not recorded. Continuing
+    would hand back another step's result, so the run stops before this step
+    does anything. Nothing ran twice; to go on, start a new session.
     """
-    recorded = ctx.replayed_steps[seq]
-    recorded_name = recorded.get("name")
+
+
+class FailureNotReplayableError(NondeterministicWorkflowError):
+    """A recorded failure or cancellation cannot be reproduced as it happened.
+
+    For example, the exception's class cannot be found in the resumed process,
+    or the record was written by another SDK. Raising something else instead
+    could send the run down a different branch, so it stops.
+    """
+
+
+#: How long a replayed cancellation waits, as a multiple of the time the step ran
+#: before it was cancelled the first time, plus a fixed allowance. Long enough
+#: that whatever cancelled it then (a `wait_for` timer) does so again first.
+_CANCEL_WAIT_FACTOR = 2.0
+_CANCEL_WAIT_EXTRA_S = 0.25
+
+
+def _cancellation(recorded: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The recorded cancellation, if this record is one."""
+    if recorded.get("status") != STEP_STATUS_FAILED:
+        return None
+    payload = recorded.get("payload") or {}
+    cancelled = payload.get("cancelled")
+    return cancelled if isinstance(cancelled, dict) else None
+
+
+def _check_recorded_name(ctx: WorkflowContext, seq: int, expected_name: str) -> None:
+    """Raises unless the step recorded at `seq` is `expected_name`."""
+    recorded_name = ctx.replayed_steps[seq].get("name")
 
     # Fail closed on an unverifiable record. Every step this SDK commits carries a
     # name -- `@step` falls back to `func.__name__`, the LangGraph saver builds
@@ -221,28 +247,108 @@ def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
             f"than a different step at the same position. Every step this SDK "
             f"commits records its name, so this history did not come from it."
         )
-
     if recorded_name != expected_name:
-        raise NondeterministicWorkflowError(
-            f"Workflow diverged from its recorded history at sequence {seq}: "
-            f"expected step {expected_name!r}, but {recorded_name!r} was "
-            f"committed there. A resumed run must perform the same steps in the "
-            f"same order — move any branching on model output, clocks, or "
-            f"network reads inside a step so its result is replayed too."
+        raise ReplayDivergedError(
+            _divergence_message(ctx, seq, expected_name, recorded_name)
         )
 
+
+def _divergence_message(
+    ctx: WorkflowContext, seq: int, expected_name: str, recorded_name: str
+) -> str:
+    lines = [
+        f"Session {ctx.session_id} cannot resume at position {seq}. The resumed "
+        f"run called {expected_name!r}, but the history records "
+        f"{recorded_name!r} there."
+    ]
+    # The last failure or cancellation before here is usually where the paths
+    # parted: the code handled it differently this time.
+    earlier = sorted(p for p in ctx.replayed_steps if p < seq)
+    for position in reversed(earlier):
+        record = ctx.replayed_steps[position]
+        if record.get("status") != STEP_STATUS_FAILED:
+            continue
+        name = record.get("name")
+        if _cancellation(record) is not None:
+            what = "was cancelled"
+        else:
+            error = (record.get("payload") or {}).get("error") or {}
+            kind = str(error.get("type", "")).rpartition(":")[2] or "an exception"
+            what = f"failed with {kind}"
+        lines.append(
+            f"Position {position} ({name!r}) {what} on the first run; after it, "
+            f"the code took a different branch than it did then."
+        )
+        break
+    lines.append(
+        "Common causes: the workflow code changed since the first run (a step "
+        "added, removed or reordered, or a different timeout), or it branched on "
+        "something not recorded (the clock, a random number, a model's answer "
+        "outside a step). Nothing ran twice. To go on, start a new session for "
+        "this work."
+    )
+    return "\n".join(lines)
+
+
+async def _replay_cancellation(cancelled: Dict[str, Any]) -> None:
+    """Reproduces a cancellation: waits to be cancelled, as the step did then.
+
+    What the workflow saw depended on what cancelled the step, not on the step:
+    `asyncio.wait_for` turns its own cancellation into `TimeoutError`, while a
+    `task.cancel()` arrives as `CancelledError`. So the replay does not raise
+    anything at once. It waits, and whatever cancelled the step the first time
+    cancels it again, producing the same exception. If nothing does within twice
+    the time the step ran then, the cancellation came from outside the code (a
+    person pressing Cancel), and the replay delivers it itself.
+    """
+    elapsed = float(cancelled.get("elapsed_s") or 0.0)
+    await asyncio.sleep(elapsed * _CANCEL_WAIT_FACTOR + _CANCEL_WAIT_EXTRA_S)
+    raise asyncio.CancelledError()
+
+
+def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
+    """Returns the recorded result at `seq`, or raises if it is a different step.
+
+    Replay is positional, so the step recorded at a sequence is only the right
+    answer if the resumed run reached that sequence by the same path. Matching on
+    the step name establishes that before the recorded result is returned.
+
+    A record whose name is empty is treated as unverifiable and rejected rather
+    than replayed.
+    """
+    _check_recorded_name(ctx, seq, expected_name)
+    recorded = ctx.replayed_steps[seq]
     payload = recorded.get("payload")
+    if _cancellation(recorded) is not None:
+        # Only an async step is ever recorded as cancelled, and an async step
+        # replays it through `_replay_cancellation`. Reaching it here means the
+        # step is now synchronous, which cannot be cancelled the same way.
+        raise FailureNotReplayableError(
+            f"Cannot replay position {seq} ({expected_name!r}) of session "
+            f"{ctx.session_id}: it was cancelled on the first run, as an async "
+            f"step, and is now a synchronous one. Start a new session for this "
+            f"work."
+        )
     if recorded.get("status") == STEP_STATUS_FAILED:
         # The step failed the first time, and the workflow carried on past it.
         # Raise the same exception, so the resumed run takes the same branch.
         try:
             failure = rebuild((payload or {}).get("error", {}), expected_name, seq)
         except ReplayedFailureError as exc:
-            raise NondeterministicWorkflowError(str(exc)) from None
+            raise FailureNotReplayableError(str(exc)) from None
         raise failure
     if payload is None:
         return None
     return payload.get("result")
+
+
+async def _replay_async(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
+    """`_replay` for an async step, which can also replay a cancellation."""
+    _check_recorded_name(ctx, seq, expected_name)
+    cancelled = _cancellation(ctx.replayed_steps[seq])
+    if cancelled is not None:
+        await _replay_cancellation(cancelled)
+    return _replay(ctx, seq, expected_name)
 
 
 def _note_failure(
@@ -253,16 +359,24 @@ def _note_failure(
     call_coordination: Optional[str],
     agent_id: str,
     ikey: Optional[str],
+    elapsed_s: float,
 ) -> None:
-    """Holds a live step's failure to be recorded at its position.
+    """Holds a live step's failure or cancellation to be recorded at its position.
 
     Not for a refused lease: another writer owns that position and fills it.
-    Not for cancellation or a process exit (`asyncio.CancelledError`,
-    `KeyboardInterrupt`): replayed as a raised exception, a cancellation would not
-    arrive the way it did the first time (`asyncio.wait_for` turns a real one into
-    `TimeoutError`), so the step gives its position back instead.
+    A cancellation (`asyncio.CancelledError`) is recorded with how long the step
+    ran, so a replay can wait to be cancelled the same way; see
+    `_replay_cancellation`. A process exit (`KeyboardInterrupt`, `SystemExit`)
+    is not something a workflow carries on past, so the step gives its position
+    back instead.
     """
     if isinstance(exc, DivergentStepError):
+        return
+    if isinstance(exc, asyncio.CancelledError):
+        ctx.defer_cancellation_record(
+            seq, name, elapsed_s, call_coordination, agent_id=agent_id,
+            step_key=ikey or "",
+        )
         return
     if not isinstance(exc, Exception):
         ctx.give_back_position(seq)
@@ -398,9 +512,10 @@ def step(
         # failure is recorded; `ikey` once it is known.
         live = False
         ikey: Optional[str] = None
+        started = time.monotonic()
         try:
             if seq in ctx.replayed_steps:
-                return _replay(ctx, seq, actual_tool_name)
+                return await _replay_async(ctx, seq, actual_tool_name)
             live = True
 
             # Derive idempotency key
@@ -521,7 +636,14 @@ def step(
         except BaseException as exc:
             if live:
                 _note_failure(
-                    ctx, seq, actual_tool_name, exc, call_coordination, agent_id, ikey
+                    ctx,
+                    seq,
+                    actual_tool_name,
+                    exc,
+                    call_coordination,
+                    agent_id,
+                    ikey,
+                    time.monotonic() - started,
                 )
             raise
         finally:
@@ -546,6 +668,7 @@ def step(
         # failure is recorded; `ikey` once it is known.
         live = False
         ikey: Optional[str] = None
+        started = time.monotonic()
         try:
             if seq in ctx.replayed_steps:
                 return _replay(ctx, seq, actual_tool_name)
@@ -669,7 +792,14 @@ def step(
         except BaseException as exc:
             if live:
                 _note_failure(
-                    ctx, seq, actual_tool_name, exc, call_coordination, agent_id, ikey
+                    ctx,
+                    seq,
+                    actual_tool_name,
+                    exc,
+                    call_coordination,
+                    agent_id,
+                    ikey,
+                    time.monotonic() - started,
                 )
             raise
         finally:

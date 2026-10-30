@@ -24,9 +24,22 @@ All notable changes to the CellaFlow Python SDK.
   a `grpc.RpcError` with the same `code()` and `details()`.
 
   A failure the workflow lets propagate is not recorded, so resuming retries the step. A failure
-  while another step of the session is in flight is not recorded either. A cancelled step
-  (`asyncio.CancelledError`) is not recorded: it gives its position back and releases its lease,
-  so the next step takes that position.
+  while another step of the session is in flight is not recorded either.
+
+  A cancelled async step (`asyncio.CancelledError`) is recorded the same way, with how long it ran
+  before the cancellation, and its lease is released. On replay it does not raise at once: it waits,
+  so whatever cancelled it the first time cancels it again and the code sees the same exception
+  (`asyncio.wait_for` turns its own cancellation into `TimeoutError`). If nothing has cancelled it
+  after twice the time it ran, the cancellation came from outside the code, and the replay delivers
+  it itself. A replayed timeout therefore takes as long as the original wait; putting the timeout
+  inside the step (`return await asyncio.wait_for(call(), 5)` in its body) records a plain
+  `TimeoutError` instead, which replays at once.
+
+- **Two kinds of `NondeterministicWorkflowError`.** `ReplayDivergedError` means the resumed run
+  called a different step than its history records at a position; its message names the session,
+  the position, both steps, the last failure or cancellation before them, and the way on.
+  `FailureNotReplayableError` means a recorded failure or cancellation cannot be reproduced as it
+  happened. Both subclass `NondeterministicWorkflowError`, so code that catches it still does.
 
 ### Fixed
 

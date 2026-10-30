@@ -6,7 +6,9 @@ from cellaflow.decorators import (
     step,
     tool,
     DivergentStepError,
+    FailureNotReplayableError,
     NondeterministicWorkflowError,
+    ReplayDivergedError,
 )
 from cellaflow.idempotency import IdempotencyScope
 
@@ -34,6 +36,8 @@ __all__ = [
     "tool_session_id",
     "DivergentStepError",
     "NondeterministicWorkflowError",
+    "ReplayDivergedError",
+    "FailureNotReplayableError",
     "CellaflowClient",
     "workflow",
     "step",

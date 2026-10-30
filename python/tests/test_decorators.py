@@ -2,7 +2,7 @@ import pytest
 from unittest.mock import MagicMock
 from typing import Callable, Any, Dict, List, Optional, Tuple
 
-from cellaflow.decorators import workflow, step, tool
+from cellaflow.decorators import ReplayDivergedError, workflow, step, tool
 from cellaflow.idempotency import IdempotencyScope
 from cellaflow.v1 import service_pb2
 from cellaflow.serialization import deserialize, serialize
@@ -910,7 +910,8 @@ def test_replay_rejects_a_different_step_at_the_same_sequence(
         wf()
 
     message = str(excinfo.value)
-    assert "sequence 1" in message
+    assert isinstance(excinfo.value, ReplayDivergedError)
+    assert "position 1" in message
     assert "'shared'" in message, "the error must name the step that was expected"
     assert "'warmup'" in message, "the error must name the step that was found"
 

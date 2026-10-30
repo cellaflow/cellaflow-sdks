@@ -243,21 +243,62 @@ class WorkflowContext:
         # Captured outside the lock: formatting the traceback and encoding each
         # value is work no other call in the session should wait on.
         recorded = capture(exc)
+        if self._hold_failure(
+            sequence, name, {"error": recorded}, coordination_id, agent_id, step_key
+        ):
+            self._warn_if_not_replayable(exc, name, sequence, recorded)
+
+    def defer_cancellation_record(
+        self,
+        sequence: int,
+        name: str,
+        elapsed_s: float,
+        coordination_id: Optional[str],
+        agent_id: str = "default",
+        step_key: str = "",
+    ) -> None:
+        """Holds a step's cancellation to be recorded at `sequence`.
+
+        Recorded with how long the step ran before it was cancelled, because a
+        replay reproduces a cancellation by waiting to be cancelled again rather
+        than by raising one: what the workflow saw depended on what cancelled the
+        step. Written and guarded exactly as a failure is; see
+        `defer_failure_record`.
+        """
+        cancelled = {"format": 1, "sdk": "python", "elapsed_s": round(elapsed_s, 3)}
+        self._hold_failure(
+            sequence,
+            name,
+            {"cancelled": cancelled},
+            coordination_id,
+            agent_id,
+            step_key,
+        )
+
+    def _hold_failure(
+        self,
+        sequence: int,
+        name: str,
+        payload: Dict[str, Any],
+        coordination_id: Optional[str],
+        agent_id: str,
+        step_key: str,
+    ) -> bool:
+        """Holds a failure-kind record, if nothing claimed a later position."""
         with self._lock:
-            # Nothing claimed a later position meanwhile.
             if not (self._in_flight == 1 and self.sequence == sequence):
-                return
+                return False
             self._pending_hit = {
                 "kind": "failure",
                 "status": common_pb2.StepStatus.STEP_STATUS_FAILED,
                 "sequence": sequence,
                 "name": name,
-                "payload": {"error": recorded},
+                "payload": payload,
                 "coordination_id": coordination_id,
                 "agent_id": agent_id,
                 "received_key": step_key,
             }
-        self._warn_if_not_replayable(exc, name, sequence, recorded)
+            return True
 
     def _warn_if_not_replayable(
         self, exc: BaseException, name: str, sequence: int, recorded: Dict[str, Any]
@@ -298,14 +339,14 @@ class WorkflowContext:
             )
 
     def give_back_position(self, sequence: int) -> None:
-        """Returns the position of a step that was cancelled before committing.
+        """Returns the position of a step a process exit interrupted.
 
-        A cancelled step is not recorded: replaying a cancellation as a raised
-        exception would not reproduce how it arrived. Its position is handed back
-        instead, so the next step takes it rather than landing one past an empty
-        position. Only while no later position was claimed meanwhile; if the step
-        did commit before the cancellation reached it, the next step's lease at
-        that position is refused before its body runs.
+        A `KeyboardInterrupt` or `SystemExit` is not something a workflow carries
+        on past, so it is not recorded. If the code does carry on anyway, its next
+        step takes this position rather than landing one past an empty one. Only
+        while no later position was claimed meanwhile; if the step did commit
+        before the interruption reached it, the next step's lease at that position
+        is refused before its body runs.
         """
         with self._lock:
             if self._in_flight == 1 and self.sequence == sequence:
