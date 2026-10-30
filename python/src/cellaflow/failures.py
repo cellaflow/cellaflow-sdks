@@ -28,6 +28,7 @@ return them: the transport's own error class holds live channel state that canno
 be recorded.
 """
 
+import builtins
 import enum
 import inspect
 import sys
@@ -166,17 +167,102 @@ def findable(cls: type) -> bool:
     return _resolve(type_location(cls)) is cls
 
 
-def capture(exc: BaseException) -> Dict[str, Any]:
+#: Bounds on a recorded failure, so a record always fits in a commit. A value over
+#: `_MAX_VALUE_BYTES` is not recorded (reading it on replay raises), the traceback
+#: keeps its last `_MAX_TRACEBACK_CHARS`, and a record still over
+#: `_MAX_RECORD_BYTES` keeps only its type and message.
+_MAX_VALUE_BYTES = 64 * 1024
+_MAX_TRACEBACK_CHARS = 16 * 1024
+_MAX_MESSAGE_CHARS = 4 * 1024
+_MAX_RECORD_BYTES = 512 * 1024
+#: How deep and how wide an exception group is recorded.
+_MAX_GROUP_DEPTH = 5
+_MAX_GROUP_MEMBERS = 50
+
+_BaseExceptionGroup: Any = getattr(builtins, "BaseExceptionGroup", None)
+
+
+def _safe_encode(value: Any) -> Tuple[bool, Any]:
+    """`_encode`, treating a value it cannot walk (too deep, or self-referencing)
+    as one that cannot be recorded."""
+    try:
+        return _encode(value)
+    except RecursionError:
+        return False, None
+
+
+def _small_enough(encoded: Any) -> bool:
+    try:
+        return len(serialize({"v": encoded})) <= _MAX_VALUE_BYTES
+    except Exception:
+        return False
+
+
+def _builtin_fields(exc: BaseException) -> Dict[str, Any]:
+    """Fields Python's own exception classes keep outside `args` and `__dict__`.
+
+    `OSError.errno`, `ImportError.name`, `StopIteration.value` and the like. An
+    exception whose class defines its own `__init__` sets them there, and the
+    rebuild never runs that `__init__`, so they are recorded and set directly.
+    """
+    fields: Dict[str, Any] = {}
+    for klass in type(exc).__mro__:
+        if klass.__module__ != "builtins":
+            continue
+        for name, descriptor in vars(klass).items():
+            if name.startswith("__") or name == "args":
+                continue
+            builtin_field = (types.GetSetDescriptorType, types.MemberDescriptorType)
+            if not isinstance(descriptor, builtin_field):
+                continue
+            try:
+                value = getattr(exc, name)
+            except Exception:
+                continue
+            if value is not None:
+                fields.setdefault(name, value)
+    return fields
+
+
+def capture(exc: BaseException, _depth: int = 0) -> Dict[str, Any]:
     """The recorded form of `exc`. `unavailable_args` and `unavailable_attrs`
-    name what could not be recorded."""
+    name what could not be recorded.
+
+    Never raises: a failure is recorded while the step's own exception is on its
+    way to the workflow, and nothing here may replace it. Whatever cannot be read
+    is recorded as unavailable.
+    """
+    try:
+        return _capture(exc, _depth)
+    except Exception as error:  # an exception that cannot even be inspected
+        return {
+            "format": FAILURE_FORMAT,
+            "sdk": "python",
+            "type": type_location(type(exc)),
+            "message": f"<not recorded: {type(error).__name__}>",
+            "args": [],
+            "unavailable_args": [],
+            "attrs": {},
+            "unavailable_attrs": [],
+            "traceback": "",
+        }
+
+
+def _capture(exc: BaseException, depth: int) -> Dict[str, Any]:
+    try:
+        message = str(exc)[:_MAX_MESSAGE_CHARS]
+    except Exception:
+        message = f"<{type(exc).__name__}: str() raised>"
+    try:
+        trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    except Exception:
+        trace = ""
     recorded: Dict[str, Any] = {
         "format": FAILURE_FORMAT,
         "sdk": "python",
         "type": type_location(type(exc)),
-        "message": str(exc),
-        "traceback": "".join(
-            traceback.format_exception(type(exc), exc, exc.__traceback__)
-        ),
+        "message": message,
+        "traceback": trace[-_MAX_TRACEBACK_CHARS:],
     }
 
     code = getattr(exc, "code", None)
@@ -191,27 +277,35 @@ def capture(exc: BaseException) -> Dict[str, Any]:
             recorded["grpc"] = {"code": status.name, "details": str(details or "")}
             return recorded
 
+    if _BaseExceptionGroup is not None and isinstance(exc, _BaseExceptionGroup):
+        members = list(exc.exceptions)
+        if depth < _MAX_GROUP_DEPTH and len(members) <= _MAX_GROUP_MEMBERS:
+            recorded["group"] = {
+                "message": exc.message,
+                "exceptions": [_capture_member(m, depth + 1) for m in members],
+            }
+
     args: List[Any] = []
     unavailable_args: List[int] = []
-    for i, arg in enumerate(exc.args):
-        ok, encoded = _encode(arg)
-        args.append(encoded if ok else None)
-        if not ok:
-            unavailable_args.append(i)
+    if "group" not in recorded:
+        for i, arg in enumerate(exc.args):
+            ok, encoded = _safe_encode(arg)
+            ok = ok and _small_enough(encoded)
+            args.append(encoded if ok else None)
+            if not ok:
+                unavailable_args.append(i)
 
-    fields = dict(vars(exc))
-    if isinstance(exc, OSError):
-        # Kept outside `args` and `__dict__`, by OSError itself.
-        for name in ("filename", "filename2"):
-            if getattr(exc, name, None) is not None:
-                fields[name] = getattr(exc, name)
+    fields = {**_builtin_fields(exc), **dict(vars(exc))}
+    if "group" in recorded:
+        for name in ("message", "exceptions"):
+            fields.pop(name, None)
     attrs: Dict[str, Any] = {}
     unavailable_attrs: List[str] = []
     for name, value in fields.items():
         if name.startswith("__"):
             continue
-        ok, encoded = _encode(value)
-        if ok:
+        ok, encoded = _safe_encode(value)
+        if ok and _small_enough(encoded):
             attrs[name] = encoded
         else:
             unavailable_attrs.append(name)
@@ -223,17 +317,25 @@ def capture(exc: BaseException) -> Dict[str, Any]:
         unavailable_attrs=unavailable_attrs,
     )
     try:
-        serialize({"e": recorded})
+        too_big = len(serialize({"e": recorded})) > _MAX_RECORD_BYTES
     except Exception:
-        # A value the encoder accepted and the serializer did not: record the
-        # type and message only, so the failure is still recorded.
+        too_big = True
+    if too_big:
+        # Still recorded, so the position is filled: the type and the message.
+        recorded.pop("group", None)
         recorded.update(
-            args=[None] * len(args),
-            unavailable_args=list(range(len(args))),
+            args=[None] * len(exc.args),
+            unavailable_args=list(range(len(exc.args))),
             attrs={},
-            unavailable_attrs=sorted(fields),
+            unavailable_attrs=sorted(n for n in fields if not n.startswith("__")),
         )
     return recorded
+
+
+def _capture_member(exc: BaseException, depth: int) -> Dict[str, Any]:
+    member = capture(exc, depth)
+    member.pop("traceback", None)  # the group's own traceback covers it
+    return member
 
 
 # --- Rebuilding ---------------------------------------------------------------
@@ -289,13 +391,31 @@ def _with_missing(cls: type, names: List[str]) -> type:
     return subclass
 
 
-def rebuild(recorded: Dict[str, Any], step_name: str, sequence: int) -> BaseException:
+def rebuild(recorded: Any, step_name: str, sequence: int) -> BaseException:
     """An instance of the recorded exception's class, carrying its recorded state.
 
     Raises `ReplayedFailureError` when it cannot, so the caller can refuse the
     resume instead of running the step again.
     """
     where = f"the failure of {step_name!r} at position {sequence}"
+    try:
+        return _rebuild(recorded, where)
+    except ReplayedFailureError:
+        raise
+    except Exception as error:
+        # A record this SDK could not have written, or a class hook that refused.
+        raise ReplayedFailureError(
+            f"Cannot replay {where}: the recorded failure could not be recreated "
+            f"({type(error).__name__}: {error})."
+        ) from error
+
+
+def _rebuild(recorded: Any, where: str) -> BaseException:
+    if not isinstance(recorded, dict) or not recorded.get("type"):
+        raise ReplayedFailureError(
+            f"Cannot replay {where}: the step is recorded as failed, but not in a "
+            f"form this SDK writes."
+        )
     sdk = recorded.get("sdk", "python")
     if sdk != "python":
         raise ReplayedFailureError(
@@ -305,16 +425,16 @@ def rebuild(recorded: Dict[str, Any], step_name: str, sequence: int) -> BaseExce
 
     grpc_error = recorded.get("grpc")
     if grpc_error is not None:
-        status = getattr(grpc.StatusCode, grpc_error.get("code", ""), None)
+        status = getattr(grpc.StatusCode, str(grpc_error.get("code", "")), None)
         if not isinstance(status, grpc.StatusCode):
             raise ReplayedFailureError(
                 f"Cannot replay {where}: unknown gRPC status {grpc_error!r}."
             )
-        replayed = ReplayedRpcError(status, grpc_error.get("details", ""))
+        replayed = ReplayedRpcError(status, str(grpc_error.get("details", "")))
         _note(replayed, recorded, where)
         return replayed
 
-    location = recorded.get("type", "")
+    location = recorded["type"]
     cls = _resolve(location)
     if not (isinstance(cls, type) and issubclass(cls, BaseException)):
         raise ReplayedFailureError(
@@ -324,9 +444,16 @@ def rebuild(recorded: Dict[str, Any], step_name: str, sequence: int) -> BaseExce
             f"them there while runs that raised them may still resume."
         )
 
-    args: List[Any] = [_decode(arg) for arg in recorded.get("args", [])]
-    for i in recorded.get("unavailable_args", []):
-        args[i] = UnavailableOnReplay(f"argument {i} of {cls.__name__}")
+    group = recorded.get("group")
+    if group is not None:
+        # An exception group: its members are rebuilt the same way, and the group
+        # is made from them, as `except*` needs.
+        members = [_rebuild(member, where) for member in group.get("exceptions", [])]
+        args: List[Any] = [group.get("message", ""), members]
+    else:
+        args = [_decode(arg) for arg in recorded.get("args", [])]
+        for i in recorded.get("unavailable_args", []):
+            args[i] = UnavailableOnReplay(f"argument {i} of {cls.__name__}")
     unavailable = list(recorded.get("unavailable_attrs", []))
     if unavailable:
         cls = _with_missing(cls, unavailable)
@@ -343,7 +470,8 @@ def rebuild(recorded: Dict[str, Any], step_name: str, sequence: int) -> BaseExce
         raise ReplayedFailureError(
             f"Cannot replay {where}: {location} could not be recreated ({error})."
         ) from error
-    exc.args = tuple(args)
+    if group is None:
+        exc.args = tuple(args)
 
     state = vars(exc)
     for name, value in recorded.get("attrs", {}).items():
@@ -351,8 +479,11 @@ def rebuild(recorded: Dict[str, Any], step_name: str, sequence: int) -> BaseExce
         descriptor = inspect.getattr_static(type(exc), name, None)
         builtin_field = (types.GetSetDescriptorType, types.MemberDescriptorType)
         if isinstance(descriptor, builtin_field):
-            # A field the built-in keeps outside __dict__, such as OSError.filename.
-            descriptor.__set__(exc, value)
+            # A field Python keeps outside __dict__, such as OSError.errno.
+            try:
+                descriptor.__set__(exc, value)
+            except (AttributeError, TypeError):
+                pass  # read-only on this class: its constructor already set it
         else:
             state[name] = value
 

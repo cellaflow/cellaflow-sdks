@@ -290,7 +290,7 @@ def _divergence_message(
     return "\n".join(lines)
 
 
-async def _replay_cancellation(cancelled: Dict[str, Any]) -> None:
+async def _replay_cancellation(ctx: WorkflowContext, cancelled: Dict[str, Any]) -> None:
     """Reproduces a cancellation: waits to be cancelled, as the step did then.
 
     What the workflow saw depended on what cancelled the step, not on the step:
@@ -298,11 +298,22 @@ async def _replay_cancellation(cancelled: Dict[str, Any]) -> None:
     `task.cancel()` arrives as `CancelledError`. So the replay does not raise
     anything at once. It waits, and whatever cancelled the step the first time
     cancels it again, producing the same exception. If nothing does within twice
-    the time the step ran then, the cancellation came from outside the code (a
+    the time the step ran then (and no sooner than the run is as far in as it was
+    when the cancellation came), the cancellation came from outside the code (a
     person pressing Cancel), and the replay delivers it itself.
     """
     elapsed = float(cancelled.get("elapsed_s") or 0.0)
-    await asyncio.sleep(elapsed * _CANCEL_WAIT_FACTOR + _CANCEL_WAIT_EXTRA_S)
+    wait = elapsed * _CANCEL_WAIT_FACTOR + _CANCEL_WAIT_EXTRA_S
+    since_start = cancelled.get("since_run_start_s")
+    if since_start is not None:
+        # A timeout set around several steps started before this one, and earlier
+        # steps replay instantly, so it fires later relative to this step than it
+        # did the first time. It started no earlier than the run did, so by the
+        # time this replayed run is as far in as the first one was when the
+        # cancellation came, it has fired.
+        deadline = ctx.run_started + float(since_start) * 1.25 + _CANCEL_WAIT_EXTRA_S
+        wait = max(wait, deadline - time.monotonic())
+    await asyncio.sleep(wait)
     raise asyncio.CancelledError()
 
 
@@ -347,7 +358,7 @@ async def _replay_async(ctx: WorkflowContext, seq: int, expected_name: str) -> A
     _check_recorded_name(ctx, seq, expected_name)
     cancelled = _cancellation(ctx.replayed_steps[seq])
     if cancelled is not None:
-        await _replay_cancellation(cancelled)
+        await _replay_cancellation(ctx, cancelled)
     return _replay(ctx, seq, expected_name)
 
 
@@ -370,20 +381,36 @@ def _note_failure(
     is not something a workflow carries on past, so the step gives its position
     back instead.
     """
-    if isinstance(exc, DivergentStepError):
-        return
-    if isinstance(exc, asyncio.CancelledError):
-        ctx.defer_cancellation_record(
-            seq, name, elapsed_s, call_coordination, agent_id=agent_id,
-            step_key=ikey or "",
+    try:
+        if isinstance(exc, DivergentStepError):
+            return
+        if isinstance(exc, asyncio.CancelledError):
+            ctx.defer_cancellation_record(
+                seq,
+                name,
+                elapsed_s,
+                call_coordination,
+                agent_id=agent_id,
+                step_key=ikey or "",
+                since_run_start_s=time.monotonic() - ctx.run_started,
+            )
+            return
+        if not isinstance(exc, Exception):
+            ctx.give_back_position(seq)
+            return
+        ctx.defer_failure_record(
+            seq, name, exc, call_coordination, agent_id=agent_id, step_key=ikey or ""
         )
-        return
-    if not isinstance(exc, Exception):
-        ctx.give_back_position(seq)
-        return
-    ctx.defer_failure_record(
-        seq, name, exc, call_coordination, agent_id=agent_id, step_key=ikey or ""
-    )
+    except Exception:
+        # Noting the failure must never replace the step's own exception, which
+        # is on its way to the workflow.
+        logger.warning(
+            "Cellaflow: could not hold the failure of %r at position %d for "
+            "recording.",
+            name,
+            seq,
+            exc_info=True,
+        )
 
 
 def _take_hit(
@@ -623,12 +650,22 @@ def step(
                 # Cancellation too: a lease left held would refuse the step that
                 # takes this position next until it lapsed.
                 if fencing_token > 0:
-                    ctx.client.release_lease(
-                        agent_id=agent_id,
-                        idempotency_key=ikey,
-                        fencing_token=fencing_token,
-                        reason="TOOL_ERROR",
-                    )
+                    try:
+                        ctx.client.release_lease(
+                            agent_id=agent_id,
+                            idempotency_key=ikey,
+                            fencing_token=fencing_token,
+                            reason="TOOL_ERROR",
+                        )
+                    except Exception:
+                        # The lease lapses on its own. Losing the release is not
+                        # worth replacing the error that caused it.
+                        logger.warning(
+                            "Cellaflow: could not release the lease on %r after "
+                            "it failed; it lapses on its own.",
+                            actual_tool_name,
+                            exc_info=True,
+                        )
                 raise e
             finally:
                 if hb:
@@ -779,12 +816,22 @@ def step(
                 # Cancellation too: a lease left held would refuse the step that
                 # takes this position next until it lapsed.
                 if fencing_token > 0:
-                    ctx.client.release_lease(
-                        agent_id=agent_id,
-                        idempotency_key=ikey,
-                        fencing_token=fencing_token,
-                        reason="TOOL_ERROR",
-                    )
+                    try:
+                        ctx.client.release_lease(
+                            agent_id=agent_id,
+                            idempotency_key=ikey,
+                            fencing_token=fencing_token,
+                            reason="TOOL_ERROR",
+                        )
+                    except Exception:
+                        # The lease lapses on its own. Losing the release is not
+                        # worth replacing the error that caused it.
+                        logger.warning(
+                            "Cellaflow: could not release the lease on %r after "
+                            "it failed; it lapses on its own.",
+                            actual_tool_name,
+                            exc_info=True,
+                        )
                 raise e
             finally:
                 if hb:

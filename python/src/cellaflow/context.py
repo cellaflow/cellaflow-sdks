@@ -19,6 +19,12 @@ from cellaflow.v1 import common_pb2, idempotency_pb2, service_pb2
 logger = logging.getLogger(__name__)
 
 
+def _held_payload(pending: Dict[str, Any]) -> Dict[str, Any]:
+    """A held failure's payload, if it was not prepared before the write."""
+    exc = pending.get("exc")
+    return {"error": capture(exc)} if exc is not None else {}
+
+
 class _RecordHeld(Exception):
     """A live lease holds a hit's record. Wait `retry_after_s` and ask again."""
 
@@ -82,6 +88,12 @@ class WorkflowContext:
     # Guards the position counter, the reported position, the pending record and
     # the in-flight count, which every call in the session reads and writes, on
     # whichever thread it runs.
+    # When this run started, on the monotonic clock. A cancellation records how
+    # far into the run it happened, so a replay can wait at least that long for
+    # whatever cancelled it to do so again. See `decorators._replay_cancellation`.
+    run_started: float = field(
+        default_factory=time.monotonic, repr=False, compare=False
+    )
     _lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
     )
@@ -114,6 +126,7 @@ class WorkflowContext:
 
     def _try_claim(self) -> Tuple[Optional[int], float]:
         """One attempt to claim a position: the position, or how long to wait."""
+        self._prepare_pending()
         with self._lock:
             try:
                 self.reconcile_sequence()
@@ -237,16 +250,13 @@ class WorkflowContext:
         position was claimed meanwhile, as for a hit. Otherwise nothing is
         recorded, as before.
         """
-        with self._lock:
-            if not (self._in_flight == 1 and self.sequence == sequence):
-                return
-        # Captured outside the lock: formatting the traceback and encoding each
-        # value is work no other call in the session should wait on.
-        recorded = capture(exc)
-        if self._hold_failure(
-            sequence, name, {"error": recorded}, coordination_id, agent_id, step_key
-        ):
-            self._warn_if_not_replayable(exc, name, sequence, recorded)
+        # The exception is held, not captured: most failures propagate and end the
+        # run, and then nothing is recorded. It is captured, and any warning
+        # about replaying it given, only when the record is written. See
+        # `_prepare_pending`.
+        self._hold_failure(
+            sequence, name, None, coordination_id, agent_id, step_key, exc=exc
+        )
 
     def defer_cancellation_record(
         self,
@@ -256,6 +266,7 @@ class WorkflowContext:
         coordination_id: Optional[str],
         agent_id: str = "default",
         step_key: str = "",
+        since_run_start_s: Optional[float] = None,
     ) -> None:
         """Holds a step's cancellation to be recorded at `sequence`.
 
@@ -266,6 +277,8 @@ class WorkflowContext:
         `defer_failure_record`.
         """
         cancelled = {"format": 1, "sdk": "python", "elapsed_s": round(elapsed_s, 3)}
+        if since_run_start_s is not None:
+            cancelled["since_run_start_s"] = round(since_run_start_s, 3)
         self._hold_failure(
             sequence,
             name,
@@ -279,12 +292,17 @@ class WorkflowContext:
         self,
         sequence: int,
         name: str,
-        payload: Dict[str, Any],
+        payload: Optional[Dict[str, Any]],
         coordination_id: Optional[str],
         agent_id: str,
         step_key: str,
+        exc: Optional[BaseException] = None,
     ) -> bool:
-        """Holds a failure-kind record, if nothing claimed a later position."""
+        """Holds a failure-kind record, if nothing claimed a later position.
+
+        Either `payload` is given, or `exc` is, and the payload is captured from
+        it when the record is about to be written.
+        """
         with self._lock:
             if not (self._in_flight == 1 and self.sequence == sequence):
                 return False
@@ -294,11 +312,41 @@ class WorkflowContext:
                 "sequence": sequence,
                 "name": name,
                 "payload": payload,
+                "exc": exc,
                 "coordination_id": coordination_id,
                 "agent_id": agent_id,
                 "received_key": step_key,
             }
             return True
+
+    def _prepare_pending(self) -> None:
+        """Captures a held failure before its record is written.
+
+        Outside the lock, because formatting a traceback and encoding values is
+        work no other call in the session should wait on; the result is attached
+        only if the same record is still pending. The warnings about what a
+        resume could not reproduce are given here, once, because only now is the
+        failure certain to be recorded.
+        """
+        pending = self._pending_hit
+        if pending is None or pending.get("payload") is not None:
+            return
+        exc = pending.get("exc")
+        if exc is None:
+            return
+        recorded = capture(exc)  # never raises
+        with self._lock:
+            first = self._pending_hit is pending and pending.get("payload") is None
+            if first:
+                pending["payload"] = {"error": recorded}
+                pending["exc"] = None
+        if first:
+            try:
+                self._warn_if_not_replayable(
+                    exc, pending["name"], pending["sequence"], recorded
+                )
+            except Exception:
+                pass  # a warning is never worth failing a step over
 
     def _warn_if_not_replayable(
         self, exc: BaseException, name: str, sequence: int, recorded: Dict[str, Any]
@@ -373,6 +421,7 @@ class WorkflowContext:
             await asyncio.sleep(wait)
 
     def _try_record_failure(self) -> Optional[float]:
+        self._prepare_pending()
         with self._lock:
             pending = self._pending_hit
             if pending is None or pending.get("kind") != "failure":
@@ -508,7 +557,7 @@ class WorkflowContext:
                 sequence=pending["sequence"],
                 name=pending["name"],
                 status=pending["status"],
-                output_payload=pending["payload"],
+                output_payload=pending["payload"] or _held_payload(pending),
                 idempotency_key=key,
                 idempotency_fencing_token=token,
                 coordination_id=pending["coordination_id"],

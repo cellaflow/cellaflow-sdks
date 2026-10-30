@@ -7,6 +7,7 @@ takes the same branch.
 """
 
 import asyncio
+import sys
 from typing import Any, Callable, List, Tuple
 from unittest.mock import MagicMock
 
@@ -841,3 +842,235 @@ def test_an_unreplayable_failure_is_a_failure_not_replayable_error(
     with pytest.raises(FailureNotReplayableError) as excinfo:
         handle(_session_id="sess-ts")  # type: ignore[call-arg]
     assert isinstance(excinfo.value, NondeterministicWorkflowError)
+
+
+# --- Review fixes, round two ----------------------------------------------------
+
+
+def test_a_timeout_around_several_steps_replays_its_branch(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The timeout started before the first step, which took most of it. On replay
+    that step is instant, so the timeout fires later relative to the cancelled
+    step than it did. The replay waits until the run is as far in as it was."""
+    _history(
+        mock_stub,
+        "sess-scope",
+        [
+            _succeeded(1, "prepare", "ready"),
+            common_pb2.StepResult(
+                sequence=2,
+                name="charge",
+                status=FAILED,
+                output_payload=serialize(
+                    {
+                        "cancelled": {
+                            "format": 1,
+                            "sdk": "python",
+                            "elapsed_s": 0.1,
+                            "since_run_start_s": 1.0,
+                        }
+                    }
+                ),
+            ),
+            _succeeded(3, "fallback", "fallback"),
+        ],
+    )
+
+    @step
+    async def prepare() -> str:
+        return "ready"
+
+    @step
+    async def charge() -> str:
+        return "charged"
+
+    @step
+    async def fallback() -> str:
+        return "live fallback"
+
+    @workflow(version="1.0.0")
+    async def checkout() -> str:
+        async def both() -> str:
+            await prepare()
+            return await charge()  # type: ignore[no-any-return]
+
+        try:
+            return await asyncio.wait_for(both(), 1.0)
+        except asyncio.TimeoutError:
+            return await fallback()  # type: ignore[no-any-return]
+
+    result = asyncio.run(checkout(_session_id="sess-scope"))  # type: ignore[call-arg]
+    assert result == "fallback"
+
+
+class FetchFailed(OSError):
+    """Sets its OSError fields in its own constructor, which replay never runs."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(2, "missing", path)
+
+
+def test_an_oserror_subclass_keeps_errno_and_strerror() -> None:
+    import errno
+
+    rebuilt = _round_trip(FetchFailed("/data/x"))
+    assert isinstance(rebuilt, FetchFailed)
+    assert rebuilt.errno == errno.ENOENT and rebuilt.strerror == "missing"
+    assert str(rebuilt) == str(FetchFailed("/data/x"))
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="exception groups arrived in Python 3.11"
+)
+def test_an_exception_group_replays_with_its_members() -> None:
+    import builtins
+
+    group_cls = getattr(builtins, "ExceptionGroup")
+    group = group_cls("batch failed", [ValueError("a"), PaymentDeclined("no funds")])
+    rebuilt = _round_trip(group)
+    assert type(rebuilt) is group_cls
+    assert rebuilt.message == "batch failed"  # type: ignore[attr-defined]
+    members = rebuilt.exceptions  # type: ignore[attr-defined]
+    assert [type(m) for m in members] == [ValueError, PaymentDeclined]
+    assert members[1].reason == "no funds"
+    matched, rest = rebuilt.split(PaymentDeclined)  # type: ignore[attr-defined]
+    assert matched is not None and rest is not None
+
+
+class Unprintable(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("str() is broken")
+
+
+def test_an_exception_that_cannot_be_inspected_still_reaches_the_workflow(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """Recording the failure must never replace the step's own exception."""
+    _fresh(mock_stub, "sess-unprintable")
+
+    @step
+    def charge() -> str:
+        raise Unprintable()
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            charge()
+        except Unprintable:
+            return "caught the real one"
+        return "charged"
+
+    assert wf() == "caught the real one"
+    assert _commits(mock_stub) == [(1, "charge", FAILED)]
+
+
+class Huge(Exception):
+    def __init__(self) -> None:
+        super().__init__("response too big")
+        self.body = b"x" * (2 * 1024 * 1024)
+
+
+def test_a_huge_value_is_left_out_so_the_record_fits() -> None:
+    recorded = capture(Huge())
+    assert "body" in recorded["unavailable_attrs"]
+    assert len(serialize({"e": recorded})) < 600 * 1024
+
+
+def test_a_failed_release_does_not_replace_the_steps_exception(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    _fresh(mock_stub, "sess-release")
+
+    class Unavailable(grpc.RpcError):  # type: ignore[misc]
+        def code(self) -> grpc.StatusCode:
+            return grpc.StatusCode.UNAVAILABLE
+
+    mock_stub.ReleaseLease.side_effect = Unavailable()
+
+    @step
+    def charge() -> str:
+        raise PaymentDeclined("insufficient funds")
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        return charge()  # type: ignore[no-any-return]
+
+    with pytest.raises(PaymentDeclined):
+        wf()
+
+
+def test_a_failure_record_in_another_shape_is_not_replayable(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    from cellaflow import FailureNotReplayableError
+
+    recorded = common_pb2.StepResult(
+        sequence=1,
+        name="charge",
+        status=FAILED,
+        output_payload=serialize({"error": "timeout"}),
+    )
+    _history(mock_stub, "sess-shape", [recorded])
+
+    @step
+    def charge() -> str:
+        return "charged"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        return charge()  # type: ignore[no-any-return]
+
+    with pytest.raises(FailureNotReplayableError, match="not in a form"):
+        wf(_session_id="sess-shape")  # type: ignore[call-arg]
+
+
+class NoSubclasses(Exception):
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        raise TypeError("NoSubclasses may not be subclassed")
+
+
+def test_a_class_hook_that_refuses_is_a_failure_not_replayable() -> None:
+    from cellaflow.failures import ReplayedFailureError, rebuild
+
+    recorded = {
+        "type": f"{__name__}:NoSubclasses",
+        "args": ["x"],
+        "unavailable_attrs": ["response"],
+    }
+    with pytest.raises(ReplayedFailureError, match="could not be recreated"):
+        rebuild(recorded, "step", 1)
+
+
+def test_a_failure_that_propagates_is_never_captured(
+    mock_stub: MagicMock, mock_client: None, caplog: Any, monkeypatch: Any
+) -> None:
+    """Nothing is recorded for it, so nothing is captured and nothing is said
+    about how it would replay."""
+    from cellaflow.failures import capture as real_capture
+
+    captured: List[Any] = []
+
+    def counting_capture(exc: BaseException) -> Any:
+        captured.append(exc)
+        return real_capture(exc)
+
+    monkeypatch.setattr("cellaflow.context.capture", counting_capture)
+    _fresh(mock_stub, "sess-propagate-quiet")
+
+    class Local(Exception):
+        pass
+
+    @step
+    def charge() -> str:
+        raise Local("x")
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        return charge()  # type: ignore[no-any-return]
+
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        with pytest.raises(Local):
+            wf()
+    assert captured == []
+    assert "not defined at module level" not in caplog.text
