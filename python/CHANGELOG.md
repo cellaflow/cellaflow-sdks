@@ -4,6 +4,54 @@ All notable changes to the CellaFlow Python SDK.
 
 ## Unreleased
 
+### Added
+
+- **A step's failure is recorded at its position, and replayed.** When a workflow catches a step's
+  exception and carries on, the failure is recorded at the step's position as a step with status
+  `STEP_STATUS_FAILED`, and the next step takes the following position. A resumed `@workflow`
+  raises the same exception there instead of running the step again, so it takes the same branch.
+
+  The exception comes back as an instance of its own class, with its arguments and attributes, so
+  `except` clauses and `isinstance` checks behave as they did. Rebuilding it runs no code the
+  record can choose: the class is looked up only among modules already loaded, nothing is
+  imported, and the class's own `__new__` and `__init__` are not called. Its class must be defined
+  at module level in a module the workflow imports, as it is when an `except` clause names it.
+  Otherwise the resume stops with `FailureNotReplayableError` rather than run the step again.
+  The original run logs a warning when the failure is recorded if the class cannot be found by name,
+  is defined in `__main__`, or has values that cannot be recorded, such as an HTTP response
+  object; each comes back as a placeholder, and using it raises `AttributeError` (Python's
+  `AttributeError.obj` is replayed the same way, without a warning). These warnings come when the
+  failure is recorded, so a failure the workflow lets propagate says nothing. Tuples,
+  enums and subclasses of plain types are recorded, the last two as their plain value, as are the
+  fields Python keeps outside `args` (`OSError.errno`, `ImportError.name` and the like). An
+  exception group comes back with its members, every one of them keeping at least its type and
+  message, so `except*` behaves the same; a group too large to record that way (over 2,000 members
+  or 512 KB) is refused on resume, with a warning when it happens. An engine call's gRPC
+  error comes back as a `grpc.RpcError` with the same `code()` and `details()`. A record is kept
+  within a commit's size: a value over 64 KB is left out, and the traceback is trimmed. Recording a
+  failure never replaces the step's own exception, and neither does a lease that cannot be
+  released after it.
+
+  A failure the workflow lets propagate is not recorded, so resuming retries the step. A failure
+  while another step of the session is in flight is not recorded either.
+
+  A cancelled async step (`asyncio.CancelledError`) is recorded the same way, with how long it ran
+  before the cancellation, and its lease is released. On replay it does not raise at once: it waits,
+  so whatever cancelled it the first time cancels it again and the code sees the same exception
+  (`asyncio.wait_for` turns its own cancellation into `TimeoutError`). If nothing has cancelled it
+  after twice the time it ran, and no sooner than the resumed run is as far in as the first run was
+  when the cancellation came (so a timeout set around several steps fires first, waiting at most
+  two minutes for that), the cancellation came from outside the code, and the replay delivers it
+  itself. A replayed timeout therefore takes as long as the original wait; putting the timeout
+  inside the step (`return await asyncio.wait_for(call(), 5)` in its body) records a plain
+  `TimeoutError` instead, which replays at once.
+
+- **Two kinds of `NondeterministicWorkflowError`.** `ReplayDivergedError` means the resumed run
+  called a different step than its history records at a position; its message names the session,
+  the position, both steps, the last failure or cancellation before them, and the way on.
+  `FailureNotReplayableError` means a recorded failure or cancellation cannot be reproduced as it
+  happened. Both subclass `NondeterministicWorkflowError`, so code that catches it still does.
+
 ### Fixed
 
 - **A session that received a shared result can be resumed.** When a `SCOPE_SHARED` step was

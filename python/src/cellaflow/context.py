@@ -12,10 +12,24 @@ import grpc
 
 from cellaflow.client import CellaflowClient
 from cellaflow.history import latest_session_sequence
-from cellaflow.idempotency import record_idempotency_key
+from cellaflow.failures import (
+    _MAX_GROUP_TOTAL,
+    _MAX_RECORD_BYTES,
+    capture,
+    findable,
+    incomplete_group,
+    unrecorded,
+)
+from cellaflow.idempotency import failure_idempotency_key, record_idempotency_key
 from cellaflow.v1 import common_pb2, idempotency_pb2, service_pb2
 
 logger = logging.getLogger(__name__)
+
+
+def _held_payload(pending: Dict[str, Any]) -> Dict[str, Any]:
+    """A held failure's payload, if it was not prepared before the write."""
+    exc = pending.get("exc")
+    return {"error": capture(exc)} if exc is not None else {}
 
 
 class _RecordHeld(Exception):
@@ -81,6 +95,12 @@ class WorkflowContext:
     # Guards the position counter, the reported position, the pending record and
     # the in-flight count, which every call in the session reads and writes, on
     # whichever thread it runs.
+    # When this run started, on the monotonic clock. A cancellation records how
+    # far into the run it happened, so a replay can wait at least that long for
+    # whatever cancelled it to do so again. See `decorators._replay_cancellation`.
+    run_started: float = field(
+        default_factory=time.monotonic, repr=False, compare=False
+    )
     _lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
     )
@@ -113,6 +133,7 @@ class WorkflowContext:
 
     def _try_claim(self) -> Tuple[Optional[int], float]:
         """One attempt to claim a position: the position, or how long to wait."""
+        self._prepare_pending()
         with self._lock:
             try:
                 self.reconcile_sequence()
@@ -200,6 +221,8 @@ class WorkflowContext:
         `record_idempotency_key`.
         """
         self._pending_hit = {
+            "kind": "result",
+            "status": common_pb2.StepStatus.STEP_STATUS_SUCCESS,
             "sequence": sequence,
             "name": name,
             "payload": payload,
@@ -207,6 +230,227 @@ class WorkflowContext:
             "agent_id": agent_id,
             "received_key": received_key,
         }
+
+    def defer_failure_record(
+        self,
+        sequence: int,
+        name: str,
+        exc: BaseException,
+        coordination_id: Optional[str],
+        agent_id: str = "default",
+        step_key: str = "",
+    ) -> None:
+        """Holds a step's failure to be recorded at `sequence` in this session.
+
+        A step that fails leaves its position empty. A workflow that catches the
+        failure and carries on would otherwise put its next step one position
+        past the gap, where the engine refuses the commit after that step's side
+        effect has run. Recording the failure fills the position, and lets a
+        resumed run raise the same exception there instead of running the step
+        again, so the workflow takes the same branch. See `failures.rebuild`.
+
+        Written when the next step claims a position, or when the workflow
+        returns: only once the run has moved past the failure. A failure the
+        workflow lets propagate is not recorded, so resuming retries the step.
+
+        Only while the step is the session's only call in flight and no later
+        position was claimed meanwhile, as for a hit. Otherwise nothing is
+        recorded, as before.
+        """
+        # The exception is held, not captured: most failures propagate and end the
+        # run, and then nothing is recorded. It is captured, and any warning
+        # about replaying it given, only when the record is written. See
+        # `_prepare_pending`.
+        self._hold_failure(
+            sequence, name, None, coordination_id, agent_id, step_key, exc=exc
+        )
+
+    def defer_cancellation_record(
+        self,
+        sequence: int,
+        name: str,
+        elapsed_s: float,
+        coordination_id: Optional[str],
+        agent_id: str = "default",
+        step_key: str = "",
+        since_run_start_s: Optional[float] = None,
+    ) -> None:
+        """Holds a step's cancellation to be recorded at `sequence`.
+
+        Recorded with how long the step ran before it was cancelled, because a
+        replay reproduces a cancellation by waiting to be cancelled again rather
+        than by raising one: what the workflow saw depended on what cancelled the
+        step. Written and guarded exactly as a failure is; see
+        `defer_failure_record`.
+        """
+        cancelled = {"format": 1, "sdk": "python", "elapsed_s": round(elapsed_s, 3)}
+        if since_run_start_s is not None:
+            cancelled["since_run_start_s"] = round(since_run_start_s, 3)
+        self._hold_failure(
+            sequence,
+            name,
+            {"cancelled": cancelled},
+            coordination_id,
+            agent_id,
+            step_key,
+        )
+
+    def _hold_failure(
+        self,
+        sequence: int,
+        name: str,
+        payload: Optional[Dict[str, Any]],
+        coordination_id: Optional[str],
+        agent_id: str,
+        step_key: str,
+        exc: Optional[BaseException] = None,
+    ) -> None:
+        """Holds a failure-kind record, if nothing claimed a later position.
+
+        Either `payload` is given, or `exc` is, and the payload is captured from
+        it when the record is about to be written.
+        """
+        with self._lock:
+            if not (self._in_flight == 1 and self.sequence == sequence):
+                return
+            self._pending_hit = {
+                "kind": "failure",
+                "status": common_pb2.StepStatus.STEP_STATUS_FAILED,
+                "sequence": sequence,
+                "name": name,
+                "payload": payload,
+                "exc": exc,
+                "coordination_id": coordination_id,
+                "agent_id": agent_id,
+                "received_key": step_key,
+            }
+
+    def _prepare_pending(self) -> None:
+        """Captures a held failure before its record is written.
+
+        Outside the lock, because formatting a traceback and encoding values is
+        work no other call in the session should wait on; the result is attached
+        only if the same record is still pending. The warnings about what a
+        resume could not reproduce are given here, once, because only now is the
+        failure certain to be recorded.
+        """
+        pending = self._pending_hit
+        if pending is None or pending.get("payload") is not None:
+            return
+        exc = pending.get("exc")
+        if exc is None:
+            return
+        recorded = capture(exc)  # never raises
+        with self._lock:
+            first = self._pending_hit is pending and pending.get("payload") is None
+            if first:
+                pending["payload"] = {"error": recorded}
+                pending["exc"] = None
+        if first:
+            try:
+                self._warn_if_not_replayable(
+                    exc, pending["name"], pending["sequence"], recorded
+                )
+            except Exception:
+                pass  # a warning is never worth failing a step over
+
+    def _warn_if_not_replayable(
+        self, exc: BaseException, name: str, sequence: int, recorded: Dict[str, Any]
+    ) -> None:
+        """Says now, while the failure happens, what a resume could not reproduce."""
+        cls = type(exc)
+        if "grpc" in recorded:
+            return
+        if not findable(cls):
+            logger.warning(
+                "Cellaflow: %s raised by %r is not defined at module level, so a "
+                "resumed run cannot raise it again and will refuse to resume past "
+                "position %d. Define exceptions a step raises at module level.",
+                cls.__qualname__,
+                name,
+                sequence,
+            )
+        elif cls.__module__ == "__main__":
+            logger.warning(
+                "Cellaflow: %s raised by %r is defined in the script being run "
+                "(__main__). A run resumed from another entry point will not find "
+                "it and will refuse to resume past position %d. Define exceptions "
+                "a step raises in an importable module.",
+                cls.__qualname__,
+                name,
+                sequence,
+            )
+        if incomplete_group(recorded):
+            logger.warning(
+                "Cellaflow: the exception group %s raised by %r at position %d is "
+                "too large to record (over %d members, or over %d KB even with "
+                "each member reduced to its type and message). A resumed run will "
+                "refuse to resume past this position rather than raise a "
+                "different group.",
+                cls.__qualname__,
+                name,
+                sequence,
+                _MAX_GROUP_TOTAL,
+                _MAX_RECORD_BYTES // 1024,
+            )
+            return
+        missing = unrecorded(recorded)
+        if missing:
+            logger.warning(
+                "Cellaflow: %s raised by %r at position %d has values that cannot "
+                "be recorded (%s). A resumed run raises it with a placeholder for "
+                "each, and using one raises AttributeError.",
+                cls.__qualname__,
+                name,
+                sequence,
+                ", ".join(missing),
+            )
+
+    def give_back_position(self, sequence: int) -> None:
+        """Returns the position of a step a process exit interrupted.
+
+        A `KeyboardInterrupt` or `SystemExit` is not something a workflow carries
+        on past, so it is not recorded. If the code does carry on anyway, its next
+        step takes this position rather than landing one past an empty one. Only
+        while no later position was claimed meanwhile; if the step did commit
+        before the interruption reached it, the next step's lease at that position
+        is refused before its body runs.
+        """
+        with self._lock:
+            if self._in_flight == 1 and self.sequence == sequence:
+                self.sequence = sequence - 1
+
+    def record_pending_failure(self) -> None:
+        """Records a failure the workflow caught and finished after.
+
+        Called when a workflow returns normally. A failure followed by a later
+        step is recorded when that step starts; this covers one followed by none.
+        """
+        while True:
+            wait = self._try_record_failure()
+            if wait is None:
+                return
+            time.sleep(wait)
+
+    async def record_pending_failure_async(self) -> None:
+        """`record_pending_failure` for an async workflow."""
+        while True:
+            wait = self._try_record_failure()
+            if wait is None:
+                return
+            await asyncio.sleep(wait)
+
+    def _try_record_failure(self) -> Optional[float]:
+        self._prepare_pending()
+        with self._lock:
+            pending = self._pending_hit
+            if pending is None or pending.get("kind") != "failure":
+                return None
+            try:
+                self.reconcile_sequence()
+            except _RecordHeld as held:
+                return held.retry_after_s
+            return None
 
     def reconcile_sequence(self) -> None:
         """Records a deferred hit, then adopts the position the engine reported.
@@ -269,9 +513,10 @@ class WorkflowContext:
                 else:
                     reason = f"it could not be sent ({type(exc).__name__}: {exc})"
                 logger.warning(
-                    "Cellaflow: the result of %r was not recorded at position %d "
+                    "Cellaflow: the %s of %r was not recorded at position %d "
                     "of session %s, because %s. Continuing from position %d. A "
                     "later resume of this session may not replay that step.",
+                    "failure" if pending.get("kind") == "failure" else "result",
                     pending["name"],
                     pending["sequence"],
                     self.session_id,
@@ -295,9 +540,17 @@ class WorkflowContext:
         it refuses the record at a position another lease has claimed, or refuses
         the later lease before its side effect runs.
         """
-        key = record_idempotency_key(
-            self.session_id, pending["sequence"], pending["received_key"]
-        )
+        if pending.get("kind") == "failure":
+            key = failure_idempotency_key(
+                self.session_id,
+                pending["sequence"],
+                pending["name"],
+                pending["received_key"],
+            )
+        else:
+            key = record_idempotency_key(
+                self.session_id, pending["sequence"], pending["received_key"]
+            )
         agent_id = pending["agent_id"]
         resp = self.client.check_idempotency_cache(
             agent_id=agent_id,
@@ -323,8 +576,8 @@ class WorkflowContext:
                 session_id=self.session_id,
                 sequence=pending["sequence"],
                 name=pending["name"],
-                status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
-                output_payload=pending["payload"],
+                status=pending["status"],
+                output_payload=pending["payload"] or _held_payload(pending),
                 idempotency_key=key,
                 idempotency_fencing_token=token,
                 coordination_id=pending["coordination_id"],

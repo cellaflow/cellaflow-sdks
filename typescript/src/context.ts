@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { CellaflowClient } from "./client.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
-import { recordIdempotencyKey } from "./idempotency.js";
+import { failureIdempotencyKey, recordIdempotencyKey } from "./idempotency.js";
 import {
   errorCode,
   hasStatusCode,
@@ -13,17 +13,64 @@ import {
 
 /** A cache hit's result, waiting to be recorded at its position in the session. */
 interface PendingHit {
+  /** A result received from a hit, or a step's failure. */
+  kind: "result" | "failure";
+  status: StepStatus;
   sequence: number;
   name: string;
   payload: Record<string, unknown>;
   coordinationId?: string;
   /** The agent whose call was answered by the hit. */
   agentId: string;
-  /** The idempotency key the hit answered. */
+  /** The idempotency key the hit answered, or the failed step's own key. */
   receivedKey: string;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** The longest message and stack a failure record keeps, as the Python SDK. */
+const MAX_MESSAGE_CHARS = 4 * 1024;
+const MAX_TRACEBACK_CHARS = 16 * 1024;
+
+/** Reads a property, or `undefined` if reading it throws (a getter, a Proxy). */
+function readField(value: unknown, field: string): unknown {
+  try {
+    return (value as Record<string, unknown> | null | undefined)?.[field];
+  } catch {
+    return undefined;
+  }
+}
+
+/** `String(value)`, or a placeholder if converting it throws. */
+function safeString(value: unknown): string {
+  try {
+    return String(value);
+  } catch {
+    return `<${typeof value}: could not be converted to a string>`;
+  }
+}
+
+/**
+ * What a failure record holds about an error. Never throws: recording a failure
+ * must not replace the error the step raised. The message keeps its first
+ * {@link MAX_MESSAGE_CHARS}, the stack its last {@link MAX_TRACEBACK_CHARS}.
+ */
+export function describeError(err: unknown): Record<string, unknown> {
+  const name = readField(err, "name");
+  const message = readField(err, "message");
+  const stack = readField(err, "stack");
+  return {
+    format: 1,
+    // Which SDK wrote it: the Python SDK replays only its own records.
+    sdk: "typescript",
+    type: typeof name === "string" ? name : typeof err,
+    message: (typeof message === "string" ? message : safeString(err)).slice(
+      0,
+      MAX_MESSAGE_CHARS,
+    ),
+    traceback: typeof stack === "string" ? stack.slice(-MAX_TRACEBACK_CHARS) : "",
+  };
+}
 
 /**
  * The session a tool call belongs to, plus the bookkeeping that keeps the local
@@ -116,7 +163,49 @@ export class WorkflowContext {
     agentId = "default",
     receivedKey = "",
   ): void {
-    this.pendingHit = { sequence, name, payload, coordinationId, agentId, receivedKey };
+    this.pendingHit = {
+      kind: "result",
+      status: StepStatus.SUCCESS,
+      sequence,
+      name,
+      payload,
+      coordinationId,
+      agentId,
+      receivedKey,
+    };
+  }
+
+  /**
+   * Holds a call's failure to be recorded at `sequence` in this session.
+   *
+   * A call that fails leaves its position empty. A caller that catches the error
+   * and carries on would otherwise put its next call one position past the gap,
+   * where the engine refuses the commit after that call's side effect has run.
+   * Recording the failure fills the position. Written when the next call claims
+   * a position, so a failure nothing follows costs nothing.
+   *
+   * Only while the call is the session's only one in flight and no later position
+   * was claimed meanwhile, as for a hit. Otherwise nothing is recorded, as before.
+   */
+  deferFailureRecord(
+    sequence: number,
+    name: string,
+    err: unknown,
+    coordinationId?: string,
+    agentId = "default",
+    stepKey = "",
+  ): void {
+    if (!(this.inFlight === 1 && this.sequence === sequence)) return;
+    this.pendingHit = {
+      kind: "failure",
+      status: StepStatus.FAILED,
+      sequence,
+      name,
+      payload: { error: describeError(err) },
+      coordinationId,
+      agentId,
+      receivedKey: stepKey,
+    };
   }
 
   /**
@@ -254,7 +343,7 @@ export class WorkflowContext {
           ? `the engine refused it (${errorCode(err)})`
           : `it could not be sent (${errorCode(err)})`;
       console.warn(
-        `Cellaflow: the result of '${pending.name}' was not recorded at position ` +
+        `Cellaflow: the ${pending.kind} of '${pending.name}' was not recorded at position ` +
           `${pending.sequence} of session ${this.sessionId}, because ${reason}. ` +
           `Continuing from position ${this.sequence}. A later resume of this ` +
           "session may not replay that step.",
@@ -275,7 +364,10 @@ export class WorkflowContext {
    * lease before its side effect runs.
    */
   private async writeRecord(pending: PendingHit): Promise<void> {
-    const key = recordIdempotencyKey(this.sessionId, pending.sequence, pending.receivedKey);
+    const key =
+      pending.kind === "failure"
+        ? failureIdempotencyKey(this.sessionId, pending.sequence, pending.name, pending.receivedKey)
+        : recordIdempotencyKey(this.sessionId, pending.sequence, pending.receivedKey);
     let token = 0;
     for (;;) {
       const resp = await this.client.checkIdempotencyCache(
@@ -307,7 +399,7 @@ export class WorkflowContext {
         this.sessionId,
         pending.sequence,
         pending.name,
-        StepStatus.SUCCESS,
+        pending.status,
         pending.payload,
         key,
         token,

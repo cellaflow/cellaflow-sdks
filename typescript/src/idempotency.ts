@@ -195,3 +195,21 @@ export function recordIdempotencyKey(
   const digest = createHash("sha256").update(receivedKey, "utf8").digest("hex");
   return `${sessionId}:record:${sequence}:${digest}`;
 }
+
+/**
+ * The key a session records a step's failure under, at `sequence`.
+ *
+ * Its own key, not the step's: completing the step's key with a failure would
+ * answer every later call with that key from the cache, so a retry of the tool
+ * would never run again. Leased like any step, so the engine arbitrates the
+ * position, as for {@link recordIdempotencyKey}. Matches the Python SDK.
+ */
+export function failureIdempotencyKey(
+  sessionId: string,
+  sequence: number,
+  stepName: string,
+  stepKey: string,
+): string {
+  const digest = createHash("sha256").update(`${stepName}\n${stepKey}`, "utf8").digest("hex");
+  return `${sessionId}:failure:${sequence}:${digest}`;
+}

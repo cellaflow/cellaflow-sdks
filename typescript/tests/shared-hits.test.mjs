@@ -45,7 +45,7 @@ function scriptedClient(
     },
     async checkIdempotencyCache(agentId, key, waitTimeoutMs, leaseTtlMs, sessionId, sequence) {
       // A recorded hit is leased under its own key before it is committed.
-      if (key.includes(":record:")) {
+      if (key.includes(":record:") || key.includes(":failure:")) {
         order.push(`record-lease:${sequence}`);
         recordLeases.push({ agentId, key, sessionId, sequence });
         if (recordLease) return recordLease();
@@ -533,4 +533,102 @@ test("a hit after a later call failed is not recorded", async () => {
   assert.equal(ctx.recordingInFlight, false);
   assert.equal(ctx.claimPosition(), 1);
   assert.deepEqual(client.commits, []);
+});
+
+// A failed call's position is filled with a record of the failure.
+
+test("a caught failure is recorded, and the next call takes the next position", async () => {
+  const client = scriptedClient([acquired(), acquired()]);
+  const charge = tool(
+    async () => {
+      throw Object.assign(new Error("insufficient funds"), { name: "PaymentDeclined" });
+    },
+    { toolName: "charge" },
+  );
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), /insufficient funds/);
+    assert.equal(await notify(), "notified");
+  });
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [
+      [1, "charge"],
+      [2, "notify"],
+    ],
+  );
+  const failure = client.commits[0];
+  assert.match(failure.key, /^s-1:failure:1:[0-9a-f]{64}$/);
+  assert.equal(failure.payload.error.type, "PaymentDeclined");
+  assert.equal(failure.payload.error.message, "insufficient funds");
+});
+
+test("a huge failure is recorded with its message and stack cut down", async () => {
+  const client = scriptedClient([acquired(), acquired()]);
+  const huge = new Error("m".repeat(100_000));
+  huge.stack = "s".repeat(50_000) + "LAST FRAME";
+  const charge = tool(async () => { throw huge; }, { toolName: "charge" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), (e) => e === huge);
+    await notify();
+  });
+  const { error } = client.commits[0].payload;
+  assert.equal(error.message.length, 4 * 1024);
+  assert.equal(error.traceback.length, 16 * 1024);
+  assert.ok(error.traceback.endsWith("LAST FRAME"));
+});
+
+test("a thrown value that cannot be inspected still reaches the caller", async () => {
+  // A getter that throws, and an object with no toString: reading either while
+  // recording must not replace what the step threw.
+  const hostile = Object.create(null);
+  Object.defineProperty(hostile, "message", { get() { throw new Error("getter"); } });
+  const client = scriptedClient([acquired(), acquired()]);
+  const charge = tool(async () => { throw hostile; }, { toolName: "charge" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), (e) => e === hostile);
+    assert.equal(await notify(), "notified");
+  });
+  const { error } = client.commits[0].payload;
+  assert.equal(error.type, "object");
+  assert.match(error.message, /could not be converted/);
+});
+
+test("a failure nothing follows records nothing", async () => {
+  const client = scriptedClient([acquired()]);
+  const charge = tool(async () => { throw new Error("boom"); }, { toolName: "charge" });
+  await runWithContext(session(client), () => assert.rejects(charge(), /boom/));
+  assert.deepEqual(client.commits, []);
+});
+
+test("a refused lease is not recorded as a failure", async () => {
+  const client = scriptedClient([acquired()]);
+  client.checkIdempotencyCache = async () => {
+    throw Object.assign(new Error("position claimed"), { code: 9 });
+  };
+  const charge = tool(async () => "charged", { toolName: "charge" });
+  const ctx = session(client);
+  await runWithContext(ctx, () => assert.rejects(charge(), /refused/));
+  ctx.reconcileSequence();
+  assert.equal(ctx.recordingInFlight, false);
+  assert.deepEqual(client.commits, []);
+});
+
+test("a failure while another call runs is not recorded", async () => {
+  let release;
+  const released = new Promise((r) => (release = r));
+  const slow = tool(async () => { await released; return "slow"; }, { toolName: "slow" });
+  const charge = tool(async () => { release(); throw new Error("boom"); }, { toolName: "charge" });
+  const client = scriptedClient([acquired(), acquired()]);
+  await runWithContext(session(client), async () => {
+    const results = await Promise.allSettled([slow(), charge()]);
+    assert.equal(results[0].value, "slow");
+    assert.equal(results[1].status, "rejected");
+  });
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [[1, "slow"]],
+  );
 });
