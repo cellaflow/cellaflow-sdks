@@ -1313,3 +1313,111 @@ def test_a_timeout_that_expires_during_the_commit_does_not_cancel_a_committed_st
 
     assert asyncio.run(wf()) == "charged"
     assert _commits(mock_stub) == [(1, "charge", SUCCESS), (2, "notify", SUCCESS)]
+
+
+class Code(int):
+    pass
+
+
+class Label(str):
+    pass
+
+
+class Ratio(float):
+    pass
+
+
+class Blob(bytes):
+    pass
+
+
+class WithFields(Exception):
+    def __init__(self) -> None:
+        super().__init__("fields")
+        self.code = Code(7)
+        self.label = Label("eu")
+        self.ratio = Ratio(0.5)
+        self.raw = Blob(b"\x00\x01")
+        self.meta = {"tries": [1, (2, 3)], 4: "four"}
+        self.handle = {"conn": object()}
+        self.keyed = {(1, 2): "tuple key"}
+
+
+def test_subclasses_dicts_and_nested_tuples_are_recorded_as_plain_values() -> None:
+    rebuilt: Any = _round_trip(WithFields())
+    assert type(rebuilt) is WithFields
+    assert rebuilt.code == 7 and type(rebuilt.code) is int
+    assert rebuilt.label == "eu" and type(rebuilt.label) is str
+    assert rebuilt.ratio == 0.5 and type(rebuilt.ratio) is float
+    assert rebuilt.raw == b"\x00\x01" and type(rebuilt.raw) is bytes
+    assert rebuilt.meta == {"tries": [1, (2, 3)], 4: "four"}
+    with pytest.raises(AttributeError, match="not available on replay"):
+        rebuilt.handle["conn"]
+    with pytest.raises(AttributeError, match="not available on replay"):
+        rebuilt.keyed[(1, 2)]
+
+
+def test_a_replayed_rpc_error_answers_the_rest_of_the_rpc_error_interface() -> None:
+    from cellaflow.failures import ReplayedRpcError
+
+    error = ReplayedRpcError(grpc.StatusCode.UNAVAILABLE, "engine restarting")
+    assert error.trailing_metadata() == ()
+    assert error.debug_error_string() == "replayed UNAVAILABLE: engine restarting"
+
+
+def test_a_placeholder_refuses_every_use_but_repr() -> None:
+    from cellaflow.failures import UnavailableOnReplay
+
+    placeholder: Any = UnavailableOnReplay("Fetch.response")
+    assert "Fetch.response" in repr(placeholder)
+    for use in (
+        lambda: len(placeholder),
+        lambda: 1 in placeholder,
+        lambda: int(placeholder),
+        lambda: float(placeholder),
+        lambda: hash(placeholder),
+        lambda: placeholder != 1,
+        lambda: placeholder < 1,
+        lambda: setattr(placeholder, "status", 200),
+    ):
+        with pytest.raises(AttributeError, match="not available on replay"):
+            use()
+
+
+class LooksLikeAGroup(Exception):
+    """Has what a group's record is made from, so the shape can be checked on
+    Python 3.10, which has no exception groups."""
+
+    def __init__(self, message: str, exceptions: List[BaseException]) -> None:
+        super().__init__(message)
+        self.message = message
+        self.exceptions = exceptions
+
+
+def test_a_groups_members_beyond_the_first_keep_their_type_message_and_small_args(
+    monkeypatch: Any,
+) -> None:
+    from cellaflow import failures
+
+    monkeypatch.setattr(failures, "_MAX_GROUP_MEMBERS", 1)
+    first = WithPayload("x")
+    later = ValueError("small", "y" * 5000)
+    later.note = "an attribute"  # type: ignore[attr-defined]
+    group = failures._group(LooksLikeAGroup("batch", [first, later]), 0, full=True)
+    assert group["message"] == "batch"
+    full, minimal = group["exceptions"]
+    assert full["attrs"]["payload"] == "x"
+    assert minimal["type"] == "builtins:ValueError"
+    assert minimal["message"].startswith("('small', 'yyy")
+    assert minimal["args"] == ["small", None] and minimal["unavailable_args"] == [1]
+    assert minimal["unavailable_attrs"] == ["note"]
+
+    reduced = failures._group(LooksLikeAGroup("batch", [first]), 0, full=False)
+    assert reduced["exceptions"][0]["unavailable_attrs"] == ["payload"]
+
+
+def test_a_member_that_cannot_be_printed_is_kept_by_its_type() -> None:
+    from cellaflow import failures
+
+    member = failures._minimal(Unprintable(), 1)
+    assert member["type"] == f"{__name__}:Unprintable" and member["message"] == ""
