@@ -32,6 +32,11 @@ def _renew_failure_detail(reason: int) -> str:
     return f"unrecognised reason {reason}"
 
 
+#: Heartbeats being stopped in the background by `stop_soon`, held so the event
+#: loop does not drop them before they finish.
+_stopping: "set[asyncio.Task[Any]]" = set()
+
+
 class LeaseHeartbeat:
     """
     Manages the background heartbeat (RenewLease) for an actively running step.
@@ -166,6 +171,24 @@ class LeaseHeartbeat:
         loop = asyncio.get_running_loop()
         self._async_task = loop.create_task(self._async_loop())
 
+    def stop_soon(self) -> None:
+        """Stops the heartbeat without waiting, once its step has committed.
+
+        After the commit nothing may be awaited before the step returns: an
+        `await` is where a cancellation lands, and a step cancelled after its
+        commit would be recorded as cancelled while its history says it
+        succeeded. So the stop is signalled here and finished in the background,
+        with the same bounded wait as `stop_async`.
+        """
+        if self._stop_event_async:
+            self._stop_event_async.set()
+        task = self._async_task
+        if task is None or task.done():
+            return
+        finisher = asyncio.get_running_loop().create_task(self._finish_stopping(task))
+        _stopping.add(finisher)
+        finisher.add_done_callback(_stopping.discard)
+
     async def stop_async(self) -> None:
         """Stops the asyncio task, waiting briefly for an in-flight renewal.
 
@@ -180,7 +203,9 @@ class LeaseHeartbeat:
         task = self._async_task
         if task is None or task.done():
             return
+        await self._finish_stopping(task)
 
+    async def _finish_stopping(self, task: "asyncio.Task[Any]") -> None:
         # `asyncio.wait` neither cancels the task on timeout nor re-raises its
         # exception, which is exactly the "give it a chance" semantics wanted.
         done, _ = await asyncio.wait({task}, timeout=self.stop_timeout_sec)

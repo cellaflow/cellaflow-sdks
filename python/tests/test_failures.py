@@ -404,9 +404,20 @@ def test_an_attribute_that_was_not_recorded_cannot_be_read_on_replay(
 
     wf(_session_id="sess-attr")  # type: ignore[call-arg]
     (e,) = caught
-    assert isinstance(e, WithResponse) and str(e) == "boom"
-    with pytest.raises(AttributeError, match="not available on replay"):
-        e.response
+    assert type(e) is WithResponse and str(e) == "boom"
+    response: Any = e.response
+    assert "not recorded" in repr(response)
+    for use in (
+        lambda: response.status_code,
+        lambda: bool(response),
+        lambda: response == 200,
+        lambda: str(response),
+        lambda: response["body"],
+        lambda: list(response),
+        lambda: response(),
+    ):
+        with pytest.raises(AttributeError, match="not available on replay"):
+            use()
 
 
 def test_a_failure_whose_class_cannot_be_imported_refuses_the_resume(
@@ -1030,16 +1041,19 @@ class NoSubclasses(Exception):
         raise TypeError("NoSubclasses may not be subclassed")
 
 
-def test_a_class_hook_that_refuses_is_a_failure_not_replayable() -> None:
-    from cellaflow.failures import ReplayedFailureError, rebuild
+def test_a_missing_field_keeps_the_exact_class_and_runs_none_of_its_code() -> None:
+    """No subclass is made for it, so a class that refuses subclasses, or that
+    `except` matches by exact type, replays as itself."""
+    from cellaflow.failures import UnavailableOnReplay, rebuild
 
     recorded = {
         "type": f"{__name__}:NoSubclasses",
         "args": ["x"],
         "unavailable_attrs": ["response"],
     }
-    with pytest.raises(ReplayedFailureError, match="could not be recreated"):
-        rebuild(recorded, "step", 1)
+    exc = rebuild(recorded, "step", 1)
+    assert type(exc) is NoSubclasses
+    assert isinstance(vars(exc)["response"], UnavailableOnReplay)
 
 
 def test_a_failure_that_propagates_is_never_captured(
@@ -1074,3 +1088,228 @@ def test_a_failure_that_propagates_is_never_captured(
             wf()
     assert captured == []
     assert "not defined at module level" not in caplog.text
+
+
+# --- Review fixes, round three --------------------------------------------------
+
+
+def _group_cls() -> Any:
+    import builtins
+
+    return getattr(builtins, "ExceptionGroup")
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="exception groups arrived in Python 3.11"
+)
+def test_every_member_of_a_wide_group_keeps_its_type() -> None:
+    """Members past the first fifty keep their type and message, so `except*`
+    matches the replayed group exactly as it matched the original."""
+    members: List[Exception] = [ValueError(str(i)) for i in range(55)]
+    members.append(PaymentDeclined("no funds"))
+    rebuilt = _round_trip(_group_cls()("batch", members))
+    replayed = rebuilt.exceptions  # type: ignore[attr-defined]
+    assert len(replayed) == 56
+    assert type(replayed[-1]) is PaymentDeclined
+    assert str(replayed[-1]) == "no funds"
+    assert replayed[-1].args == ("no funds",)
+    matched, rest = rebuilt.split(PaymentDeclined)  # type: ignore[attr-defined]
+    assert matched is not None and len(rest.exceptions) == 55
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="exception groups arrived in Python 3.11"
+)
+def test_a_group_too_big_in_full_keeps_its_members_by_type() -> None:
+    members = [WithPayload("x" * 60_000) for _ in range(10)]
+    recorded = capture(_group_cls()("batch", members))
+    assert not recorded["group"].get("incomplete")
+    rebuilt = _round_trip(_group_cls()("batch", members))
+    replayed = rebuilt.exceptions  # type: ignore[attr-defined]
+    assert [type(m) for m in replayed] == [WithPayload] * 10
+    with pytest.raises(AttributeError, match="not available on replay"):
+        replayed[0].payload.upper()
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="exception groups arrived in Python 3.11"
+)
+def test_a_group_that_cannot_be_recorded_refuses_the_resume_and_says_so(
+    mock_stub: MagicMock, mock_client: None, caplog: Any, monkeypatch: Any
+) -> None:
+    """Rather than replay a smaller group, which could take a different branch."""
+    from cellaflow.failures import ReplayedFailureError, rebuild
+
+    monkeypatch.setattr("cellaflow.failures._MAX_GROUP_TOTAL", 3)
+    group = _group_cls()("batch", [ValueError(str(i)) for i in range(4)])
+    recorded = capture(group)
+    assert recorded["group"]["incomplete"] is True
+    with pytest.raises(ReplayedFailureError, match="too large to record"):
+        rebuild(deserialize(serialize({"e": recorded}))["e"], "step", 1)
+
+    _fresh(mock_stub, "sess-big-group")
+
+    @step
+    def fan_out() -> str:
+        raise _group_cls()("batch", [ValueError(str(i)) for i in range(4)])
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            fan_out()
+        except Exception:  # `except*` would not parse on Python 3.10
+            return "fallback"
+        return "done"
+
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert wf() == "fallback"
+    assert "too large to record" in caplog.text
+    assert "refuse to resume past this position" in caplog.text
+
+
+class WithPayload(Exception):
+    def __init__(self, payload: str) -> None:
+        super().__init__("payload too big")
+        self.payload = payload
+
+
+def test_an_attribute_errors_object_is_not_warned_about(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
+) -> None:
+    """Python fills `AttributeError.obj` with the live object, which can never be
+    recorded and which handlers almost never read. It replays as a placeholder,
+    without a warning on every `AttributeError` a step raises."""
+    _fresh(mock_stub, "sess-obj")
+
+    @step
+    def lookup() -> str:
+        return object().missing  # type: ignore[attr-defined,no-any-return]
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            lookup()
+        except AttributeError:
+            return "fallback"
+        return "found"
+
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert wf() == "fallback"
+    assert "cannot be recorded" not in caplog.text
+
+    try:
+        object().missing  # type: ignore[attr-defined]
+    except AttributeError as live:
+        rebuilt = _round_trip(live)
+    assert type(rebuilt) is AttributeError
+    assert rebuilt.name == "missing"
+    with pytest.raises(AttributeError, match="not available on replay"):
+        bool(rebuilt.obj)
+
+
+def _cancelled_at(seq: int, elapsed_s: float, since_run_start_s: float) -> Any:
+    return common_pb2.StepResult(
+        sequence=seq,
+        name="charge",
+        status=FAILED,
+        output_payload=serialize(
+            {
+                "cancelled": {
+                    "format": 1,
+                    "sdk": "python",
+                    "elapsed_s": elapsed_s,
+                    "since_run_start_s": since_run_start_s,
+                }
+            }
+        ),
+    )
+
+
+def test_the_wait_for_a_timeout_around_earlier_steps_is_capped(
+    mock_stub: MagicMock, mock_client: None, monkeypatch: Any
+) -> None:
+    """A cancellation that came three hours into the original run does not hold
+    the resumed run for three hours."""
+    import time
+
+    monkeypatch.setattr("cellaflow.decorators._CANCEL_WAIT_RUN_CAP_S", 0.2)
+    _history(mock_stub, "sess-cap", [_cancelled_at(1, 0.01, 3 * 3600.0)])
+
+    @step
+    async def charge() -> str:
+        return "charged"
+
+    @workflow(version="1.0.0")
+    async def wf() -> str:
+        return await charge()  # type: ignore[no-any-return]
+
+    async def run() -> None:
+        run_wf: Any = wf
+        await asyncio.wait_for(run_wf(_session_id="sess-cap"), 5.0)
+
+    started = time.monotonic()
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run())
+    assert time.monotonic() - started < 2.0
+
+
+def test_the_steps_own_wait_is_not_capped(
+    mock_stub: MagicMock, mock_client: None, monkeypatch: Any
+) -> None:
+    """A single step under a long `wait_for` still waits for that timeout."""
+    import time
+
+    monkeypatch.setattr("cellaflow.decorators._CANCEL_WAIT_RUN_CAP_S", 0.0)
+    _history(mock_stub, "sess-own", [_cancelled_at(1, 0.3, 0.3)])
+
+    @step
+    async def charge() -> str:
+        return "charged"
+
+    @workflow(version="1.0.0")
+    async def wf() -> str:
+        return await charge()  # type: ignore[no-any-return]
+
+    started = time.monotonic()
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(wf(_session_id="sess-own"))  # type: ignore[call-arg]
+    assert time.monotonic() - started >= 0.8  # 0.3 * 2 + 0.25
+
+
+def test_a_timeout_that_expires_during_the_commit_does_not_cancel_a_committed_step(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The commit blocks the loop, so a timeout that expires meanwhile is handled
+    at the step's next `await`. After a commit there is none: the step returns
+    its result, and nothing records it as cancelled at its own position."""
+    import time
+
+    _fresh(mock_stub, "sess-late-timeout")
+    answer = mock_stub.CommitStep.side_effect
+
+    def slow_commit(req: Any, **kwargs: Any) -> Any:
+        if req.step_result.name == "charge":
+            time.sleep(0.3)  # past the 0.1 s timeout below
+        return answer(req, **kwargs)
+
+    mock_stub.CommitStep.side_effect = slow_commit
+
+    @step
+    async def charge() -> str:
+        return "charged"
+
+    @step
+    async def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    async def wf() -> str:
+        try:
+            outcome = await asyncio.wait_for(charge(), 0.1)
+        except asyncio.TimeoutError:
+            outcome = "timed out"
+        await notify()
+        return outcome  # type: ignore[no-any-return]
+
+    assert asyncio.run(wf()) == "charged"
+    assert _commits(mock_stub) == [(1, "charge", SUCCESS), (2, "notify", SUCCESS)]

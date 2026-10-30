@@ -12,7 +12,14 @@ import grpc
 
 from cellaflow.client import CellaflowClient
 from cellaflow.history import latest_session_sequence
-from cellaflow.failures import capture, findable, unrecorded
+from cellaflow.failures import (
+    _MAX_GROUP_TOTAL,
+    _MAX_RECORD_BYTES,
+    capture,
+    findable,
+    incomplete_group,
+    unrecorded,
+)
 from cellaflow.idempotency import failure_idempotency_key, record_idempotency_key
 from cellaflow.v1 import common_pb2, idempotency_pb2, service_pb2
 
@@ -297,7 +304,7 @@ class WorkflowContext:
         agent_id: str,
         step_key: str,
         exc: Optional[BaseException] = None,
-    ) -> bool:
+    ) -> None:
         """Holds a failure-kind record, if nothing claimed a later position.
 
         Either `payload` is given, or `exc` is, and the payload is captured from
@@ -305,7 +312,7 @@ class WorkflowContext:
         """
         with self._lock:
             if not (self._in_flight == 1 and self.sequence == sequence):
-                return False
+                return
             self._pending_hit = {
                 "kind": "failure",
                 "status": common_pb2.StepStatus.STEP_STATUS_FAILED,
@@ -317,7 +324,6 @@ class WorkflowContext:
                 "agent_id": agent_id,
                 "received_key": step_key,
             }
-            return True
 
     def _prepare_pending(self) -> None:
         """Captures a held failure before its record is written.
@@ -374,12 +380,26 @@ class WorkflowContext:
                 name,
                 sequence,
             )
+        if incomplete_group(recorded):
+            logger.warning(
+                "Cellaflow: the exception group %s raised by %r at position %d is "
+                "too large to record (over %d members, or over %d KB even with "
+                "each member reduced to its type and message). A resumed run will "
+                "refuse to resume past this position rather than raise a "
+                "different group.",
+                cls.__qualname__,
+                name,
+                sequence,
+                _MAX_GROUP_TOTAL,
+                _MAX_RECORD_BYTES // 1024,
+            )
+            return
         missing = unrecorded(recorded)
         if missing:
             logger.warning(
                 "Cellaflow: %s raised by %r at position %d has values that cannot "
-                "be recorded (%s). A resumed run raises it without them, and "
-                "reading one raises AttributeError.",
+                "be recorded (%s). A resumed run raises it with a placeholder for "
+                "each, and using one raises AttributeError.",
                 cls.__qualname__,
                 name,
                 sequence,

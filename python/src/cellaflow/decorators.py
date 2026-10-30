@@ -220,6 +220,11 @@ class FailureNotReplayableError(NondeterministicWorkflowError):
 #: that whatever cancelled it then (a `wait_for` timer) does so again first.
 _CANCEL_WAIT_FACTOR = 2.0
 _CANCEL_WAIT_EXTRA_S = 0.25
+#: The most a replay waits, for a timeout around several steps, beyond what the
+#: step's own run time calls for. Earlier steps replay instantly, so that timeout
+#: fires later than it did; a wait without a bound would hold a resumed run for
+#: as long as the original run had been going.
+_CANCEL_WAIT_RUN_CAP_S = 120.0
 
 
 def _cancellation(recorded: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -299,8 +304,9 @@ async def _replay_cancellation(ctx: WorkflowContext, cancelled: Dict[str, Any]) 
     anything at once. It waits, and whatever cancelled the step the first time
     cancels it again, producing the same exception. If nothing does within twice
     the time the step ran then (and no sooner than the run is as far in as it was
-    when the cancellation came), the cancellation came from outside the code (a
-    person pressing Cancel), and the replay delivers it itself.
+    when the cancellation came, waiting at most two minutes for that), the
+    cancellation came from outside the code (a person pressing Cancel), and the
+    replay delivers it itself.
     """
     elapsed = float(cancelled.get("elapsed_s") or 0.0)
     wait = elapsed * _CANCEL_WAIT_FACTOR + _CANCEL_WAIT_EXTRA_S
@@ -311,8 +317,10 @@ async def _replay_cancellation(ctx: WorkflowContext, cancelled: Dict[str, Any]) 
         # did the first time. It started no earlier than the run did, so by the
         # time this replayed run is as far in as the first one was when the
         # cancellation came, it has fired.
+        # Only this wait is capped; the step's own is not, so a single step
+        # under a long `wait_for` still replays its timeout.
         deadline = ctx.run_started + float(since_start) * 1.25 + _CANCEL_WAIT_EXTRA_S
-        wait = max(wait, deadline - time.monotonic())
+        wait = max(wait, min(deadline - time.monotonic(), _CANCEL_WAIT_RUN_CAP_S))
     await asyncio.sleep(wait)
     raise asyncio.CancelledError()
 
@@ -360,6 +368,29 @@ async def _replay_async(ctx: WorkflowContext, seq: int, expected_name: str) -> A
     if cancelled is not None:
         await _replay_cancellation(ctx, cancelled)
     return _replay(ctx, seq, expected_name)
+
+
+def _release_after_failure(
+    ctx: WorkflowContext, agent_id: str, ikey: str, fencing_token: int, name: str
+) -> None:
+    """Releases the lease of a step that failed or was cancelled, so the step
+    that takes this position next is not refused until it lapses."""
+    try:
+        ctx.client.release_lease(
+            agent_id=agent_id,
+            idempotency_key=ikey,
+            fencing_token=fencing_token,
+            reason="TOOL_ERROR",
+        )
+    except Exception:
+        # The lease lapses on its own. Losing the release is not worth
+        # replacing the error that caused it.
+        logger.warning(
+            "Cellaflow: could not release the lease on %r after it failed; it "
+            "lapses on its own.",
+            name,
+            exc_info=True,
+        )
 
 
 def _note_failure(
@@ -577,6 +608,7 @@ def step(
                         **kwargs,
                     )
 
+            committed = False
             fencing_token = 0
             hb: Optional[LeaseHeartbeat] = None
 
@@ -645,31 +677,24 @@ def step(
                     # session's default.
                     coordination_id=call_coordination,
                 )
+                committed = True
                 return result
             except BaseException as e:
                 # Cancellation too: a lease left held would refuse the step that
                 # takes this position next until it lapsed.
                 if fencing_token > 0:
-                    try:
-                        ctx.client.release_lease(
-                            agent_id=agent_id,
-                            idempotency_key=ikey,
-                            fencing_token=fencing_token,
-                            reason="TOOL_ERROR",
-                        )
-                    except Exception:
-                        # The lease lapses on its own. Losing the release is not
-                        # worth replacing the error that caused it.
-                        logger.warning(
-                            "Cellaflow: could not release the lease on %r after "
-                            "it failed; it lapses on its own.",
-                            actual_tool_name,
-                            exc_info=True,
-                        )
+                    _release_after_failure(
+                        ctx, agent_id, ikey, fencing_token, actual_tool_name
+                    )
                 raise e
             finally:
                 if hb:
-                    await hb.stop_async()
+                    if committed:
+                        # Nothing is awaited between the commit and the return,
+                        # so a cancellation cannot land on a committed step.
+                        hb.stop_soon()
+                    else:
+                        await hb.stop_async()
         except BaseException as exc:
             if live:
                 _note_failure(
@@ -816,22 +841,9 @@ def step(
                 # Cancellation too: a lease left held would refuse the step that
                 # takes this position next until it lapsed.
                 if fencing_token > 0:
-                    try:
-                        ctx.client.release_lease(
-                            agent_id=agent_id,
-                            idempotency_key=ikey,
-                            fencing_token=fencing_token,
-                            reason="TOOL_ERROR",
-                        )
-                    except Exception:
-                        # The lease lapses on its own. Losing the release is not
-                        # worth replacing the error that caused it.
-                        logger.warning(
-                            "Cellaflow: could not release the lease on %r after "
-                            "it failed; it lapses on its own.",
-                            actual_tool_name,
-                            exc_info=True,
-                        )
+                    _release_after_failure(
+                        ctx, agent_id, ikey, fencing_token, actual_tool_name
+                    )
                 raise e
             finally:
                 if hb:

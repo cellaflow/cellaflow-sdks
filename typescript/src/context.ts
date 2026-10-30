@@ -28,6 +28,50 @@ interface PendingHit {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** The longest message and stack a failure record keeps, as the Python SDK. */
+const MAX_MESSAGE_CHARS = 4 * 1024;
+const MAX_TRACEBACK_CHARS = 16 * 1024;
+
+/** Reads a property, or `undefined` if reading it throws (a getter, a Proxy). */
+function readField(value: unknown, field: string): unknown {
+  try {
+    return (value as Record<string, unknown> | null | undefined)?.[field];
+  } catch {
+    return undefined;
+  }
+}
+
+/** `String(value)`, or a placeholder if converting it throws. */
+function safeString(value: unknown): string {
+  try {
+    return String(value);
+  } catch {
+    return `<${typeof value}: could not be converted to a string>`;
+  }
+}
+
+/**
+ * What a failure record holds about an error. Never throws: recording a failure
+ * must not replace the error the step raised. The message keeps its first
+ * {@link MAX_MESSAGE_CHARS}, the stack its last {@link MAX_TRACEBACK_CHARS}.
+ */
+export function describeError(err: unknown): Record<string, unknown> {
+  const name = readField(err, "name");
+  const message = readField(err, "message");
+  const stack = readField(err, "stack");
+  return {
+    format: 1,
+    // Which SDK wrote it: the Python SDK replays only its own records.
+    sdk: "typescript",
+    type: typeof name === "string" ? name : typeof err,
+    message: (typeof message === "string" ? message : safeString(err)).slice(
+      0,
+      MAX_MESSAGE_CHARS,
+    ),
+    traceback: typeof stack === "string" ? stack.slice(-MAX_TRACEBACK_CHARS) : "",
+  };
+}
+
 /**
  * The session a tool call belongs to, plus the bookkeeping that keeps the local
  * sequence counter aligned with the engine's.
@@ -152,22 +196,12 @@ export class WorkflowContext {
     stepKey = "",
   ): void {
     if (!(this.inFlight === 1 && this.sequence === sequence)) return;
-    const e = err as { name?: unknown; message?: unknown; stack?: unknown } | undefined;
     this.pendingHit = {
       kind: "failure",
       status: StepStatus.FAILED,
       sequence,
       name,
-      payload: {
-        error: {
-          format: 1,
-          // Which SDK wrote it: the Python SDK replays only its own records.
-          sdk: "typescript",
-          type: typeof e?.name === "string" ? e.name : typeof err,
-          message: typeof e?.message === "string" ? e.message : String(err),
-          traceback: typeof e?.stack === "string" ? e.stack : "",
-        },
-      },
+      payload: { error: describeError(err) },
       coordinationId,
       agentId,
       receivedKey: stepKey,

@@ -12,7 +12,9 @@ All notable changes to the CellaFlow TypeScript SDK.
   written when the next call claims a position, so a failure nothing follows, or one while another
   call of the session is in flight, is not recorded. `durableTools` resumes by running tools
   again rather than by replaying positions, so the record fills the position; it is not replayed.
-  The Python SDK records failures the same way and, in a `@workflow`, also replays them.
+  The Python SDK records failures the same way and, in a `@workflow`, also replays them. The
+  message keeps its first 4 KB and the stack its last 16 KB, and recording never replaces the
+  error the tool threw, even one whose fields cannot be read.
 
 ### Fixed
 

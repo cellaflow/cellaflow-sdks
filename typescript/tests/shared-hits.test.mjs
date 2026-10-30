@@ -563,6 +563,39 @@ test("a caught failure is recorded, and the next call takes the next position", 
   assert.equal(failure.payload.error.message, "insufficient funds");
 });
 
+test("a huge failure is recorded with its message and stack cut down", async () => {
+  const client = scriptedClient([acquired(), acquired()]);
+  const huge = new Error("m".repeat(100_000));
+  huge.stack = "s".repeat(50_000) + "LAST FRAME";
+  const charge = tool(async () => { throw huge; }, { toolName: "charge" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), (e) => e === huge);
+    await notify();
+  });
+  const { error } = client.commits[0].payload;
+  assert.equal(error.message.length, 4 * 1024);
+  assert.equal(error.traceback.length, 16 * 1024);
+  assert.ok(error.traceback.endsWith("LAST FRAME"));
+});
+
+test("a thrown value that cannot be inspected still reaches the caller", async () => {
+  // A getter that throws, and an object with no toString: reading either while
+  // recording must not replace what the step threw.
+  const hostile = Object.create(null);
+  Object.defineProperty(hostile, "message", { get() { throw new Error("getter"); } });
+  const client = scriptedClient([acquired(), acquired()]);
+  const charge = tool(async () => { throw hostile; }, { toolName: "charge" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), (e) => e === hostile);
+    assert.equal(await notify(), "notified");
+  });
+  const { error } = client.commits[0].payload;
+  assert.equal(error.type, "object");
+  assert.match(error.message, /could not be converted/);
+});
+
 test("a failure nothing follows records nothing", async () => {
   const client = scriptedClient([acquired()]);
   const charge = tool(async () => { throw new Error("boom"); }, { toolName: "charge" });

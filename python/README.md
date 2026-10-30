@@ -443,22 +443,51 @@ def triage(ticket_id: str) -> dict:
 
 The same applies to any other varying input to a branch: `datetime.now()`, `random`, environment lookups, or a bare HTTP call. Wrap it in a `@step` or `@tool` and branch on the result.
 
-#### `NondeterministicWorkflowError`
+#### Failed and cancelled steps replay too
 
-When a resumed run reaches a sequence holding a *different* step than the one it is about to call, the SDK raises rather than returning the recorded result:
+A step that raised, or was cancelled, and that the workflow carried on past, is recorded at its position like any other step. A resumed run raises the same exception there instead of running the step again, so the workflow takes the same branch it took the first time.
+
+- **The exception is rebuilt from what was recorded:** its class, arguments and fields. None of the class's own code runs to do it. The original traceback is attached as a note.
+- **A field that could not be recorded** (an open connection, a response object) comes back as a placeholder. Using it raises `AttributeError` saying it was not recorded. When the failure happens, the SDK logs a warning naming each such field. `AttributeError.obj`, which Python fills with a live object, is replayed the same way without a warning.
+- **Exception groups** keep every member's type and message, so `except*` matches the same members. A group with more than 2,000 members, or too large to record even member by member, cannot be replayed: the SDK warns when it happens, and a resume stops at that position.
+- **A cancellation** is replayed by waiting to be cancelled again, because what the workflow saw depended on what cancelled it: `asyncio.wait_for` turns its own cancellation into `TimeoutError`, `task.cancel()` arrives as `CancelledError`. If nothing cancels the step within twice the time it ran the first time (and, for a timeout around several steps, until the run is as far in as it was, up to two minutes more), the replay raises `CancelledError` itself.
+
+Define the exceptions a step raises at module level, in a module the workflow imports. A class defined inside a function, or only in the script being run, cannot be found by a resumed process. The SDK warns about both when the failure happens.
+
+#### When a resume cannot go on
+
+A resumed run that cannot reproduce its history stops before the step does anything. Both errors below derive from `NondeterministicWorkflowError`; catch that to handle either.
+
+**`ReplayDivergedError`**: the resumed run called a different step than the history records at that position.
 
 ```
-NondeterministicWorkflowError: Workflow diverged from its recorded history at
-sequence 1: expected step 'shared', but 'warmup' was committed there. A resumed
-run must perform the same steps in the same order — move any branching on model
-output, clocks, or network reads inside a step so its result is replayed too.
+ReplayDivergedError: Session sess-4417 cannot resume at position 3. The resumed
+run called 'notify', but the history records 'fallback' there.
+Position 2 ('charge') failed with PaymentDeclined on the first run; after it, the
+code took a different branch than it did then.
+Common causes: the workflow code changed since the first run (a step added,
+removed or reordered, or a different timeout), or it branched on something not
+recorded (the clock, a random number, a model's answer outside a step). Nothing
+ran twice. To go on, start a new session for this work.
 ```
 
-**This is a bug in your workflow, not in the engine.** It means the resumed run took a different path than the run it is recovering — most often a branch on a value computed outside a step. Find the branch named in the error, and move whatever it tests into a step.
+**This is a bug in your workflow, not in the engine.** The resumed run took a different path than the run it is recovering, most often because of a branch on a value computed outside a step. Find the branch named in the error, and move whatever it tests into a step. The check compares step names, which catches a changed *shape* of execution: a skipped branch, a reordering, an extra step.
 
-The check compares step names, which catches a changed *shape* of execution: a skipped branch, a reordering, an extra step. Deterministic branching, as above, is what keeps a resumed run matching the history it is recovering.
+**`FailureNotReplayableError`**: the history records a failure or cancellation at this position, and the resumed run cannot reproduce it exactly. Raising a different exception could send the run down a different branch, so it stops instead.
 
-A related error, `Cannot verify replay at sequence N: the recorded step has no name`, means the history was not written by this SDK. Every step it commits records a name, so a nameless record cannot be checked and is refused rather than replayed positionally.
+```
+FailureNotReplayableError: Cannot replay the failure of 'charge' at position 2:
+its exception type billing.errors:PaymentDeclined is not defined in any module
+this process has loaded. Define the exceptions a step raises at module level, in
+a module the workflow imports, and keep them there while runs that raised them
+may still resume.
+```
+
+Other causes: the failure was recorded by the TypeScript SDK, the exception group was too large to record, or the step was cancelled as an async step and is now synchronous.
+
+In every case nothing ran twice, and the session's history is unchanged. To go on, start a new session for the work.
+
+A related error, `Cannot verify replay at sequence N: the recorded step has no name`, raised as `NondeterministicWorkflowError` itself, means the history was not written by this SDK. Every step it commits records a name, so a nameless record cannot be checked and is refused rather than replayed positionally.
 
 Extending history is fine and is the normal case: a run that matches the recorded prefix and then continues past it executes the new steps and commits them as usual. Only *divergence within* the recorded prefix raises.
 

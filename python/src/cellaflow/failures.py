@@ -48,18 +48,46 @@ _TUPLE = "__cellaflow_tuple__"
 
 
 class UnavailableOnReplay:
-    """Stands in for an exception argument that could not be recorded."""
+    """Stands in, on replay, for a value that could not be recorded.
+
+    Using it raises: reading an attribute, comparing, testing it for truth,
+    converting it, iterating, calling. The exception carrying it keeps its exact
+    class, and no code of that class runs to make room for it. Only an identity
+    check (`value is None`) passes silently, and reads as "not None".
+    """
 
     def __init__(self, what: str) -> None:
-        self._what = what
+        object.__setattr__(self, "_what", what)
+
+    def _unavailable(self, *args: Any, **kwargs: Any) -> Any:
+        raise AttributeError(
+            f"{object.__getattribute__(self, '_what')} was not recorded, so it is "
+            f"not available on replay"
+        )
 
     def __repr__(self) -> str:
-        return f"<{self._what}: not recorded, so not available on replay>"
+        what = object.__getattribute__(self, "_what")
+        return f"<{what}: not recorded, so not available on replay>"
 
     def __getattr__(self, name: str) -> Any:
-        raise AttributeError(
-            f"{self._what} was not recorded, so it is not available on replay"
-        )
+        return self._unavailable()
+
+    __setattr__ = _unavailable
+    __bool__ = _unavailable
+    __eq__ = _unavailable
+    __ne__ = _unavailable
+    __lt__ = _unavailable
+    __gt__ = _unavailable
+    __hash__ = _unavailable
+    __str__ = _unavailable
+    __int__ = _unavailable
+    __float__ = _unavailable
+    __index__ = _unavailable
+    __len__ = _unavailable
+    __iter__ = _unavailable
+    __contains__ = _unavailable
+    __getitem__ = _unavailable
+    __call__ = _unavailable
 
 
 class ReplayedFailureError(RuntimeError):
@@ -175,9 +203,18 @@ _MAX_VALUE_BYTES = 64 * 1024
 _MAX_TRACEBACK_CHARS = 16 * 1024
 _MAX_MESSAGE_CHARS = 4 * 1024
 _MAX_RECORD_BYTES = 512 * 1024
-#: How deep and how wide an exception group is recorded.
+#: How deep and how wide an exception group is recorded in full. Every member
+#: beyond that, and every member of a group too large in full, keeps its type,
+#: its message (up to `_MAX_MEMBER_MESSAGE_CHARS`) and its small arguments,
+#: which is what `except*` matches on. A group that does not fit even so, or
+#: that has more than `_MAX_GROUP_TOTAL` members in all, is recorded as
+#: incomplete, and a resume refuses at its position rather than raise a
+#: different group.
 _MAX_GROUP_DEPTH = 5
 _MAX_GROUP_MEMBERS = 50
+_MAX_GROUP_TOTAL = 2000
+_MAX_MEMBER_MESSAGE_CHARS = 1024
+_MAX_MEMBER_ARG_BYTES = 1024
 
 _BaseExceptionGroup: Any = getattr(builtins, "BaseExceptionGroup", None)
 
@@ -278,12 +315,7 @@ def _capture(exc: BaseException, depth: int) -> Dict[str, Any]:
             return recorded
 
     if _BaseExceptionGroup is not None and isinstance(exc, _BaseExceptionGroup):
-        members = list(exc.exceptions)
-        if depth < _MAX_GROUP_DEPTH and len(members) <= _MAX_GROUP_MEMBERS:
-            recorded["group"] = {
-                "message": exc.message,
-                "exceptions": [_capture_member(m, depth + 1) for m in members],
-            }
+        recorded["group"] = _group(exc, depth, full=True)
 
     args: List[Any] = []
     unavailable_args: List[int] = []
@@ -316,26 +348,95 @@ def _capture(exc: BaseException, depth: int) -> Dict[str, Any]:
         attrs=attrs,
         unavailable_attrs=unavailable_attrs,
     )
-    try:
-        too_big = len(serialize({"e": recorded})) > _MAX_RECORD_BYTES
-    except Exception:
-        too_big = True
+    too_big = not _fits(recorded)
     if too_big:
-        # Still recorded, so the position is filled: the type and the message.
-        recorded.pop("group", None)
+        # Still recorded, so the position is filled: the type and the message,
+        # and a group's members by type, message and small arguments.
+        if "group" in recorded:
+            recorded["group"] = _group(exc, depth, full=False)
         recorded.update(
             args=[None] * len(exc.args),
             unavailable_args=list(range(len(exc.args))),
             attrs={},
             unavailable_attrs=sorted(n for n in fields if not n.startswith("__")),
         )
+        if "group" in recorded and not _fits(recorded):
+            recorded["group"] = {
+                "message": recorded["group"]["message"],
+                "exceptions": [],
+                "incomplete": True,
+            }
     return recorded
+
+
+def _fits(recorded: Dict[str, Any]) -> bool:
+    try:
+        return len(serialize({"e": recorded})) <= _MAX_RECORD_BYTES
+    except Exception:
+        return False
 
 
 def _capture_member(exc: BaseException, depth: int) -> Dict[str, Any]:
     member = capture(exc, depth)
     member.pop("traceback", None)  # the group's own traceback covers it
     return member
+
+
+def _minimal(exc: BaseException, depth: int) -> Dict[str, Any]:
+    """A member by its type, message and small arguments, and a group's members
+    likewise. Its other fields are listed as not recorded."""
+    try:
+        message = str(exc)[:_MAX_MEMBER_MESSAGE_CHARS]
+    except Exception:
+        message = ""
+    member: Dict[str, Any] = {
+        "format": FAILURE_FORMAT,
+        "sdk": "python",
+        "type": type_location(type(exc)),
+        "message": message,
+        "args": [],
+        "unavailable_args": [],
+        "attrs": {},
+        "unavailable_attrs": [],
+    }
+    if _BaseExceptionGroup is not None and isinstance(exc, _BaseExceptionGroup):
+        member["group"] = _group(exc, depth, full=False)
+        return member
+    for i, arg in enumerate(exc.args):
+        ok, encoded = _safe_encode(arg)
+        try:
+            ok = ok and len(serialize({"v": encoded})) <= _MAX_MEMBER_ARG_BYTES
+        except Exception:
+            ok = False
+        member["args"].append(encoded if ok else None)
+        if not ok:
+            member["unavailable_args"].append(i)
+    try:
+        fields = {**_builtin_fields(exc), **dict(vars(exc))}
+    except Exception:
+        fields = {}
+    member["unavailable_attrs"] = sorted(n for n in fields if not n.startswith("__"))
+    return member
+
+
+def _count_members(exc: BaseException) -> int:
+    if _BaseExceptionGroup is not None and isinstance(exc, _BaseExceptionGroup):
+        return sum(1 + _count_members(m) for m in exc.exceptions)
+    return 0
+
+
+def _group(exc: Any, depth: int, full: bool) -> Dict[str, Any]:
+    """A group's message and members: the first ones in full when `full`, the
+    rest by type and message. Marked `incomplete` when it is too large."""
+    if depth == 0 and _count_members(exc) > _MAX_GROUP_TOTAL:
+        return {"message": exc.message, "exceptions": [], "incomplete": True}
+    members = []
+    for i, member in enumerate(exc.exceptions):
+        if full and depth < _MAX_GROUP_DEPTH and i < _MAX_GROUP_MEMBERS:
+            members.append(_capture_member(member, depth + 1))
+        else:
+            members.append(_minimal(member, depth + 1))
+    return {"message": exc.message, "exceptions": members}
 
 
 # --- Rebuilding ---------------------------------------------------------------
@@ -353,42 +454,6 @@ def _builtin_new(cls: type) -> Any:
             continue  # defined in Python by the class: never run on replay
         return new
     return BaseException.__new__
-
-
-_missing_cache: Dict[Tuple[type, Tuple[str, ...]], type] = {}
-
-
-def _with_missing(cls: type, names: List[str]) -> type:
-    """`cls` with a property per name that raises when read.
-
-    Created once per class and set of names, so a class's subclass hooks run once
-    rather than on every replay.
-    """
-    key = (cls, tuple(sorted(names)))
-    cached = _missing_cache.get(key)
-    if cached is not None:
-        return cached
-
-    def _missing(name: str) -> property:
-        def _get(self: Any) -> Any:
-            raise AttributeError(
-                f"{cls.__name__}.{name} was not recorded, so it is not "
-                f"available on replay"
-            )
-
-        return property(_get)
-
-    subclass = type(
-        cls.__name__,
-        (cls,),
-        {
-            "__module__": cls.__module__,
-            "__qualname__": cls.__qualname__,
-            **{name: _missing(name) for name in names},
-        },
-    )
-    _missing_cache[key] = subclass
-    return subclass
 
 
 def rebuild(recorded: Any, step_name: str, sequence: int) -> BaseException:
@@ -445,6 +510,12 @@ def _rebuild(recorded: Any, where: str) -> BaseException:
         )
 
     group = recorded.get("group")
+    if group is not None and group.get("incomplete"):
+        raise ReplayedFailureError(
+            f"Cannot replay {where}: it is an exception group too large to record "
+            f"in full, and raising a smaller one could send the run down a "
+            f"different branch."
+        )
     if group is not None:
         # An exception group: its members are rebuilt the same way, and the group
         # is made from them, as `except*` needs.
@@ -455,8 +526,6 @@ def _rebuild(recorded: Any, where: str) -> BaseException:
         for i in recorded.get("unavailable_args", []):
             args[i] = UnavailableOnReplay(f"argument {i} of {cls.__name__}")
     unavailable = list(recorded.get("unavailable_attrs", []))
-    if unavailable:
-        cls = _with_missing(cls, unavailable)
 
     try:
         exc: BaseException = _builtin_new(cls)(cls, *args)
@@ -473,9 +542,11 @@ def _rebuild(recorded: Any, where: str) -> BaseException:
     if group is None:
         exc.args = tuple(args)
 
+    values = {name: _decode(value) for name, value in recorded.get("attrs", {}).items()}
+    for name in unavailable:
+        values[name] = UnavailableOnReplay(f"{cls.__name__}.{name}")
     state = vars(exc)
-    for name, value in recorded.get("attrs", {}).items():
-        value = _decode(value)
+    for name, value in values.items():
         descriptor = inspect.getattr_static(type(exc), name, None)
         builtin_field = (types.GetSetDescriptorType, types.MemberDescriptorType)
         if isinstance(descriptor, builtin_field):
@@ -498,7 +569,20 @@ def _note(exc: BaseException, recorded: Dict[str, Any], where: str) -> None:
         add_note(note)
 
 
+#: Fields Python fills with a reference to a live object, such as
+#: `AttributeError.obj`, which can never be recorded and which handlers rarely
+#: read. Replayed as unavailable like any other, but not warned about.
+_QUIET_FIELDS = frozenset({"obj"})
+
+
+def incomplete_group(recorded: Dict[str, Any]) -> bool:
+    """Whether an exception group was too large to record, so cannot replay."""
+    return bool((recorded.get("group") or {}).get("incomplete"))
+
+
 def unrecorded(recorded: Dict[str, Any]) -> List[str]:
     """What `capture` could not record, for a warning when the failure happens."""
     names = [f"argument {i}" for i in recorded.get("unavailable_args", [])]
-    return names + list(recorded.get("unavailable_attrs", []))
+    return names + [
+        n for n in recorded.get("unavailable_attrs", []) if n not in _QUIET_FIELDS
+    ]
