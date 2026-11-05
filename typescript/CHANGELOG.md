@@ -2,7 +2,28 @@
 
 All notable changes to the CellaFlow TypeScript SDK.
 
-## Unreleased
+## 0.9.0
+
+0.8.1 was prepared but never published; its changes are part of 0.9.0.
+
+### Behaviour changes
+
+Code written against 0.8.0 can see these:
+
+- **A session's history has more entries:** the result of a shared tool answered from another
+  session, at its position in the receiving session, and calls with status `FAILED`.
+- **An execution lease is treated as lost sooner:** no later than the engine treats it as expired,
+  counted from when each renewal was sent. `check()` fails once the block has exited, and
+  `executionLease` throws `LeaseLostError` rather than run its block on a lease already lost.
+- **`tool()` renewals ask for the full lease lifetime,** four heartbeat intervals rather than
+  three.
+- **A resumed `durableTools` session reads its history at its first call,** one paged read, to
+  continue after the positions it holds.
+
+### Compatibility
+
+- Verified against engine 0.2.0 (`ghcr.io/cellaflow/cellaflow:0.2.0`), which CI's integration
+  tests run against. Older engines are untested.
 
 ### Added
 
@@ -20,6 +41,10 @@ All notable changes to the CellaFlow TypeScript SDK.
   message keeps its first 4 KB and the stack its last 16 KB, and recording never replaces the
   error the tool threw, even one whose fields cannot be read.
 
+- **`onEvent` on `executionLease`**, called on acquisition, every renewal outcome, loss and
+  release, with a wall-clock time, the fencing token and, where the engine sent one, its expiry.
+  For tracing; it cannot change what the lease does.
+
 ### Fixed
 
 - **A resumed `durableTools` session can run a tool it had not reached.** A resumed session counted
@@ -30,16 +55,6 @@ All notable changes to the CellaFlow TypeScript SDK.
   cache hit that reports it. A session the engine reports as recovered but whose history it cannot
   find is an error, not a session at position 0; a read that fails with an error that may pass
   lets the call go ahead as before, and the next call reads again.
-
-## 0.8.1
-
-### Added
-
-- **`onEvent` on `executionLease`**, called on acquisition, every renewal outcome, loss and
-  release, with a wall-clock time, the fencing token and, where the engine sent one, its expiry.
-  For tracing; it cannot change what the lease does.
-
-### Fixed
 
 - **An execution lease is treated as lost no later than the engine treats it as expired.** Two
   things let a holder keep going after another worker had taken its lease. Renewals asked the

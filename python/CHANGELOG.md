@@ -2,7 +2,34 @@
 
 All notable changes to the CellaFlow Python SDK.
 
-## Unreleased
+## 0.9.0
+
+### Behaviour changes
+
+Code written against 0.8.0 can see these:
+
+- **A resumed `@workflow` raises a caught step failure again instead of running the step.** When
+  the first run caught a step's exception and carried on, the failure is recorded at its position,
+  and a resume raises it there, so the workflow takes the branch it took. A failure the workflow
+  let propagate is still not recorded, so a resume still runs that step again.
+- **A recorded cancellation makes a resume refuse,** with `FailureNotReplayableError`, rather than
+  guess what cancelled the step. Put a timeout inside the step's body instead: it records a plain
+  `TimeoutError`, which replays.
+- **A refusal stops the run even if the workflow catches it.** After `ReplayDivergedError` or
+  `FailureNotReplayableError`, every later step raises it again before its body runs, and the
+  workflow raises it when it ends.
+- **A session's history has more entries:** the result of a shared step answered from another
+  session, at its position in the receiving session, and steps with status `STEP_STATUS_FAILED`.
+- **A workflow that returns right after a caught failure waits for its record before returning.**
+  Normally one round trip; up to the failed step's lease lifetime (about 27 seconds by default)
+  when that lease could not be released.
+- **A resumed `durable_tools` session reads its history at its first call,** one paged read, to
+  continue after the positions it holds.
+
+### Compatibility
+
+- Verified against engine 0.2.0 (`ghcr.io/cellaflow/cellaflow:0.2.0`), which CI's integration
+  tests run against. Older engines are untested.
 
 ### Added
 
