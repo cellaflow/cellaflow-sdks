@@ -2,7 +2,7 @@
 
 All notable changes to the CellaFlow TypeScript SDK.
 
-## Unreleased
+## 0.8.1
 
 ### Added
 
