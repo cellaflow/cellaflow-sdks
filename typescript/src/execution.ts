@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { CellaflowClient } from "./client.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { LeaseHeartbeat } from "./lease.js";
+import type { LeaseEvent } from "./lease.js";
 
 const DEFAULT_TTL_MS = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
@@ -36,18 +37,41 @@ export class LeaseHandle {
   readonly fencingToken: number;
   private readonly controller = new AbortController();
   private lostDetail?: string;
+  private released = false;
+  private readonly probe?: () => void;
 
-  constructor(fencingToken: number) {
+  /**
+   * @param probe Called before every `isLost` and `check()`, so loss is judged
+   *   on the clock at the moment of asking rather than on the last heartbeat.
+   */
+  constructor(fencingToken: number, probe?: () => void) {
     this.fencingToken = fencingToken;
+    this.probe = probe;
   }
 
-  /** Aborts when the lease is lost. Pass to `fetch`, streams, or your own loops. */
+  /**
+   * Aborts when the lease is lost. Pass to `fetch`, streams, or your own loops.
+   * Reading it checks the clock, like `isLost`, so a process resumed past its
+   * deadline gets a signal that has already aborted.
+   *
+   * It does not abort when the block exits and the lease is released: that is
+   * not a loss, and a response or stream fetched with it may still be read.
+   */
   get signal(): AbortSignal {
+    if (!this.released && !this.controller.signal.aborted) this.probe?.();
     return this.controller.signal;
   }
 
+  /** True once the lease is lost, or released because its block exited. */
   get isLost(): boolean {
+    if (this.released) return true;
+    if (!this.controller.signal.aborted) this.probe?.();
     return this.controller.signal.aborted;
+  }
+
+  /** @internal Called as the block exits, before the lease is let go. */
+  markReleased(): void {
+    this.released = true;
   }
 
   /** @internal */
@@ -58,15 +82,24 @@ export class LeaseHandle {
   }
 
   /**
-   * Throws if the lease has been lost.
+   * Throws if the lease has been lost, or can no longer be assumed held.
    *
    * Call this before anything irreversible inside a long block. Nothing else
    * stops the work: losing a lease cannot preempt a running function in Node.
+   * It judges by the clock, not only by the last heartbeat, so a process that
+   * was stopped past its deadline fails here before any renewal answers.
+   *
+   * It cannot close the gap between the check and the write landing at the
+   * other end: a write sent just before the deadline can still arrive after
+   * another worker took over. Hand `signal` to the request to shorten it.
    */
   check(): void {
-    if (this.isLost) {
-      throw new LeaseLostError(`Execution lease was lost: ${this.lostDetail}`);
-    }
+    if (!this.isLost) return;
+    throw new LeaseLostError(
+      this.controller.signal.aborted
+        ? `Execution lease was lost: ${this.lostDetail}`
+        : "Execution lease was released when its block exited",
+    );
   }
 }
 
@@ -95,10 +128,23 @@ export interface ExecutionLeaseOptions {
   workerId: string;
   target?: string;
   secure?: boolean;
+  /**
+   * How long the lease lasts without a renewal. Each renewal extends it by the
+   * same amount. Defaults to 30 000.
+   */
   ttlMs?: number;
+  /**
+   * Fallback renewal interval. The engine answers acquisition with its own
+   * interval (a quarter of the TTL), and that one is used when present.
+   */
   heartbeatIntervalMs?: number;
   /** Notified when the lease is lost. A notification, not a substitute for checking. */
   onLeaseLost?: (detail: string) => void;
+  /**
+   * Called on acquisition, every renewal outcome, loss and release, for
+   * tracing. Times are wall-clock epoch milliseconds.
+   */
+  onEvent?: (event: LeaseEvent) => void;
   /**
    * How long to wait for a lease another worker is holding. Defaults to 0, which
    * fails immediately with {@link LeaseNotAcquired}.
@@ -138,14 +184,26 @@ export async function executionLease<T>(
     ttlMs = DEFAULT_TTL_MS,
     heartbeatIntervalMs = DEFAULT_HEARTBEAT_INTERVAL_MS,
     onLeaseLost,
+    onEvent,
     waitMs = 0,
   } = options;
 
   const client = new CellaflowClient({ target, secure });
   let hb: LeaseHeartbeat | undefined;
+  let handle: LeaseHandle | undefined;
   let fencingToken = 0;
 
+  const emit = (event: Omit<LeaseEvent, "at" | "fencingToken">) => {
+    try {
+      onEvent?.({ at: Date.now(), fencingToken, ...event });
+    } catch {
+      // A caller's tracer must not change what the lease does.
+    }
+  };
+
   try {
+    const acquiredSentAt = performance.now();
+    const acquiredSentWallAt = Date.now();
     const resp = await client.checkIdempotencyCache(workerId, key, waitMs, ttlMs);
 
     if (resp.status === CacheStatus.HIT) {
@@ -165,17 +223,34 @@ export async function executionLease<T>(
     }
 
     fencingToken = Number(resp.fencingToken ?? 0n);
-    const handle = new LeaseHandle(fencingToken);
+    handle = new LeaseHandle(fencingToken, () => {
+      hb?.pastDeadline();
+    });
+    const leaseHandle = handle;
+    emit({
+      type: "acquired",
+      expiresAtMs: resp.leaseExpiresAtMs !== undefined ? Number(resp.leaseExpiresAtMs) : undefined,
+    });
 
+    const engineInterval = Number(resp.heartbeatIntervalMs ?? 0n);
     hb = new LeaseHeartbeat({
       client,
       agentId: workerId,
       idempotencyKey: key,
       fencingToken,
-      heartbeatIntervalMs: Number(resp.heartbeatIntervalMs ?? BigInt(heartbeatIntervalMs)),
+      // An engine too old to suggest one, or a TTL under 4 ms, gives 0: renew at
+      // the caller's interval, but never less often than four times per TTL.
+      heartbeatIntervalMs:
+        engineInterval > 0 ? engineInterval : Math.min(heartbeatIntervalMs, Math.max(1, Math.floor(ttlMs / 4))),
+      // Renew for the full TTL. Asking for less made the engine hand the lease
+      // on before this side noticed it was gone.
+      extendMs: ttlMs,
       leaseTtlMs: ttlMs,
+      acquiredSentAt,
+      acquiredSentWallAt,
+      onEvent,
       onLeaseLost: (detail) => {
-        handle.markLost(detail);
+        leaseHandle.markLost(detail);
         try {
           onLeaseLost?.(detail);
         } catch {
@@ -183,14 +258,48 @@ export async function executionLease<T>(
         }
       },
     });
+    if (waitMs > 0) {
+      // The engine may have waited before granting, so the lease can be much
+      // younger than the request that won it, and a deadline counted from that
+      // request would read a fresh lease as nearly expired. A renewal sent now
+      // gives a deadline counted from a known time. One failed attempt is not a
+      // loss, so try a few, backing off, while the lease, counted from when the
+      // grant arrived, could still be live. If none is confirmed, the deadline
+      // counted from the request still bounds the lease from below (the grant
+      // came after it), so the block runs only if that has not passed.
+      const windowEnd = performance.now() + ttlMs - hb.marginMs;
+      for (let attempt = 0; attempt < 3 && !hb.lost; attempt++) {
+        if (await hb.renewNow()) break;
+        const pause = Math.min(100 * 2 ** attempt, windowEnd - performance.now());
+        if (pause <= 0) break;
+        await new Promise((resolve) => setTimeout(resolve, pause));
+      }
+    }
+    // A lease already lost before the block starts must not run it: a block
+    // that acts before its first check() would act on a lease this side has
+    // already given up.
+    if (leaseHandle.isLost) {
+      throw new LeaseLostError(
+        `Execution lease '${key}' was lost before the block started: ${hb.lostDetail}`,
+      );
+    }
     hb.start();
 
-    return await currentLeaseStore.run(handle, () => fn(handle));
+    return await currentLeaseStore.run(leaseHandle, () => fn(leaseHandle));
   } finally {
+    // Before anything is awaited: work the block started and did not await can
+    // still reach the handle through currentLease(), and from here on the lease
+    // is not this worker's to act under.
+    handle?.markReleased();
     await hb?.stop();
     if (fencingToken > 0) {
       await client
         .releaseLease(workerId, key, fencingToken, "BLOCK_EXIT")
+        .then((released) => {
+          // Only a release the engine confirms: if another worker holds the
+          // lease by now, there was nothing of this worker's to release.
+          if (released.released) emit({ type: "released" });
+        })
         .catch(() => {
           // The lease expires on its own; a failed release is not worth masking
           // whatever the block was doing.
