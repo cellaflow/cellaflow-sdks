@@ -44,8 +44,15 @@ export interface LeaseHeartbeatOptions {
    */
   acquiredSentAt?: number;
   /**
+   * The engine's expiry for the acquisition (`leaseExpiresAtMs`), on the
+   * engine's clock. Pass it only when the engine granted the lease without
+   * waiting, so the grant happened right after `acquiredSentAt`. It anchors the
+   * mapping that catches a renewal the engine shortened.
+   */
+  acquiredExpiresAtMs?: number;
+  /**
    * How long before the computed expiry the lease stops being treated as held.
-   * Defaults to one heartbeat interval, capped at half of `extendMs`.
+   * Defaults to half a heartbeat interval, capped at half of `extendMs`.
    */
   marginMs?: number;
   /** Called once when the lease is determined to be lost. */
@@ -86,14 +93,13 @@ export interface LeaseEvent {
  * does not) keeps it for as long as the engine agrees. Renewing stops only when
  * the engine refuses a renewal, or on `stop()`.
  *
- * One case the deadline does not see: near the engine's maximum lease lifetime
- * a renewal is granted less than it asked for, and the next renewal is refused
- * with MAX_LIFETIME_EXCEEDED. Until that answer arrives the local deadline can
- * run up to one extension past the engine's.
+ * Near the engine's maximum lease lifetime a renewal is granted less than it
+ * asked for. The engine's expiry on each renewal is mapped onto the local
+ * clock, so a shortened renewal moves the deadline in by the shortfall.
  */
 export class LeaseHeartbeat {
   private readonly opts: Required<
-    Omit<LeaseHeartbeatOptions, "onLeaseLost" | "onEvent" | "acquiredSentAt" | "marginMs">
+    Omit<LeaseHeartbeatOptions, "onLeaseLost" | "onEvent" | "acquiredSentAt" | "acquiredExpiresAtMs" | "marginMs">
   > &
     Pick<LeaseHeartbeatOptions, "onLeaseLost" | "onEvent">;
   private readonly marginMs: number;
@@ -102,6 +108,13 @@ export class LeaseHeartbeat {
   private stopped = false;
   private deadline: number;
   private inFlight?: Promise<void>;
+  /**
+   * Local time minus engine time, measured on the last renewal believed to be
+   * a full extension. Engine expiries plus this give a local deadline. The
+   * absolute offset includes clock skew between hosts; it cancels, because only
+   * differences between the engine's own expiries are used.
+   */
+  private engineToLocal?: number;
 
   /** Set once the lease is known to be lost. Read by `LeaseHandle.check()`. */
   lost = false;
@@ -115,9 +128,41 @@ export class LeaseHeartbeat {
       extendMs: options.extendMs ?? intervalMs * 4,
       leaseTtlMs: options.leaseTtlMs ?? intervalMs * 4,
     };
-    this.marginMs = options.marginMs ?? Math.min(intervalMs, this.opts.extendMs / 2);
+    // Half an interval: a renewal sent one interval before the expiry still
+    // has time to answer, so one slow or failed renewal does not cost a lease
+    // the engine is still holding.
+    this.marginMs = options.marginMs ?? Math.min(intervalMs / 2, this.opts.extendMs / 2);
     const sentAt = options.acquiredSentAt ?? performance.now();
     this.deadline = sentAt + this.opts.leaseTtlMs - this.marginMs;
+    if (options.acquiredExpiresAtMs !== undefined && options.acquiredSentAt !== undefined) {
+      this.engineToLocal = sentAt + this.opts.leaseTtlMs - options.acquiredExpiresAtMs;
+    }
+  }
+
+  /**
+   * The local deadline after a confirmed renewal sent at `sentAt`.
+   *
+   * Counted from the send, a full extension cannot outlive the engine's. But
+   * near the maximum lease lifetime the engine grants less than it was asked,
+   * and only its expiry says so. That expiry is mapped onto the local clock
+   * through the last renewal believed full: if it lands earlier than the full
+   * extension would, the renewal was shortened and the earlier time counts.
+   */
+  private deadlineAfterRenewal(sentAt: number, engineExpiresAtMs: number | undefined): number {
+    const full = sentAt + this.opts.extendMs;
+    if (engineExpiresAtMs === undefined) return full - this.marginMs;
+    if (this.engineToLocal === undefined) {
+      this.engineToLocal = full - engineExpiresAtMs;
+      return full - this.marginMs;
+    }
+    const mapped = engineExpiresAtMs + this.engineToLocal;
+    // Arrival jitter makes a full renewal map a little early; only a gap
+    // beyond that tolerance marks it shortened. A shortened renewal must not
+    // become the reference, or the shortfall would be read as skew.
+    if (mapped >= full - this.marginMs / 4) {
+      this.engineToLocal = full - engineExpiresAtMs;
+    }
+    return Math.min(full, mapped) - this.marginMs;
   }
 
   /**
@@ -201,12 +246,14 @@ export class LeaseHeartbeat {
     if (this.lost) return;
     this.lost = true;
     this.lostDetail = detail;
-    this.emit({ type: "lost", detail });
+    // onLeaseLost first: it is what marks the handle lost, so a tracer that
+    // looks at the handle from the "lost" event already sees it lost.
     try {
       this.opts.onLeaseLost?.(detail);
     } catch {
       // A caller's callback must not take down the heartbeat.
     }
+    this.emit({ type: "lost", detail });
   }
 
   /**
@@ -215,7 +262,14 @@ export class LeaseHeartbeat {
    * a request whose send time is known.
    */
   async renewNow(): Promise<void> {
-    await this.beat(true);
+    // Through inFlight like any renewal, so it never overlaps a scheduled one
+    // and stop() waits for it.
+    if (this.inFlight) await this.inFlight.catch(() => {});
+    if (this.stopped) return;
+    this.inFlight = this.beat(true).finally(() => {
+      this.inFlight = undefined;
+    });
+    await this.inFlight;
   }
 
   private async beat(force = false): Promise<void> {
@@ -232,9 +286,9 @@ export class LeaseHeartbeat {
         this.opts.idempotencyKey,
         this.opts.fencingToken,
         this.opts.extendMs,
-        // Bound the RPC. Without a deadline a black-holed connection parks the
-        // renewal forever and the lease silently ages out while we wait on it.
-        Math.max(1, Math.ceil(this.opts.heartbeatIntervalMs / 1000)),
+        // Bound the RPC to half an interval, so a renewal that hangs gives up
+        // before the next tick is due rather than making that tick skip.
+        Math.max(1, Math.floor(this.opts.heartbeatIntervalMs / 2)) / 1000,
       );
       if (this.stopped) return;
       if (!resp.renewed) {
@@ -243,12 +297,10 @@ export class LeaseHeartbeat {
       }
       // A failed renewal is not itself proof of loss, so only a confirmed one
       // moves the deadline, and only from when it was sent.
-      this.deadline = sentAt + this.opts.extendMs - this.marginMs;
+      const expiresAtMs = resp.newExpiresAtMs !== undefined ? Number(resp.newExpiresAtMs) : undefined;
+      this.deadline = this.deadlineAfterRenewal(sentAt, expiresAtMs);
       this.armDeadline();
-      this.emit({
-        type: "renewed",
-        expiresAtMs: resp.newExpiresAtMs !== undefined ? Number(resp.newExpiresAtMs) : undefined,
-      });
+      this.emit({ type: "renewed", expiresAtMs });
     } catch (err) {
       // Transient until the deadline says otherwise: the engine may still be
       // holding the lease for us, and aborting work that holds a valid lease

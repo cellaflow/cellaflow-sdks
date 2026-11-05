@@ -48,8 +48,13 @@ export class LeaseHandle {
     this.probe = probe;
   }
 
-  /** Aborts when the lease is lost. Pass to `fetch`, streams, or your own loops. */
+  /**
+   * Aborts when the lease is lost. Pass to `fetch`, streams, or your own loops.
+   * Reading it checks the clock, like `isLost`, so a process resumed past its
+   * deadline gets a signal that has already aborted.
+   */
   get signal(): AbortSignal {
+    if (!this.controller.signal.aborted) this.probe?.();
     return this.controller.signal;
   }
 
@@ -228,6 +233,10 @@ export async function executionLease<T>(
       extendMs: ttlMs,
       leaseTtlMs: ttlMs,
       acquiredSentAt,
+      // After a wait the grant time is unknown, so the acquisition's expiry
+      // cannot anchor anything; the renewal made below does instead.
+      acquiredExpiresAtMs:
+        waitMs === 0 && resp.leaseExpiresAtMs !== undefined ? Number(resp.leaseExpiresAtMs) : undefined,
       onEvent,
       onLeaseLost: (detail) => {
         leaseHandle.markLost(detail);

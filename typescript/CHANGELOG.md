@@ -18,7 +18,7 @@ All notable changes to the CellaFlow TypeScript SDK.
   after the full TTL, and only when a heartbeat tick came round. And `check()` and `signal` reflected
   the last renewal's answer, so a process resumed after a stop passed `check()` until its next
   renewal came back refused. Renewals now ask for the full TTL. Each confirmed renewal sets a
-  deadline counted from when the renewal was sent, minus one heartbeat interval; `check()` and
+  deadline counted from when the renewal was sent, minus half a heartbeat interval; `check()` and
   `isLost` compare against it on every call, on the monotonic clock, and `signal` aborts when it
   passes. A holder stopped past its deadline fails `check()` the moment it resumes, before any
   renewal answers. After waiting for a lease (`waitMs` above 0), one renewal is made before the
@@ -28,6 +28,17 @@ All notable changes to the CellaFlow TypeScript SDK.
   and renewing keeps it until the engine refuses a renewal. `tool()`, which cannot act on a loss,
   keeps its lease for as long as the engine agrees, and its renewals now also ask for the full TTL
   (four heartbeat intervals) rather than three.
+
+  Near the engine's maximum lease lifetime a renewal is granted less than it asked for. The
+  engine's expiry on each renewal is mapped onto the local clock through the last full renewal, so
+  a shortened one moves the deadline in by the shortfall. Only differences between the engine's
+  own timestamps are used, so clock skew between hosts does not matter.
+
+  Renewals time out after half an interval, so one that hangs gives up before the next is due, and
+  the half-interval margin leaves a renewal sent one interval before expiry time to answer: one or
+  two failed renewals in a row no longer lose a lease the engine still holds. Reading `signal`
+  checks the clock, as `isLost` and `check()` do. In an `onEvent` callback for `lost`, the handle
+  already reads as lost.
 
 - **`executionLease` does not run its block on a lease already lost**, for example when the
   renewal after a wait is refused. It throws `LeaseLostError` instead.
