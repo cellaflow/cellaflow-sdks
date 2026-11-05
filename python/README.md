@@ -443,22 +443,56 @@ def triage(ticket_id: str) -> dict:
 
 The same applies to any other varying input to a branch: `datetime.now()`, `random`, environment lookups, or a bare HTTP call. Wrap it in a `@step` or `@tool` and branch on the result.
 
-#### `NondeterministicWorkflowError`
+#### Failed steps replay too
 
-When a resumed run reaches a sequence holding a *different* step than the one it is about to call, the SDK raises rather than returning the recorded result:
+A step that raised, and that the workflow carried on past, is recorded at its position like any other step. A resumed run raises the same exception there instead of running the step again, so the workflow takes the same branch it took the first time.
+
+- **The exception is rebuilt from what was recorded:** its class, arguments and fields. None of the class's own code runs to do it. The original traceback is attached as a note.
+- **A field that could not be recorded** (an open connection, a response object) comes back as a placeholder. Using it raises `AttributeError` saying it was not recorded. When the failure happens, the SDK logs a warning naming each such field. `AttributeError.obj`, which Python fills with a live object, is replayed the same way without a warning.
+- **Exception groups** keep every member's type and message, so `except*` matches the same members. A group with more than 2,000 members, or too large to record even member by member, cannot be replayed: the SDK warns when it happens, and a resume stops at that position.
+- **A cancelled async step is recorded, but not replayed.** The record fills the position, so the workflow's next step lands where it should, and it is written even when nothing follows, so re-running a finished session to read its result refuses there too: read the session's history instead. A resume refuses there with `FailureNotReplayableError`, because what the workflow saw depended on what cancelled the step, which the record cannot say: `asyncio.wait_for` around the step turns its own cancellation into `TimeoutError`, while one from outside arrives as `CancelledError`. Waiting for the same thing to happen again cannot tell them apart either, because earlier steps replay instantly and move every timer. **Put the timeout inside the step's body** (`return await asyncio.wait_for(call(), 5)`): the step then raises `TimeoutError` itself, which is recorded and replays exactly.
+- **The exception is recorded as the step raised it,** before the workflow's handler runs, so a handler that changes it (`e.attempts += 1`) finds the original values on replay too. Fields in `__slots__` are recorded too.
+- **A refusal stops the run, even if the workflow catches it.** A recorded failure is raised inside the workflow's own `try`, so a broad `except Exception` there would catch `FailureNotReplayableError` or `ReplayDivergedError` and carry on. After a refusal, every later step raises it again before its body runs, and the workflow raises it when it ends.
+
+A failure the workflow lets propagate is not recorded, so a resume runs the step again. The exception is a step that runs while the failure is still propagating: a cleanup in a `finally`, or in an `except` that re-raises. That step needs the next position, so the failure is recorded to fill the one before it, and a resume then replays both and ends with the same exception rather than running the failed step again. The run logs a warning when this happens; to run the step again, start a new session. An async run interrupted with Ctrl-C reaches the running step as a cancellation; with a cleanup step after it, the cancellation is recorded, and a resume refuses there.
+
+Define the exceptions a step raises at module level, in a module the workflow imports. A class defined inside a function, or only in the script being run, cannot be found by a resumed process. Nor can one from a library the step imports inside its own body (`import stripe` inside the tool): a resume does not run the step, so it does not run that import, and the SDK never imports anything itself on replay. Import such libraries where the workflow is defined. The SDK warns about all three when the failure is recorded.
+
+#### When a resume cannot go on
+
+A resumed run that cannot reproduce its history stops before the step does anything. Both errors below derive from `NondeterministicWorkflowError`; catch that to handle either.
+
+**`ReplayDivergedError`**: the resumed run called a different step than the history records at that position.
 
 ```
-NondeterministicWorkflowError: Workflow diverged from its recorded history at
-sequence 1: expected step 'shared', but 'warmup' was committed there. A resumed
-run must perform the same steps in the same order — move any branching on model
-output, clocks, or network reads inside a step so its result is replayed too.
+ReplayDivergedError: Session sess-4417 cannot resume at position 3. The resumed
+run called 'notify', but the history records 'fallback' there.
+Position 2 ('charge') failed with PaymentDeclined on the first run; after it, the
+code took a different branch than it did then.
+Common causes: the workflow code changed since the first run (a step added,
+removed or reordered, or a different timeout), or it branched on something not
+recorded (the clock, a random number, a model's answer outside a step). Nothing
+ran twice. To go on, start a new session for this work.
 ```
 
-**This is a bug in your workflow, not in the engine.** It means the resumed run took a different path than the run it is recovering — most often a branch on a value computed outside a step. Find the branch named in the error, and move whatever it tests into a step.
+**This is a bug in your workflow, not in the engine.** The resumed run took a different path than the run it is recovering, most often because of a branch on a value computed outside a step. Find the branch named in the error, and move whatever it tests into a step. The check compares step names, which catches a changed *shape* of execution: a skipped branch, a reordering, an extra step.
 
-The check compares step names, which catches a changed *shape* of execution: a skipped branch, a reordering, an extra step. Deterministic branching, as above, is what keeps a resumed run matching the history it is recovering.
+**`FailureNotReplayableError`**: the history records a failure or cancellation at this position, and the resumed run cannot reproduce it exactly. Raising a different exception could send the run down a different branch, so it stops instead.
 
-A related error, `Cannot verify replay at sequence N: the recorded step has no name`, means the history was not written by this SDK. Every step it commits records a name, so a nameless record cannot be checked and is refused rather than replayed positionally.
+```
+FailureNotReplayableError: Cannot replay the failure of 'charge' at position 2:
+its exception type stripe._error:CardError is in module stripe._error, which this
+process has not imported. A resume does not run a step's body, so an import
+inside the step does not happen. Add `import stripe._error` where the workflow is
+defined, then resume this session again: nothing has run twice, and it resumes
+from here.
+```
+
+That one is fixed by the import it names, and the same session then resumes. Other causes need a new session: the exception's class is defined inside a function or was renamed, the class can only be built by an extension module's compiled code (pydantic's `ValidationError`), the failure was recorded by the TypeScript SDK, the exception group was too large to record, or the step was cancelled as an async step and is now synchronous.
+
+In every case nothing ran twice, and the session's history is unchanged.
+
+A related error, `Cannot verify replay at sequence N: the recorded step has no name`, raised as `NondeterministicWorkflowError` itself, means the history was not written by this SDK. Every step it commits records a name, so a nameless record cannot be checked and is refused rather than replayed positionally.
 
 Extending history is fine and is the normal case: a run that matches the recorded prefix and then continues past it executes the new steps and commits them as usual. Only *divergence within* the recorded prefix raises.
 

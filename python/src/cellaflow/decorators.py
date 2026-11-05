@@ -4,7 +4,7 @@ import uuid
 import asyncio
 import time
 import logging
-from typing import Any, Callable, Dict, Optional, Sequence, TypeVar, cast
+from typing import Any, Callable, Dict, NoReturn, Optional, Sequence, TypeVar, cast
 
 import grpc
 
@@ -16,6 +16,7 @@ from cellaflow.context import (
     get_context,
     session_coordination_id,
 )
+from cellaflow.failures import ReplayedFailureError, rebuild
 from cellaflow.history import GRAPH_PAGE, iter_session_steps
 from cellaflow.idempotency import (
     derive_idempotency_key,
@@ -24,7 +25,7 @@ from cellaflow.idempotency import (
 )
 from cellaflow.lease import LeaseHeartbeat
 from cellaflow.serialization import deserialize
-from cellaflow.v1.common_pb2 import STEP_STATUS_SUCCESS
+from cellaflow.v1.common_pb2 import STEP_STATUS_FAILED, STEP_STATUS_SUCCESS
 from cellaflow.v1.idempotency_pb2 import (
     CACHE_STATUS_HIT,
     CACHE_STATUS_ACQUIRED,
@@ -74,6 +75,7 @@ def workflow(
                     replayed_steps[step_info["sequence"]] = {
                         "name": step_info["name"],
                         "payload": step_info["output_payload"],
+                        "status": step_info.get("status"),
                     }
 
             ctx = WorkflowContext(
@@ -89,7 +91,21 @@ def workflow(
             )
             token = set_context(ctx)
             try:
-                return await func(*args, **kwargs)
+                try:
+                    result = await func(*args, **kwargs)
+                except BaseException as exc:
+                    ctx.note_run_ended(exc)
+                    # A refusal the workflow's own code caught still ends it.
+                    ctx.raise_if_refused(cause=exc)
+                    raise
+                # A failure the workflow caught, with no step after it to record
+                # it. Only on a normal return: a failure the workflow lets
+                # propagate stays unrecorded, so resuming retries the step.
+                ctx.raise_if_refused()
+                if ctx.has_pending_failure():
+                    # Written before returning, off the event loop.
+                    await asyncio.to_thread(ctx.record_pending_failure)
+                return result
             finally:
                 reset_context(token)
 
@@ -126,6 +142,7 @@ def workflow(
                     replayed_steps[step_info["sequence"]] = {
                         "name": step_info["name"],
                         "payload": step_info["output_payload"],
+                        "status": step_info.get("status"),
                     }
 
             ctx = WorkflowContext(
@@ -141,7 +158,17 @@ def workflow(
             )
             token = set_context(ctx)
             try:
-                return func(*args, **kwargs)
+                try:
+                    result = func(*args, **kwargs)
+                except BaseException as exc:
+                    ctx.note_run_ended(exc)
+                    # A refusal the workflow's own code caught still ends it.
+                    ctx.raise_if_refused(cause=exc)
+                    raise
+                # See the async wrapper.
+                ctx.raise_if_refused()
+                ctx.record_pending_failure()
+                return result
             finally:
                 reset_context(token)
 
@@ -172,31 +199,50 @@ class DivergentStepError(RuntimeError):
 
 
 class NondeterministicWorkflowError(RuntimeError):
-    """Raised when a resumed run reaches a step that does not match history.
+    """A resumed run cannot be replayed against its recorded history.
 
     Replay is positional: the step at sequence N is answered from whatever was
     committed at sequence N. That is only sound if the resumed run performs the
     same steps in the same order, which is why the workflow body must be
-    deterministic given the session's inputs — all nondeterminism belongs inside
+    deterministic given the session's inputs: all nondeterminism belongs inside
     step bodies, never in the code deciding what to call.
 
-    Reaching this means the two diverged. Continuing would hand back another
-    step's result, so the run stops instead.
+    The base of `ReplayDivergedError` and `FailureNotReplayableError`; catch this
+    to handle both. Raised as itself only for a record that cannot be verified.
     """
 
 
-def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
-    """Returns the recorded result at `seq`, or raises if it is a different step.
+class ReplayDivergedError(NondeterministicWorkflowError):
+    """The resumed run called a different step than its history records here.
 
-    Replay is positional, so the step recorded at a sequence is only the right
-    answer if the resumed run reached that sequence by the same path. Matching on
-    the step name establishes that before the recorded result is returned.
-
-    A record whose name is empty is treated as unverifiable and rejected rather
-    than replayed.
+    The run went a different way than it did the first time: the code changed
+    since then, or it branched on something that was not recorded. Continuing
+    would hand back another step's result, so the run stops before this step
+    does anything. Nothing ran twice; to go on, start a new session.
     """
-    recorded = ctx.replayed_steps[seq]
-    recorded_name = recorded.get("name")
+
+
+class FailureNotReplayableError(NondeterministicWorkflowError):
+    """A recorded failure or cancellation cannot be reproduced as it happened.
+
+    For example, the exception's class cannot be found in the resumed process,
+    or the record was written by another SDK. Raising something else instead
+    could send the run down a different branch, so it stops.
+    """
+
+
+def _cancellation(recorded: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The recorded cancellation, if this record is one."""
+    if recorded.get("status") != STEP_STATUS_FAILED:
+        return None
+    payload = recorded.get("payload") or {}
+    cancelled = payload.get("cancelled")
+    return cancelled if isinstance(cancelled, dict) else None
+
+
+def _check_recorded_name(ctx: WorkflowContext, seq: int, expected_name: str) -> None:
+    """Raises unless the step recorded at `seq` is `expected_name`."""
+    recorded_name = ctx.replayed_steps[seq].get("name")
 
     # Fail closed on an unverifiable record. Every step this SDK commits carries a
     # name -- `@step` falls back to `func.__name__`, the LangGraph saver builds
@@ -210,20 +256,226 @@ def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
             f"than a different step at the same position. Every step this SDK "
             f"commits records its name, so this history did not come from it."
         )
-
     if recorded_name != expected_name:
-        raise NondeterministicWorkflowError(
-            f"Workflow diverged from its recorded history at sequence {seq}: "
-            f"expected step {expected_name!r}, but {recorded_name!r} was "
-            f"committed there. A resumed run must perform the same steps in the "
-            f"same order — move any branching on model output, clocks, or "
-            f"network reads inside a step so its result is replayed too."
+        raise ReplayDivergedError(
+            _divergence_message(ctx, seq, expected_name, recorded_name)
         )
 
+
+def _divergence_message(
+    ctx: WorkflowContext, seq: int, expected_name: str, recorded_name: str
+) -> str:
+    lines = [
+        f"Session {ctx.session_id} cannot resume at position {seq}. The resumed "
+        f"run called {expected_name!r}, but the history records "
+        f"{recorded_name!r} there."
+    ]
+    # The last failure before here is usually where the paths parted: the code
+    # handled it differently this time. (A cancellation before here cannot be:
+    # a resume refuses at it, so never gets this far.)
+    earlier = sorted(p for p in ctx.replayed_steps if p < seq)
+    for position in reversed(earlier):
+        record = ctx.replayed_steps[position]
+        if record.get("status") != STEP_STATUS_FAILED:
+            continue
+        name = record.get("name")
+        error = (record.get("payload") or {}).get("error") or {}
+        kind = str(error.get("type", "")).rpartition(":")[2] or "an exception"
+        lines.append(
+            f"Position {position} ({name!r}) failed with {kind} on the first run; "
+            f"after it, the code took a different branch than it did then."
+        )
+        break
+    lines.append(
+        "Common causes: the workflow code changed since the first run (a step "
+        "added, removed or reordered, or a different timeout), or it branched on "
+        "something not recorded (the clock, a random number, a model's answer "
+        "outside a step). Nothing ran twice. To go on, start a new session for "
+        "this work."
+    )
+    return "\n".join(lines)
+
+
+def _refuse(ctx: WorkflowContext, refusal: NondeterministicWorkflowError) -> NoReturn:
+    """Raises a replay refusal, after recording it so the run stops there."""
+    ctx.refuse(refusal)
+    raise refusal from None
+
+
+def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
+    """Returns the recorded result at `seq`, or raises if it is a different step.
+
+    Replay is positional, so the step recorded at a sequence is only the right
+    answer if the resumed run reached that sequence by the same path. Matching on
+    the step name establishes that before the recorded result is returned.
+
+    A record whose name is empty is treated as unverifiable and rejected rather
+    than replayed.
+
+    A refusal also stops the rest of the run: the workflow called this step
+    inside its own `try`, since that is why a failure was recorded here, and a
+    broad `except` there would otherwise catch the refusal and carry on down a
+    guessed branch. See `WorkflowContext.refuse`.
+    """
+    try:
+        _check_recorded_name(ctx, seq, expected_name)
+    except NondeterministicWorkflowError as refusal:
+        ctx.refuse(refusal)
+        raise
+    return _replay_recorded(ctx, seq, expected_name)
+
+
+def _replay_recorded(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
+    """`_replay` once the recorded name has been checked.
+
+    Only the replay's own refusals go through `ctx.refuse`. A recorded failure
+    raised again is the step's own exception, even one that happens to be a
+    `NondeterministicWorkflowError` (from a workflow the step drives, say):
+    the workflow caught it the first time, and may again.
+    """
+    recorded = ctx.replayed_steps[seq]
     payload = recorded.get("payload")
+    if _cancellation(recorded) is not None:
+        # Inside the step a cancellation always looks the same, but what the
+        # workflow saw depended on what cancelled it: a `wait_for` around the
+        # step turns its own into `TimeoutError`, while one from outside arrives
+        # as `CancelledError`. The record cannot say which, and waiting for the
+        # same thing to happen again cannot either: steps before this one replay
+        # instantly, so timers around them fire at different moments, and one
+        # that did not fire the first time can fire now. So the replay refuses
+        # rather than guess.
+        _refuse(ctx, FailureNotReplayableError(
+            f"Cannot replay position {seq} ({expected_name!r}) of session "
+            f"{ctx.session_id}: it was cancelled on the first run, and a replay "
+            f"cannot tell what cancelled it (a timeout around the step, or "
+            f"something outside the run), so it cannot raise what the workflow "
+            f"saw then. Put a timeout inside the step's body instead "
+            f"(`return await asyncio.wait_for(call(), 5)`), which records the "
+            f"TimeoutError itself and replays it. Nothing has run twice; start a "
+            f"new session for this work."
+        ))
+    if recorded.get("status") == STEP_STATUS_FAILED:
+        # The step failed the first time, and the workflow carried on past it.
+        # Raise the same exception, so the resumed run takes the same branch.
+        try:
+            failure = rebuild((payload or {}).get("error", {}), expected_name, seq)
+        except ReplayedFailureError as exc:
+            _refuse(ctx, FailureNotReplayableError(str(exc)))
+        raise failure
     if payload is None:
         return None
     return payload.get("result")
+
+
+def _release_after_failure(
+    ctx: WorkflowContext,
+    agent_id: str,
+    ikey: str,
+    fencing_token: int,
+    name: str,
+    hb: LeaseHeartbeat,
+) -> Optional[Dict[str, Any]]:
+    """Releases the lease of a step that failed or was cancelled, so the step
+    that takes this position next is not refused until it lapses.
+
+    If the release fails, returns the lease, for the failure record to retry the
+    release or wait for the lapse: the lease still claims the step's position,
+    so the engine would refuse the record there. When it lapses is counted from
+    the moment the record is held, after the heartbeat has stopped, because a
+    renewal still in flight now can extend it.
+    """
+    try:
+        ctx.client.release_lease(
+            agent_id=agent_id,
+            idempotency_key=ikey,
+            fencing_token=fencing_token,
+            reason="TOOL_ERROR",
+        )
+    except Exception:
+        # The lease lapses on its own. Losing the release is not worth
+        # replacing the error that caused it.
+        logger.warning(
+            "Cellaflow: could not release the lease on %r after it failed; it "
+            "lapses on its own.",
+            name,
+            exc_info=True,
+        )
+        # A renewal already on its way when the heartbeat is told to stop can
+        # still reach the engine, up to its RPC timeout from now, and extend
+        # the lease a full lifetime from there.
+        return {
+            "agent_id": agent_id,
+            "key": ikey,
+            "token": fencing_token,
+            "lapses_in_s": hb.rpc_timeout_sec + hb.lease_ttl_ms / 1000.0 + 1.0,
+        }
+    return None
+
+
+def _note_failure(
+    ctx: WorkflowContext,
+    seq: int,
+    name: str,
+    exc: BaseException,
+    call_coordination: Optional[str],
+    agent_id: str,
+    ikey: Optional[str],
+    started: float,
+    failed_at: float,
+    unreleased: Optional[Dict[str, Any]] = None,
+    is_async: bool = True,
+) -> None:
+    """Holds a live step's failure or cancellation to be recorded at its position.
+
+    `started` and `failed_at` are when the step started and when it failed, on
+    the monotonic clock: a cancellation records the time between, without the
+    release and heartbeat stop after it.
+
+    Not for a refused lease: another writer owns that position and fills it.
+    An async step's cancellation (`asyncio.CancelledError`) is recorded as a
+    cancellation, which fills the position, and which a resume refuses at; see
+    `_replay_recorded`. Raised out of a synchronous step, it is the step's own
+    exception (an `asyncio.run` inside it, say), recorded and replayed like any
+    other. A process exit (`KeyboardInterrupt`, `SystemExit`) is not something a
+    workflow carries on past, so the step gives its position back instead.
+    """
+    try:
+        if isinstance(exc, DivergentStepError):
+            return
+        if isinstance(exc, asyncio.CancelledError) and is_async:
+            ctx.defer_cancellation_record(
+                seq,
+                name,
+                failed_at - started,
+                call_coordination,
+                agent_id=agent_id,
+                step_key=ikey or "",
+                source=exc,
+                unreleased=unreleased,
+            )
+            return
+        if not isinstance(exc, (Exception, asyncio.CancelledError)):
+            ctx.give_back_position(seq)
+            return
+        ctx.defer_failure_record(
+            seq,
+            name,
+            exc,
+            call_coordination,
+            agent_id=agent_id,
+            step_key=ikey or "",
+            unreleased=unreleased,
+        )
+    except Exception:
+        # Noting the failure must never replace the step's own exception, which
+        # is on its way to the workflow.
+        logger.warning(
+            "Cellaflow: could not hold the failure of %r at position %d for "
+            "recording.",
+            name,
+            seq,
+            exc_info=True,
+        )
 
 
 def _take_hit(
@@ -336,6 +588,9 @@ def step(
     @functools.wraps(func)
     async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
         ctx = get_context()
+        # A replay that refused stops the run, even where the workflow caught
+        # the refusal: no later step may run on a guessed branch.
+        ctx.raise_if_refused()
         # A step may name its own coordination domain, overriding the
         # session's for this call only. It is recorded with the step and, under
         # SCOPE_SHARED, is what the key is derived from, so the call is
@@ -348,9 +603,23 @@ def step(
         # the wrong step. Deferred to here rather than done on the hit itself so
         # a workflow that ends on a hit does no extra work.
         seq = await ctx.begin_call_async()
+        # Set once the step runs live rather than replaying, so only a live
+        # failure is recorded; `ikey` once it is known.
+        live = False
+        ikey: Optional[str] = None
+        # A lease the step could not release after failing, kept with its
+        # failure record. See `_release_after_failure`.
+        unreleased: Optional[Dict[str, Any]] = None
+        started = time.monotonic()
+        # When the step failed, before releasing its lease and stopping its
+        # heartbeat, which a replayed cancellation must not count.
+        failed_at: Optional[float] = None
+        # Whether the failure path already stopped the heartbeat.
+        stopped = False
         try:
             if seq in ctx.replayed_steps:
                 return _replay(ctx, seq, actual_tool_name)
+            live = True
 
             # Derive idempotency key
             ikey = idempotency_key
@@ -453,24 +722,50 @@ def step(
                     coordination_id=call_coordination,
                 )
                 return result
-            except Exception as e:
-                if fencing_token > 0:
-                    ctx.client.release_lease(
-                        agent_id=agent_id,
-                        idempotency_key=ikey,
-                        fencing_token=fencing_token,
-                        reason="TOOL_ERROR",
+            except BaseException as e:
+                failed_at = time.monotonic()
+                if hb:
+                    # Told to stop before the release, so it starts no renewal
+                    # after it. Not awaited: an await is where a cancellation
+                    # lands, and would replace the step's own exception.
+                    hb.stop_soon()
+                    stopped = True
+                # Cancellation too: a lease left held would refuse the step that
+                # takes this position next until it lapsed.
+                if fencing_token > 0 and hb is not None:
+                    unreleased = _release_after_failure(
+                        ctx, agent_id, ikey, fencing_token, actual_tool_name, hb
                     )
                 raise e
             finally:
-                if hb:
-                    await hb.stop_async()
+                if hb and not stopped:
+                    # Not awaited after a commit either: a cancellation landing
+                    # there would turn a committed step into a cancelled one.
+                    hb.stop_soon()
+        except BaseException as exc:
+            if live:
+                _note_failure(
+                    ctx,
+                    seq,
+                    actual_tool_name,
+                    exc,
+                    call_coordination,
+                    agent_id,
+                    ikey,
+                    started,
+                    failed_at or time.monotonic(),
+                    unreleased,
+                )
+            raise
         finally:
             ctx.end_call()
 
     @functools.wraps(func)
     def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
         ctx = get_context()
+        # A replay that refused stops the run, even where the workflow caught
+        # the refusal: no later step may run on a guessed branch.
+        ctx.raise_if_refused()
         # A step may name its own coordination domain, overriding the
         # session's for this call only. It is recorded with the step and, under
         # SCOPE_SHARED, is what the key is derived from, so the call is
@@ -483,9 +778,23 @@ def step(
         # the wrong step. Deferred to here rather than done on the hit itself so
         # a workflow that ends on a hit does no extra work.
         seq = ctx.begin_call()
+        # Set once the step runs live rather than replaying, so only a live
+        # failure is recorded; `ikey` once it is known.
+        live = False
+        ikey: Optional[str] = None
+        # A lease the step could not release after failing, kept with its
+        # failure record. See `_release_after_failure`.
+        unreleased: Optional[Dict[str, Any]] = None
+        started = time.monotonic()
+        # When the step failed, before releasing its lease and stopping its
+        # heartbeat, which a replayed cancellation must not count.
+        failed_at: Optional[float] = None
+        # Whether the failure path already stopped the heartbeat.
+        stopped = False
         try:
             if seq in ctx.replayed_steps:
                 return _replay(ctx, seq, actual_tool_name)
+            live = True
 
             # Derive idempotency key
             ikey = idempotency_key
@@ -588,18 +897,38 @@ def step(
                     coordination_id=call_coordination,
                 )
                 return result
-            except Exception as e:
-                if fencing_token > 0:
-                    ctx.client.release_lease(
-                        agent_id=agent_id,
-                        idempotency_key=ikey,
-                        fencing_token=fencing_token,
-                        reason="TOOL_ERROR",
+            except BaseException as e:
+                failed_at = time.monotonic()
+                if hb:
+                    # Stopped before the release, so it renews nothing after it.
+                    hb.stop_sync()
+                    stopped = True
+                # Cancellation too: a lease left held would refuse the step that
+                # takes this position next until it lapsed.
+                if fencing_token > 0 and hb is not None:
+                    unreleased = _release_after_failure(
+                        ctx, agent_id, ikey, fencing_token, actual_tool_name, hb
                     )
                 raise e
             finally:
-                if hb:
+                if hb and not stopped:
                     hb.stop_sync()
+        except BaseException as exc:
+            if live:
+                _note_failure(
+                    ctx,
+                    seq,
+                    actual_tool_name,
+                    exc,
+                    call_coordination,
+                    agent_id,
+                    ikey,
+                    started,
+                    failed_at or time.monotonic(),
+                    unreleased,
+                    is_async=False,
+                )
+            raise
         finally:
             ctx.end_call()
 

@@ -1,7 +1,7 @@
 import { isFailedPrecondition } from "./errors.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
-import { getContext, type WorkflowContext } from "./context.js";
+import { getContext, type UnreleasedLease, type WorkflowContext } from "./context.js";
 import { IdempotencyScope, deriveIdempotencyKey, normalizeCoordinationId } from "./idempotency.js";
 import { LeaseHeartbeat } from "./lease.js";
 import { deserialize } from "./serialization.js";
@@ -150,8 +150,25 @@ export function tool<A extends unknown[], R>(
       await ctx.settleRecording();
     }
     const seq = ctx.claimPosition();
+    const known: { key?: string; unreleased?: UnreleasedLease } = {};
     try {
-      return await runAt(ctx, seq, args, callCoordination, coordinationId);
+      return await runAt(ctx, seq, args, callCoordination, coordinationId, known);
+    } catch (err) {
+      // A failed call leaves its position empty; record the failure there so the
+      // next call does not land past the gap. Not for a refused lease: another
+      // writer owns that position and fills it.
+      if (!(err instanceof DivergentStepError)) {
+        ctx.deferFailureRecord(
+          seq,
+          toolName,
+          err,
+          callCoordination,
+          agentId,
+          known.key ?? "",
+          known.unreleased,
+        );
+      }
+      throw err;
     } finally {
       ctx.endCall();
     }
@@ -164,6 +181,7 @@ export function tool<A extends unknown[], R>(
     args: A,
     callCoordination: string | undefined,
     coordinationId: string | undefined,
+    known: { key?: string; unreleased?: UnreleasedLease },
   ): Promise<R> {
 
     let ikey = idempotencyKey;
@@ -192,8 +210,10 @@ export function tool<A extends unknown[], R>(
         sharedOn,
       });
     }
+    known.key = ikey;
 
     let fencingToken = 0;
+    let intervalMs = 5000;
     let hb: LeaseHeartbeat | undefined;
 
     // Arbitrate. Loop because IN_PROGRESS means another worker holds it and the
@@ -254,7 +274,7 @@ export function tool<A extends unknown[], R>(
 
       if (resp.status === CacheStatus.ACQUIRED) {
         fencingToken = Number(resp.fencingToken ?? 0n);
-        const intervalMs = Number(resp.heartbeatIntervalMs ?? 5000n);
+        intervalMs = Number(resp.heartbeatIntervalMs ?? 5000n);
         hb = new LeaseHeartbeat({
           client: ctx.client,
           agentId,
@@ -293,7 +313,17 @@ export function tool<A extends unknown[], R>(
           .releaseLease(agentId, ikey, fencingToken, "TOOL_ERROR")
           .catch(() => {
             // The lease expires on its own. Losing the release is not worth
-            // masking the error that caused it.
+            // masking the error that caused it. Until it does, it still claims
+            // this position, so the failure record there retries the release
+            // or waits for it. It lasts at most as long as the heartbeat's own
+            // lease settings say, counted once the heartbeat below has stopped,
+            // plus a second for the engine's clock.
+            known.unreleased = {
+              agentId,
+              key: ikey,
+              token: fencingToken,
+              lapsesInMs: (hb?.lastsAtMostMs ?? intervalMs * 4) + 1000,
+            };
           });
       }
       throw err;

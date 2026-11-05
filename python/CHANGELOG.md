@@ -4,6 +4,90 @@ All notable changes to the CellaFlow Python SDK.
 
 ## Unreleased
 
+### Added
+
+- **A step's failure is recorded at its position, and replayed.** When a workflow catches a step's
+  exception and carries on, the failure is recorded at the step's position as a step with status
+  `STEP_STATUS_FAILED`, and the next step takes the following position. A resumed `@workflow`
+  raises the same exception there instead of running the step again, so it takes the same branch.
+
+  The exception comes back as an instance of its own class, with its arguments and attributes, so
+  `except` clauses and `isinstance` checks behave as they did. Rebuilding it runs no code the
+  record can choose: the class is looked up only among modules already loaded, nothing is
+  imported, and the class's own `__new__` and `__init__` are not called. A class that only
+  compiled code in an extension module can construct, such as pydantic's `ValidationError`, cannot
+  be rebuilt that way, so its resume is refused. Its class must be defined
+  at module level in a module the workflow imports, as it is when an `except` clause names it. A
+  library the step imports inside its own body is not imported on resume, since the step does not
+  run; every run warns when such a class is recorded, and a resume that cannot find it names the
+  import to add, after which the same session resumes.
+  Otherwise the resume stops with `FailureNotReplayableError` rather than run the step again.
+  The original run logs a warning when the failure is recorded if the class cannot be found by name,
+  is defined in `__main__`, or has values that cannot be recorded, such as an HTTP response
+  object; each comes back as a placeholder, and using it raises `AttributeError` (Python's
+  `AttributeError.obj` is replayed the same way, without a warning). A placeholder prints as the
+  value did, so an exception whose argument was not recorded keeps its message. The run also
+  warns about anything else a resume would refuse, because the record is rebuilt once as a resume
+  would rebuild it. These warnings come when the
+  failure is recorded, so a failure the workflow lets propagate says nothing. Tuples,
+  enums and subclasses of plain types are recorded, the last two as their plain value, as are the
+  fields Python keeps outside `args` (`OSError.errno`, `ImportError.name` and the like) and fields
+  in a class's `__slots__`. An
+  exception group comes back with its members, every one of them keeping at least its type and
+  message, so `except*` behaves the same; a group too large to record that way (over 2,000 members
+  or 512 KB) is refused on resume, with a warning when it happens. An engine call's gRPC
+  error comes back as a `grpc.RpcError` with the same `code()` and `details()`; a subclass of
+  `grpc.RpcError` defined outside gRPC comes back as itself. A record is kept
+  within a commit's size: a value over 64 KB is left out, and the traceback is trimmed. Recording a
+  failure never replaces the step's own exception, and neither does a lease that cannot be
+  released after it.
+
+  The exception is recorded as the step raised it, before the workflow's handler runs, so a
+  handler that changes it finds the original values on replay too; the record keeps what was
+  captured, not the exception, so the failed step's frames are released.
+
+  A failure the workflow lets propagate is not recorded, so resuming retries the step, unless a
+  step runs while it propagates (a cleanup in a `finally`): that step needs the next position, so
+  the failure is recorded to fill it, and a resume ends with the same exception. The run warns when
+  it ends that way, and says to start a new session to run the step again. A failure
+  while another step of the session is in flight is not recorded either, and the run then stops
+  recording, so no later failure is recorded above the position it left empty; nor is one in a run that has
+  not read the session's history (a resumed `durable_tools` thread). A record still unwritten when
+  the workflow returns is written before the workflow returns its result, because a record lost
+  after the run reported its result would let a re-run run the step again. That costs one write's
+  round trip at the end of such a run; in an async workflow, a caller that cancels the workflow
+  meanwhile still has the write finish on its worker thread. Errors that may pass are retried,
+  and every engine call writing a record has a deadline of at most 10 seconds, shortened to what
+  is left of the time allowed. If the failed step's lease could not be released, the record
+  retries the release, or waits for the lease to lapse (allowing for a renewal still on its way),
+  rather than be refused at a position that lease still claims; otherwise it keeps trying for 5
+  seconds. A record that still cannot be written, or that the engine refuses, is dropped with a
+  warning, and a re-run runs the step again. In an async
+  workflow, records are written on a worker thread, so the event loop is not held up.
+
+  A cancelled async step (`asyncio.CancelledError`) is recorded the same way, with how long it ran,
+  and its lease is released, so the workflow's next step lands at the right position. A resume
+  refuses at it with `FailureNotReplayableError` rather than replay it: what the workflow saw
+  depended on what cancelled the step (`asyncio.wait_for` turns its own cancellation into
+  `TimeoutError`, one from outside arrives as `CancelledError`), which the record cannot say, and
+  waiting to be cancelled again cannot reliably tell either, since earlier steps replay instantly
+  and move every timer. A timeout inside the step's body (`return await asyncio.wait_for(call(),
+  5)`) records a plain `TimeoutError` instead, which replays exactly. A cancellation the workflow
+  carries on past is recorded even when nothing follows it, so re-running a finished session
+  refuses there rather than run the cancelled step again; read the session's history to see how it
+  ended. A `CancelledError` raised out of a synchronous step is that step's own exception, and
+  is recorded and replayed as one.
+
+  A refusal stops the run even when the workflow catches it: every later step raises it again
+  before its body runs, and the workflow raises it when it ends, so a broad `except` around the
+  refused step cannot carry the run down a branch nothing checked.
+
+- **Two kinds of `NondeterministicWorkflowError`.** `ReplayDivergedError` means the resumed run
+  called a different step than its history records at a position; its message names the session,
+  the position, both steps, the last failure before them, and the way on.
+  `FailureNotReplayableError` means a recorded failure or cancellation cannot be reproduced as it
+  happened. Both subclass `NondeterministicWorkflowError`, so code that catches it still does.
+
 ### Fixed
 
 - **A resumed `durable_tools` thread can run a tool it had not reached.** A resumed session counted

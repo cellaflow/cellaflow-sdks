@@ -567,3 +567,12 @@ test("'released' is reported only when the engine confirms the release", async (
   await executionLease("k", { workerId: "w", ttlMs: 200, onEvent: (e) => events.push(e.type) }, async () => {});
   assert.equal(events.includes("released"), false);
 });
+
+test("a heartbeat says how long its lease can last after its last renewal", async () => {
+  // The failure record waits that long for an unreleased lease to lapse, so it
+  // follows the heartbeat's own settings rather than a fixed multiple.
+  const client = { renewLease: async () => ({ renewed: true }) };
+  const base = { client, agentId: "a", idempotencyKey: "k", fencingToken: 1, heartbeatIntervalMs: 5000 };
+  assert.equal(new LeaseHeartbeat(base).lastsAtMostMs, 20_000);
+  assert.equal(new LeaseHeartbeat({ ...base, extendMs: 90_000 }).lastsAtMostMs, 90_000);
+});

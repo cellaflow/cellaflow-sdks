@@ -56,11 +56,13 @@ class CellaflowClient:
         idempotency_key: Optional[str] = None,
         idempotency_fencing_token: Optional[int] = None,
         coordination_id: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> service_pb2.CommitStepResponse:
         """Commits a step.
 
         `coordination_id` records the step under its own coordination domain.
         When omitted, the engine records it under the session's default.
+        `timeout` bounds the RPC in seconds.
         """
         # Strictly serialize dict to MessagePack
         serialized_state = serialize(output_payload)
@@ -86,15 +88,22 @@ class CellaflowClient:
                 )
             req.idempotency_fencing_token = idempotency_fencing_token
 
-        return cast(service_pb2.CommitStepResponse, self.stub.CommitStep(req))
+        return cast(
+            service_pb2.CommitStepResponse, self.stub.CommitStep(req, timeout=timeout)
+        )
 
     def get_graph(
-        self, session_id: str, limit: Optional[int] = None, cursor: Optional[str] = None
+        self,
+        session_id: str,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """
         Returns a tuple of (list of deserialized step results, next_cursor).
         Each step result is a dictionary representation of the StepResult proto,
         with the output_payload fully deserialized into a Python dictionary.
+        `timeout` bounds the RPC in seconds.
         """
         req = service_pb2.GetGraphRequest(session_id=session_id)
         if limit is not None:
@@ -102,7 +111,7 @@ class CellaflowClient:
         if cursor is not None:
             req.cursor = cursor
 
-        resp: service_pb2.GetGraphResponse = self.stub.GetGraph(req)
+        resp: service_pb2.GetGraphResponse = self.stub.GetGraph(req, timeout=timeout)
 
         results = []
         for step in resp.steps:
@@ -136,6 +145,7 @@ class CellaflowClient:
         lease_ttl_ms: Optional[int] = None,
         session_id: Optional[str] = None,
         sequence: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> idempotency_pb2.CheckCacheResponse:
         """Arbitrates the lease for `idempotency_key`.
 
@@ -166,7 +176,7 @@ class CellaflowClient:
 
         return cast(
             idempotency_pb2.CheckCacheResponse,
-            self.stub.CheckIdempotencyCache(req),
+            self.stub.CheckIdempotencyCache(req, timeout=timeout),
         )
 
     def renew_lease(

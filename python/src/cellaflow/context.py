@@ -12,10 +12,36 @@ import grpc
 
 from cellaflow.client import CellaflowClient
 from cellaflow.history import GRAPH_PAGE, latest_session_sequence
-from cellaflow.idempotency import record_idempotency_key
+from cellaflow.failures import (
+    _MAX_GROUP_TOTAL,
+    _MAX_RECORD_BYTES,
+    capture,
+    findable,
+    incomplete_group,
+    modules_at_first_run,
+    rebuild,
+    type_location,
+    unrecorded,
+)
+from cellaflow.idempotency import failure_idempotency_key, record_idempotency_key
 from cellaflow.v1 import common_pb2, idempotency_pb2, service_pb2
 
 logger = logging.getLogger(__name__)
+
+
+def _identity(exc: Optional[BaseException]) -> Optional[Tuple[int, type, str]]:
+    """An exception's identity without a reference to it, which would keep its
+    traceback, and every frame in it, alive. Exceptions cannot be weakly
+    referenced, and Python reuses a freed exception's id for the next one of the
+    same size, so the class and message are kept with it: a new exception of
+    the same class at the same address is told apart by what it says."""
+    if exc is None:
+        return None
+    try:
+        message = str(exc)[:200]
+    except Exception:
+        message = ""
+    return (id(exc), type(exc), message)
 
 
 class _RecordHeld(Exception):
@@ -24,6 +50,23 @@ class _RecordHeld(Exception):
     def __init__(self, retry_after_s: float) -> None:
         super().__init__(f"the record is leased; retry in {retry_after_s}s")
         self.retry_after_s = retry_after_s
+
+
+#: The longest any one engine call writing a record may take. A write that
+#: cannot finish in time is dropped rather than hold up the run.
+_RECORD_RPC_TIMEOUT_S = 10.0
+#: Marks a refusal raised again as a copy, so the workflow's end can tell it
+#: from an exception the workflow raised from the refusal.
+_REFUSAL_COPY = "_cellaflow_refusal_copy"
+#: How long the last failure record keeps trying when the failed step's own
+#: unreleased lease is not what holds it up: for someone else's lease on its
+#: position, or for an engine error that may pass.
+_FINAL_HELD_WAIT_S = 5.0
+#: Between tries of the last failure record after an error that may pass.
+_FINAL_RETRY_S = 0.5
+#: How long after its estimated lapse a failed step's unreleased lease is still
+#: waited for, for clock and renewal skew.
+_LAPSE_GRACE_S = 1.0
 
 
 #: Failures writing a hit's record that may succeed if sent again. The record is
@@ -83,6 +126,30 @@ class WorkflowContext:
     # Calls in one session can overlap: asyncio tasks, or a framework running
     # tools on a thread pool. See `take_hit`.
     _in_flight: int = 0
+    # The refusal that stopped this run's replay, if one did. Every later step
+    # raises it again, and so does the workflow's end. See `refuse`.
+    _refusal: Optional[BaseException] = field(default=None, repr=False, compare=False)
+    # When the last failure record must be written or given up. See
+    # `record_pending_failure` and `_rpc_timeout`.
+    _rpc_deadline: Optional[float] = field(default=None, repr=False, compare=False)
+    # The modules loaded when the first run in this process started. A failure
+    # whose class comes from a module loaded later was most likely imported by a
+    # step, and a resume does not run steps, so the run warns. Taken once per
+    # process, so every run warns, not only the first. See
+    # `_warn_if_not_replayable`.
+    _modules_at_start: "frozenset[str]" = field(
+        default_factory=lambda: modules_at_first_run(), repr=False, compare=False
+    )
+    # The failures this run recorded, by the identity of their exception, with
+    # the step's name and position. See `note_run_ended`.
+    _recorded_failures: List[Tuple[Tuple[int, type, str], str, int, bool]] = field(
+        default_factory=list, repr=False, compare=False
+    )
+    # The write of a pending record that async steps are waiting on. See
+    # `begin_call_async`.
+    _settling: "Optional[asyncio.Task[None]]" = field(
+        default=None, repr=False, compare=False
+    )
     # Guards the position counter, the reported position, the pending record and
     # the in-flight count, which every call in the session reads and writes, on
     # whichever thread it runs.
@@ -111,10 +178,32 @@ class WorkflowContext:
             time.sleep(wait)
 
     async def begin_call_async(self) -> int:
-        """`begin_call` for an async step: waits without blocking the event loop."""
+        """`begin_call` for an async step: waits without blocking the event loop.
+
+        A pending record is written on a worker thread first, because writing it
+        is engine calls and encoding that would stall every other task on the
+        loop. Every call that finds it pending waits on the same write, and
+        they resume in the order they arrived, so positions are still claimed in
+        call order, as a resume claims them. The claim itself stays on the loop:
+        it is quick, and a claim made on a thread that a cancellation abandoned
+        would leave a position counted that no step owns.
+        """
         if not self.position_known:
             await asyncio.to_thread(self._ensure_position)
+        loop = asyncio.get_running_loop()
         while True:
+            if self._pending_hit is not None:
+                settling = self._settling
+                if (
+                    settling is None
+                    or settling.done()
+                    or settling.get_loop() is not loop
+                ):
+                    settling = loop.create_task(self._settle_async())
+                    self._settling = settling
+                # Shielded: one caller being cancelled does not stop the write
+                # the others are waiting on.
+                await asyncio.shield(settling)
             position, wait = self._try_claim()
             if position is not None:
                 return position
@@ -158,16 +247,43 @@ class WorkflowContext:
                     self.sequence = max(self.sequence, position)
                 self.position_known = True
 
-    def _try_claim(self) -> Tuple[Optional[int], float]:
-        """One attempt to claim a position: the position, or how long to wait."""
+    async def _settle_async(self) -> None:
+        """Writes the pending record on a worker thread, waiting out a held one."""
+        while self._pending_hit is not None:
+            wait = await asyncio.to_thread(self._settle_pending)
+            if not wait:
+                return
+            await asyncio.sleep(wait)
+
+    def _settle_pending(self) -> float:
+        """Writes a pending record, or says how long to wait before trying again."""
+        self._prepare_pending()
         with self._lock:
-            try:
-                self.reconcile_sequence()
-            except _RecordHeld as held:
-                return None, held.retry_after_s
+            return self._reconcile_or_wait()
+
+    def _try_claim(self) -> Tuple[Optional[int], float]:
+        """One attempt to claim a position: the position, or how long to wait.
+
+        Settling the pending record and claiming are one locked step, so no
+        other call can hold a new record in between.
+        """
+        self._prepare_pending()
+        with self._lock:
+            wait = self._reconcile_or_wait()
+            if wait:
+                return None, wait
             self.sequence += 1
             self._in_flight += 1
             return self.sequence, 0.0
+
+    def _reconcile_or_wait(self) -> float:
+        """`reconcile_sequence`, or how long a held record says to wait. Under
+        the lock."""
+        try:
+            self.reconcile_sequence()
+        except _RecordHeld as held:
+            return held.retry_after_s
+        return 0.0
 
     def end_call(self) -> None:
         """Marks a step claimed by `begin_call` as returned."""
@@ -247,6 +363,8 @@ class WorkflowContext:
         `record_idempotency_key`.
         """
         self._pending_hit = {
+            "kind": "result",
+            "status": common_pb2.StepStatus.STEP_STATUS_SUCCESS,
             "sequence": sequence,
             "name": name,
             "payload": payload,
@@ -254,6 +372,437 @@ class WorkflowContext:
             "agent_id": agent_id,
             "received_key": received_key,
         }
+
+    def defer_failure_record(
+        self,
+        sequence: int,
+        name: str,
+        exc: BaseException,
+        coordination_id: Optional[str],
+        agent_id: str = "default",
+        step_key: str = "",
+        unreleased: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Holds a step's failure to be recorded at `sequence` in this session.
+
+        A step that fails leaves its position empty. A workflow that catches the
+        failure and carries on would otherwise put its next step one position
+        past the gap, where the engine refuses the commit after that step's side
+        effect has run. Recording the failure fills the position, and lets a
+        resumed run raise the same exception there instead of running the step
+        again, so the workflow takes the same branch. See `failures.rebuild`.
+
+        Written when the next step claims a position, or when the workflow
+        returns: only once the run has moved past the failure. A failure the
+        workflow lets propagate is not recorded, so resuming retries the step.
+
+        Only while the step is the session's only call in flight and no later
+        position was claimed meanwhile, as for a hit. Otherwise nothing is
+        recorded, as before.
+        """
+        # Captured now, before the workflow's handler runs: a handler that
+        # changes the exception (`e.attempts += 1`) must find on replay what it
+        # found the first time. Capturing also lets go of the exception, whose
+        # traceback keeps every frame of the failed step alive. Skipped when the
+        # failure could not be held anyway. The warnings about replaying it wait
+        # until it is recorded; see `_prepare_pending`.
+        with self._lock:
+            if not self._can_hold(sequence):
+                return
+        recorded = capture(exc)  # never raises
+        self._hold_failure(
+            sequence,
+            name,
+            {"error": recorded},
+            coordination_id,
+            agent_id,
+            step_key,
+            source=exc,
+            unreleased=unreleased,
+        )
+
+    def defer_cancellation_record(
+        self,
+        sequence: int,
+        name: str,
+        elapsed_s: float,
+        coordination_id: Optional[str],
+        agent_id: str = "default",
+        step_key: str = "",
+        source: Optional[BaseException] = None,
+        unreleased: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Holds a step's cancellation to be recorded at `sequence`.
+
+        The record fills the position, so the workflow's next step lands where
+        it should. A resume refuses at it rather than replay it, because what
+        the workflow saw depended on what cancelled the step, which the record
+        cannot say; see `decorators._replay_recorded`. Recorded with how long
+        the step ran, for whoever reads the history. Written and guarded exactly
+        as a failure is; see `defer_failure_record`.
+        """
+        cancelled = {"format": 1, "sdk": "python", "elapsed_s": round(elapsed_s, 3)}
+        self._hold_failure(
+            sequence,
+            name,
+            {"cancelled": cancelled},
+            coordination_id,
+            agent_id,
+            step_key,
+            source=source,
+            unreleased=unreleased,
+        )
+
+    def _hold_failure(
+        self,
+        sequence: int,
+        name: str,
+        payload: Dict[str, Any],
+        coordination_id: Optional[str],
+        agent_id: str,
+        step_key: str,
+        source: Optional[BaseException] = None,
+        unreleased: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Holds a failure-kind record, if nothing claimed a later position.
+
+        `source` is the exception, kept only as its identity and class: to warn
+        about replaying it when it is recorded, and to recognise it if the
+        workflow later ends by raising it. See `note_run_ended`.
+
+        `unreleased` is the step's own lease, if it could not be released: it
+        still claims this position, so the record retries the release or waits
+        for it to lapse. It lives and goes with the record. See `_write_record`.
+        """
+        if unreleased is not None:
+            # Counted from now: the step's heartbeat has been told to stop, and
+            # `lapses_in_s` already allows for a renewal still on its way. See
+            # `decorators._release_after_failure`.
+            unreleased = dict(unreleased)
+            unreleased["lapses_at"] = time.monotonic() + unreleased["lapses_in_s"]
+        with self._lock:
+            if not self._can_hold(sequence):
+                return
+            self._pending_hit = {
+                "kind": "failure",
+                "status": common_pb2.StepStatus.STEP_STATUS_FAILED,
+                "sequence": sequence,
+                "name": name,
+                "payload": payload,
+                "source": _identity(source),
+                "unreleased": unreleased,
+                "warn": source is not None and "error" in payload,
+                "coordination_id": coordination_id,
+                "agent_id": agent_id,
+                "received_key": step_key,
+            }
+
+    def _can_hold(self, sequence: int) -> bool:
+        """Whether a failure at `sequence` can be held for recording. Under the
+        lock.
+
+        As for a hit: only while the step is the session's only call in flight
+        and no later position was claimed meanwhile, and only in a run that knows
+        everything the session holds (not a resumed `durable_tools` thread, which
+        would record at a position the session already filled).
+
+        A failure that overlapped another call is not recorded, so its position
+        stays empty, and the run stops recording, as it does for a hit: a later
+        failure held above that empty position would be written out of order,
+        and the step after it would claim a position the engine then refuses
+        after its side effect ran.
+        """
+        if not self.history_known:
+            return False
+        if self._in_flight == 1 and self.sequence == sequence:
+            return True
+        self.history_known = False
+        return False
+
+    def _prepare_pending(self) -> None:
+        """Warns about what a resume could not reproduce of a held failure.
+
+        Here, once, just before its record is written, because only now is the
+        failure certain to be recorded: one the workflow lets propagate says
+        nothing. Outside the lock, because the check rebuilds the exception.
+        """
+        pending = self._pending_hit
+        if pending is None or not pending.get("warn"):
+            return
+        with self._lock:
+            first = self._pending_hit is pending and pending.get("warn")
+            if first:
+                pending["warn"] = False
+        if first:
+            try:
+                self._warn_if_not_replayable(
+                    pending["source"][1],
+                    pending["name"],
+                    pending["sequence"],
+                    pending["payload"]["error"],
+                )
+            except Exception:
+                pass  # a warning is never worth failing a step over
+
+    def _warn_if_not_replayable(
+        self, cls: type, name: str, sequence: int, recorded: Dict[str, Any]
+    ) -> None:
+        """Says now, while the failure happens, what a resume could not reproduce."""
+        if "grpc" in recorded:
+            return
+        if not findable(cls):
+            logger.warning(
+                "Cellaflow: %s raised by %r is not defined at module level, so a "
+                "resumed run cannot raise it again and will refuse to resume past "
+                "position %d. Define exceptions a step raises at module level.",
+                cls.__qualname__,
+                name,
+                sequence,
+            )
+            return
+        module = type_location(cls).partition(":")[0]
+        if module not in self._modules_at_start and module != "__main__":
+            logger.warning(
+                "Cellaflow: %s raised by %r at position %d comes from module %s, "
+                "which was first imported during this run, most likely by a step. "
+                "A resume does not run steps, so it may not be imported then, and "
+                "the resume would refuse at this position. Add `import %s` where "
+                "the workflow is defined.",
+                cls.__qualname__,
+                name,
+                sequence,
+                module,
+                module,
+            )
+        if cls.__module__ == "__main__":
+            logger.warning(
+                "Cellaflow: %s raised by %r is defined in the script being run "
+                "(__main__). A run resumed from another entry point will not find "
+                "it and will refuse to resume past position %d. Define exceptions "
+                "a step raises in an importable module.",
+                cls.__qualname__,
+                name,
+                sequence,
+            )
+        if incomplete_group(recorded):
+            logger.warning(
+                "Cellaflow: the exception group %s raised by %r at position %d is "
+                "too large to record (over %d members, or over %d KB even with "
+                "each member reduced to its type and message). A resumed run will "
+                "refuse to resume past this position rather than raise a "
+                "different group.",
+                cls.__qualname__,
+                name,
+                sequence,
+                _MAX_GROUP_TOTAL,
+                _MAX_RECORD_BYTES // 1024,
+            )
+            return
+        try:
+            # The same rebuild a resume does, so anything that would refuse
+            # there (a class only its extension module can construct, say) is
+            # said now rather than discovered on resume.
+            rebuild(recorded, name, sequence)
+        except Exception as error:
+            logger.warning(
+                "Cellaflow: %s raised by %r at position %d cannot be raised again "
+                "by a resumed run, which will refuse to resume past this position. "
+                "%s",
+                cls.__qualname__,
+                name,
+                sequence,
+                error,
+            )
+            return
+        missing = unrecorded(recorded)
+        if missing:
+            logger.warning(
+                "Cellaflow: %s raised by %r at position %d has values that cannot "
+                "be recorded (%s). A resumed run raises it with a placeholder for "
+                "each, and using one raises AttributeError.",
+                cls.__qualname__,
+                name,
+                sequence,
+                ", ".join(missing),
+            )
+
+    def refuse(self, refusal: BaseException) -> None:
+        """Records that this run's replay refused to go on.
+
+        The refusal is raised at a step the workflow called inside its own
+        `try` (a failure was recorded there because the workflow caught one),
+        so a broad `except` can catch it and carry on down a branch nothing
+        checked. From here every step raises it again before its body runs,
+        and the workflow raises it at its end however it ends.
+        """
+        with self._lock:
+            if self._refusal is None:
+                self._refusal = refusal
+
+    def raise_if_refused(self, cause: Optional[BaseException] = None) -> None:
+        """Raises the refusal recorded by `refuse`, if any.
+
+        Raised as a fresh copy whose cause is the original, so its traceback
+        still shows where the replay refused, without the original gaining
+        frames each time. `cause` is the exception the workflow is ending with,
+        if it is: the refusal replaces it, even one the workflow raised from the
+        refusal (`except Exception: raise PaymentFailed(...)`), because that
+        outcome is one the first run never produced. A cancellation or process
+        exit (anything not an `Exception`) is not replaced; it keeps
+        propagating as itself.
+        """
+        refusal = self._refusal
+        if refusal is None:
+            return
+        if cause is not None:
+            if not isinstance(cause, Exception):
+                return
+            if cause is refusal or getattr(cause, _REFUSAL_COPY, False):
+                return  # already the refusal, or a copy of it
+        again = type(refusal)(*refusal.args)
+        setattr(again, _REFUSAL_COPY, True)
+        raise again from refusal
+
+    def note_run_ended(self, exc: BaseException) -> None:
+        """Warns when the workflow ends by raising a failure that was recorded.
+
+        A failure the workflow lets propagate is not recorded, so a resume runs
+        the step again. But a step that runs while it propagates (a cleanup in a
+        `finally`, or in an `except` that re-raises) needs the next position, so
+        the failure is recorded to fill it, and the history then holds both. A
+        resume replays them and ends with the same exception: it cannot run the
+        failed step again, because a later position is already filled.
+        """
+        chain: List[Optional[Tuple[int, type, str]]] = []
+        link: Optional[BaseException] = exc
+        while link is not None and len(chain) < 20:
+            chain.append(_identity(link))
+            link = link.__cause__ or link.__context__
+        for source, name, sequence, cancelled in self._recorded_failures:
+            if source in chain and cancelled:
+                logger.warning(
+                    "Cellaflow: the workflow ended with %r cancelled at position %d "
+                    "of session %s. A step ran after the cancellation, so it was "
+                    "recorded, and a resume of this session refuses at that "
+                    "position: a replay cannot tell what cancelled it. To run it "
+                    "again, start a new session.",
+                    name,
+                    sequence,
+                    self.session_id,
+                )
+                return
+            if source in chain:
+                logger.warning(
+                    "Cellaflow: the workflow ended with %s from %r at position %d "
+                    "of session %s. A step ran after that failure, so it was "
+                    "recorded, and resuming this session raises it again rather "
+                    "than running %r again. To run it again, start a new session.",
+                    source[1].__name__,
+                    name,
+                    sequence,
+                    self.session_id,
+                    name,
+                )
+                return
+
+    def give_back_position(self, sequence: int) -> None:
+        """Returns the position of a step a process exit interrupted.
+
+        A `KeyboardInterrupt` or `SystemExit` is not something a workflow carries
+        on past, so it is not recorded. If the code does carry on anyway, its next
+        step takes this position rather than landing one past an empty one. Only
+        while no later position was claimed meanwhile; if the step did commit
+        before the interruption reached it, the next step's lease at that position
+        is refused before its body runs.
+        """
+        with self._lock:
+            if self._in_flight == 1 and self.sequence == sequence:
+                self.sequence = sequence - 1
+
+    def has_pending_failure(self) -> bool:
+        """Whether a failure is held, waiting to be recorded."""
+        pending = self._pending_hit
+        return pending is not None and pending.get("kind") == "failure"
+
+    def record_pending_failure(self) -> None:
+        """Records a failure the workflow caught and finished after, before the
+        workflow returns.
+
+        A failure followed by a later step is recorded when that step starts;
+        this covers one followed by none. It is written before the result is
+        returned, not in the background: a record lost after the run reported
+        its result would let a re-run run the step again, whose side effect
+        could repeat, and which could then take a different branch. That costs
+        one write's round trip at the end of such a run, and, when the failed
+        step's lease could not be released, up to that lease's lapse. In an
+        async workflow the write runs on a worker thread; if the caller cancels
+        the workflow meanwhile, the write still finishes there.
+
+        Errors that may pass are retried, and a lease holding the position is
+        waited out, until the failed step's own unreleased lease lapses or for
+        `_FINAL_HELD_WAIT_S`, whichever is later. Every engine call is bounded
+        by what is left of that time. A record that still cannot be written,
+        or that the engine refuses, is dropped with a warning, and a re-run
+        runs the step again, as before failures were recorded.
+        """
+        pending = self._pending_hit
+        if pending is None or pending.get("kind") != "failure":
+            return
+        deadline = time.monotonic() + _FINAL_HELD_WAIT_S
+        unreleased = pending.get("unreleased")
+        if unreleased is not None:
+            deadline = max(deadline, unreleased["lapses_at"] + _LAPSE_GRACE_S)
+        self._rpc_deadline = deadline
+        try:
+            last_try = False
+            while self._pending_hit is pending:
+                try:
+                    wait = self._settle_pending()
+                    reason = "a lease still holds its position"
+                except Exception as exc:
+                    code = exc.code() if isinstance(exc, grpc.RpcError) else None
+                    if code is None or code not in _RETRYABLE_CODES:
+                        self._drop_final_record(
+                            pending, f"{type(exc).__name__}: {exc}"
+                        )
+                        return
+                    # It may have landed despite the error (a deadline that
+                    # passed after the commit): the next try finds it written.
+                    wait, reason = _FINAL_RETRY_S, f"{code.name}: {exc}"
+                if not wait:
+                    return  # written, or refused and dropped by the write itself
+                remaining = deadline - time.monotonic()
+                if last_try or remaining <= 0:
+                    self._drop_final_record(pending, reason)
+                    return
+                if wait >= remaining:
+                    # Use what is left, then try once more.
+                    wait, last_try = remaining, True
+                time.sleep(wait)
+        finally:
+            self._rpc_deadline = None
+
+    def _drop_final_record(self, pending: Dict[str, Any], reason: str) -> None:
+        with self._lock:
+            if self._pending_hit is pending:
+                self._pending_hit = None
+        logger.warning(
+            "Cellaflow: the failure of %r at position %d of session %s was not "
+            "recorded (%s). The workflow's result stands; a re-run of this session "
+            "runs that step again.",
+            pending["name"],
+            pending["sequence"],
+            self.session_id,
+            reason,
+        )
+
+    def _rpc_timeout(self) -> float:
+        """The deadline for one engine call writing a record: the usual one, or
+        what is left of the last failure record's time, if less."""
+        if self._rpc_deadline is None:
+            return _RECORD_RPC_TIMEOUT_S
+        left = self._rpc_deadline - time.monotonic()
+        return max(0.5, min(_RECORD_RPC_TIMEOUT_S, left))
 
     def reconcile_sequence(self) -> None:
         """Records a deferred hit, then adopts the position the engine reported.
@@ -302,6 +851,7 @@ class WorkflowContext:
                         self.session_id,
                         from_sequence=pending["sequence"],
                         limit=GRAPH_PAGE,
+                        timeout=self._rpc_timeout(),
                     ),
                 )
                 # The run no longer knows what the session holds: it stops
@@ -316,9 +866,10 @@ class WorkflowContext:
                 else:
                     reason = f"it could not be sent ({type(exc).__name__}: {exc})"
                 logger.warning(
-                    "Cellaflow: the result of %r was not recorded at position %d "
+                    "Cellaflow: the %s of %r was not recorded at position %d "
                     "of session %s, because %s. Continuing from position %d. A "
                     "later resume of this session may not replay that step.",
+                    "failure" if pending.get("kind") == "failure" else "result",
                     pending["name"],
                     pending["sequence"],
                     self.session_id,
@@ -326,6 +877,11 @@ class WorkflowContext:
                     self.sequence,
                 )
                 return
+            if pending.get("kind") == "failure" and pending.get("source"):
+                cancelled = "cancelled" in (pending.get("payload") or {})
+                self._recorded_failures.append(
+                    (pending["source"], pending["name"], pending["sequence"], cancelled)
+                )
             self._pending_hit = None
             return
         if self._reported_sequence is not None:
@@ -342,16 +898,57 @@ class WorkflowContext:
         it refuses the record at a position another lease has claimed, or refuses
         the later lease before its side effect runs.
         """
-        key = record_idempotency_key(
-            self.session_id, pending["sequence"], pending["received_key"]
-        )
+        if pending.get("kind") == "failure":
+            key = failure_idempotency_key(
+                self.session_id,
+                pending["sequence"],
+                pending["name"],
+                pending["received_key"],
+            )
+        else:
+            key = record_idempotency_key(
+                self.session_id, pending["sequence"], pending["received_key"]
+            )
         agent_id = pending["agent_id"]
-        resp = self.client.check_idempotency_cache(
-            agent_id=agent_id,
-            idempotency_key=key,
-            session_id=self.session_id,
-            sequence=pending["sequence"],
-        )
+        unreleased = pending.get("unreleased")
+        if unreleased is not None:
+            # The failed step's own lease still claims this position, so the
+            # engine would refuse the record. Try the release again first.
+            try:
+                self.client.release_lease(
+                    agent_id=unreleased["agent_id"],
+                    idempotency_key=unreleased["key"],
+                    fencing_token=unreleased["token"],
+                    reason="TOOL_ERROR",
+                    timeout=self._rpc_timeout(),
+                )
+                pending["unreleased"] = None
+            except Exception as exc:
+                code = exc.code() if isinstance(exc, grpc.RpcError) else None
+                if code not in _RETRYABLE_CODES:
+                    # Already released or lapsed: nothing is left to free.
+                    pending["unreleased"] = None
+        try:
+            resp = self.client.check_idempotency_cache(
+                agent_id=agent_id,
+                idempotency_key=key,
+                session_id=self.session_id,
+                sequence=pending["sequence"],
+                timeout=self._rpc_timeout(),
+            )
+        except grpc.RpcError as exc:
+            unreleased = pending.get("unreleased")
+            if (
+                unreleased is not None
+                and exc.code() == grpc.StatusCode.FAILED_PRECONDITION
+            ):
+                remaining = unreleased["lapses_at"] + _LAPSE_GRACE_S - time.monotonic()
+                if remaining > 0:
+                    # Refused because of that lease, which lapses on its own:
+                    # wait for it, as for any held record.
+                    raise _RecordHeld(min(1.0, remaining)) from None
+                pending["unreleased"] = None
+            raise
         if resp.status == idempotency_pb2.CACHE_STATUS_HIT:
             # Written by an earlier attempt whose answer was lost.
             return
@@ -370,11 +967,12 @@ class WorkflowContext:
                 session_id=self.session_id,
                 sequence=pending["sequence"],
                 name=pending["name"],
-                status=common_pb2.StepStatus.STEP_STATUS_SUCCESS,
+                status=pending["status"],
                 output_payload=pending["payload"],
                 idempotency_key=key,
                 idempotency_fencing_token=token,
                 coordination_id=pending["coordination_id"],
+                timeout=self._rpc_timeout(),
             )
         except Exception:
             try:
@@ -383,6 +981,7 @@ class WorkflowContext:
                     idempotency_key=key,
                     fencing_token=token,
                     reason="TOOL_ERROR",
+                    timeout=self._rpc_timeout(),
                 )
             except Exception:
                 # The lease lapses on its own. Losing the release is not worth

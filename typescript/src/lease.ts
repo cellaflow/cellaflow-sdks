@@ -140,6 +140,14 @@ export class LeaseHeartbeat {
   lost = false;
   lostDetail?: string;
 
+  /**
+   * The longest the engine can still hold the lease after the last renewal this
+   * heartbeat sent: the larger of the grant's lifetime and a renewal's extension.
+   */
+  get lastsAtMostMs(): number {
+    return Math.max(this.opts.leaseTtlMs, this.opts.extendMs);
+  }
+
   constructor(options: LeaseHeartbeatOptions) {
     const intervalMs = options.heartbeatIntervalMs;
     this.opts = {
