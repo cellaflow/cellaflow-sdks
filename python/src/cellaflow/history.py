@@ -18,6 +18,7 @@ def iter_session_steps(
     from_sequence: Optional[int] = None,
     limit: Optional[int] = None,
     missing_ok: bool = True,
+    timeout: Optional[float] = None,
 ) -> Iterator[Dict[str, Any]]:
     """Yields a session's steps in order, from `from_sequence` on.
 
@@ -36,14 +37,18 @@ def iter_session_steps(
 
     `missing_ok=False` is for a caller that knows the session exists, such as one
     the engine just reported as recovered. NOT_FOUND then propagates too, rather
-    than reading as no history and running every step again.
+    than reading as no history and running every step again. `timeout` bounds
+    each page's RPC.
     """
+    # Passed only when given, so a client written against the older signature
+    # still works.
+    bound: Dict[str, Any] = {} if timeout is None else {"timeout": timeout}
     cursor = str(from_sequence) if from_sequence is not None else None
     yielded = False
     while True:
         try:
             steps, cursor = client.get_graph(
-                session_id=session_id, limit=limit, cursor=cursor
+                session_id=session_id, limit=limit, cursor=cursor, **bound
             )
         except grpc.RpcError as exc:
             # NOT_FOUND partway through means the session went away while it was
@@ -65,6 +70,7 @@ def latest_session_sequence(
     from_sequence: Optional[int] = None,
     limit: Optional[int] = None,
     missing_ok: bool = True,
+    timeout: Optional[float] = None,
 ) -> int:
     """The session's highest committed sequence at or after `from_sequence`.
 
@@ -74,7 +80,9 @@ def latest_session_sequence(
     as recovered, which must not read as empty.
     """
     latest = 0
-    steps = iter_session_steps(client, session_id, from_sequence, limit, missing_ok)
+    steps = iter_session_steps(
+        client, session_id, from_sequence, limit, missing_ok, timeout
+    )
     for step in steps:
         latest = max(latest, int(step.get("sequence") or 0))
     return latest

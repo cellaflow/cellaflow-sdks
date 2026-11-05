@@ -55,9 +55,18 @@ class _RecordHeld(Exception):
 #: The longest any one engine call writing a record may take. A write that
 #: cannot finish in time is dropped rather than hold up the run.
 _RECORD_RPC_TIMEOUT_S = 10.0
-#: How long the last failure record waits for a lease holding its position,
-#: when that is not the failed step's own unreleased lease, whose lapse is known.
+#: Marks a refusal raised again as a copy, so the workflow's end can tell it
+#: from an exception the workflow raised from the refusal.
+_REFUSAL_COPY = "_cellaflow_refusal_copy"
+#: How long the last failure record keeps trying when the failed step's own
+#: unreleased lease is not what holds it up: for someone else's lease on its
+#: position, or for an engine error that may pass.
 _FINAL_HELD_WAIT_S = 5.0
+#: Between tries of the last failure record after an error that may pass.
+_FINAL_RETRY_S = 0.5
+#: How long after its estimated lapse a failed step's unreleased lease is still
+#: waited for, for clock and renewal skew.
+_LAPSE_GRACE_S = 1.0
 
 
 #: Failures writing a hit's record that may succeed if sent again. The record is
@@ -120,6 +129,9 @@ class WorkflowContext:
     # The refusal that stopped this run's replay, if one did. Every later step
     # raises it again, and so does the workflow's end. See `refuse`.
     _refusal: Optional[BaseException] = field(default=None, repr=False, compare=False)
+    # When the last failure record must be written or given up. See
+    # `record_pending_failure` and `_rpc_timeout`.
+    _rpc_deadline: Optional[float] = field(default=None, repr=False, compare=False)
     # The modules loaded when the first run in this process started. A failure
     # whose class comes from a module loaded later was most likely imported by a
     # step, and a resume does not run steps, so the run warns. Taken once per
@@ -645,9 +657,10 @@ class WorkflowContext:
         if cause is not None:
             if not isinstance(cause, Exception):
                 return
-            if cause is refusal or cause.__cause__ is refusal:
+            if cause is refusal or getattr(cause, _REFUSAL_COPY, False):
                 return  # already the refusal, or a copy of it
         again = type(refusal)(*refusal.args)
+        setattr(again, _REFUSAL_COPY, True)
         raise again from refusal
 
     def note_run_ended(self, exc: BaseException) -> None:
@@ -720,13 +733,17 @@ class WorkflowContext:
         returned, not in the background: a record lost after the run reported
         its result would let a re-run run the step again, whose side effect
         could repeat, and which could then take a different branch. That costs
-        one write's round trip at the end of such a run.
+        one write's round trip at the end of such a run, and, when the failed
+        step's lease could not be released, up to that lease's lapse. In an
+        async workflow the write runs on a worker thread; if the caller cancels
+        the workflow meanwhile, the write still finishes there.
 
-        Every engine call is bounded. A lease still holding the position is
-        waited out, up to when the failed step's own unreleased lease lapses or
-        `_FINAL_HELD_WAIT_S` for anyone else's. A record that cannot be written
-        in that time, or that the engine refuses, is dropped with a warning, and
-        a re-run runs the step again, as before failures were recorded.
+        Errors that may pass are retried, and a lease holding the position is
+        waited out, until the failed step's own unreleased lease lapses or for
+        `_FINAL_HELD_WAIT_S`, whichever is later. Every engine call is bounded
+        by what is left of that time. A record that still cannot be written,
+        or that the engine refuses, is dropped with a warning, and a re-run
+        runs the step again, as before failures were recorded.
         """
         pending = self._pending_hit
         if pending is None or pending.get("kind") != "failure":
@@ -734,36 +751,41 @@ class WorkflowContext:
         deadline = time.monotonic() + _FINAL_HELD_WAIT_S
         unreleased = pending.get("unreleased")
         if unreleased is not None:
-            deadline = max(deadline, unreleased["lapses_at"] + 1.0)
-        while True:
-            wait = self._try_record_failure()
-            if wait is None:
-                return
-            if time.monotonic() + wait > deadline:
-                self._drop_final_record(pending, "a lease still holds its position")
-                return
-            time.sleep(wait)
-
-    def _try_record_failure(self) -> Optional[float]:
-        """One attempt at the last failure record: None when it is written or
-        dropped, or how long a lease holding its position says to wait."""
-        self._prepare_pending()
-        with self._lock:
-            pending = self._pending_hit
-            if pending is None or pending.get("kind") != "failure":
-                return None
-            try:
-                self.reconcile_sequence()
-                return None
-            except _RecordHeld as held:
-                return held.retry_after_s
-            except Exception as exc:
-                self._drop_final_record(pending, f"{type(exc).__name__}: {exc}")
-                return None
+            deadline = max(deadline, unreleased["lapses_at"] + _LAPSE_GRACE_S)
+        self._rpc_deadline = deadline
+        try:
+            last_try = False
+            while self._pending_hit is pending:
+                try:
+                    wait = self._settle_pending()
+                    reason = "a lease still holds its position"
+                except Exception as exc:
+                    code = exc.code() if isinstance(exc, grpc.RpcError) else None
+                    if code is None or code not in _RETRYABLE_CODES:
+                        self._drop_final_record(
+                            pending, f"{type(exc).__name__}: {exc}"
+                        )
+                        return
+                    # It may have landed despite the error (a deadline that
+                    # passed after the commit): the next try finds it written.
+                    wait, reason = _FINAL_RETRY_S, f"{code.name}: {exc}"
+                if not wait:
+                    return  # written, or refused and dropped by the write itself
+                remaining = deadline - time.monotonic()
+                if last_try or remaining <= 0:
+                    self._drop_final_record(pending, reason)
+                    return
+                if wait >= remaining:
+                    # Use what is left, then try once more.
+                    wait, last_try = remaining, True
+                time.sleep(wait)
+        finally:
+            self._rpc_deadline = None
 
     def _drop_final_record(self, pending: Dict[str, Any], reason: str) -> None:
-        if self._pending_hit is pending:
-            self._pending_hit = None
+        with self._lock:
+            if self._pending_hit is pending:
+                self._pending_hit = None
         logger.warning(
             "Cellaflow: the failure of %r at position %d of session %s was not "
             "recorded (%s). The workflow's result stands; a re-run of this session "
@@ -773,6 +795,14 @@ class WorkflowContext:
             self.session_id,
             reason,
         )
+
+    def _rpc_timeout(self) -> float:
+        """The deadline for one engine call writing a record: the usual one, or
+        what is left of the last failure record's time, if less."""
+        if self._rpc_deadline is None:
+            return _RECORD_RPC_TIMEOUT_S
+        left = self._rpc_deadline - time.monotonic()
+        return max(0.5, min(_RECORD_RPC_TIMEOUT_S, left))
 
     def reconcile_sequence(self) -> None:
         """Records a deferred hit, then adopts the position the engine reported.
@@ -821,6 +851,7 @@ class WorkflowContext:
                         self.session_id,
                         from_sequence=pending["sequence"],
                         limit=GRAPH_PAGE,
+                        timeout=self._rpc_timeout(),
                     ),
                 )
                 # The run no longer knows what the session holds: it stops
@@ -889,7 +920,7 @@ class WorkflowContext:
                     idempotency_key=unreleased["key"],
                     fencing_token=unreleased["token"],
                     reason="TOOL_ERROR",
-                    timeout=_RECORD_RPC_TIMEOUT_S,
+                    timeout=self._rpc_timeout(),
                 )
                 pending["unreleased"] = None
             except Exception as exc:
@@ -903,7 +934,7 @@ class WorkflowContext:
                 idempotency_key=key,
                 session_id=self.session_id,
                 sequence=pending["sequence"],
-                timeout=_RECORD_RPC_TIMEOUT_S,
+                timeout=self._rpc_timeout(),
             )
         except grpc.RpcError as exc:
             unreleased = pending.get("unreleased")
@@ -911,7 +942,7 @@ class WorkflowContext:
                 unreleased is not None
                 and exc.code() == grpc.StatusCode.FAILED_PRECONDITION
             ):
-                remaining = unreleased["lapses_at"] - time.monotonic()
+                remaining = unreleased["lapses_at"] + _LAPSE_GRACE_S - time.monotonic()
                 if remaining > 0:
                     # Refused because of that lease, which lapses on its own:
                     # wait for it, as for any held record.
@@ -941,7 +972,7 @@ class WorkflowContext:
                 idempotency_key=key,
                 idempotency_fencing_token=token,
                 coordination_id=pending["coordination_id"],
-                timeout=_RECORD_RPC_TIMEOUT_S,
+                timeout=self._rpc_timeout(),
             )
         except Exception:
             try:
@@ -950,7 +981,7 @@ class WorkflowContext:
                     idempotency_key=key,
                     fencing_token=token,
                     reason="TOOL_ERROR",
-                    timeout=_RECORD_RPC_TIMEOUT_S,
+                    timeout=self._rpc_timeout(),
                 )
             except Exception:
                 # The lease lapses on its own. Losing the release is not worth

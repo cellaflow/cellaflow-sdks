@@ -55,11 +55,14 @@ All notable changes to the CellaFlow Python SDK.
   not read the session's history (a resumed `durable_tools` thread). A record still unwritten when
   the workflow returns is written before the workflow returns its result, because a record lost
   after the run reported its result would let a re-run run the step again. That costs one write's
-  round trip at the end of such a run. Every engine call writing a record has a 10-second deadline.
-  If the failed step's lease could not be released, the record retries the release, or waits for
-  the lease to lapse (allowing for a renewal still on its way), rather than be refused at a
-  position that lease still claims. A record that cannot be written in that time, or that the
-  engine refuses, is dropped with a warning, and a re-run runs the step again. In an async
+  round trip at the end of such a run; in an async workflow, a caller that cancels the workflow
+  meanwhile still has the write finish on its worker thread. Errors that may pass are retried,
+  and every engine call writing a record has a deadline of at most 10 seconds, shortened to what
+  is left of the time allowed. If the failed step's lease could not be released, the record
+  retries the release, or waits for the lease to lapse (allowing for a renewal still on its way),
+  rather than be refused at a position that lease still claims; otherwise it keeps trying for 5
+  seconds. A record that still cannot be written, or that the engine refuses, is dropped with a
+  warning, and a re-run runs the step again. In an async
   workflow, records are written on a worker thread, so the event loop is not held up.
 
   A cancelled async step (`asyncio.CancelledError`) is recorded the same way, with how long it ran,

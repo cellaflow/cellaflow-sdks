@@ -614,6 +614,8 @@ def step(
         # When the step failed, before releasing its lease and stopping its
         # heartbeat, which a replayed cancellation must not count.
         failed_at: Optional[float] = None
+        # Whether the failure path already stopped the heartbeat.
+        stopped = False
         try:
             if seq in ctx.replayed_steps:
                 return _replay(ctx, seq, actual_tool_name)
@@ -727,6 +729,7 @@ def step(
                     # after it. Not awaited: an await is where a cancellation
                     # lands, and would replace the step's own exception.
                     hb.stop_soon()
+                    stopped = True
                 # Cancellation too: a lease left held would refuse the step that
                 # takes this position next until it lapsed.
                 if fencing_token > 0 and hb is not None:
@@ -735,7 +738,7 @@ def step(
                     )
                 raise e
             finally:
-                if hb:
+                if hb and not stopped:
                     # Not awaited after a commit either: a cancellation landing
                     # there would turn a committed step into a cancelled one.
                     hb.stop_soon()
@@ -786,6 +789,8 @@ def step(
         # When the step failed, before releasing its lease and stopping its
         # heartbeat, which a replayed cancellation must not count.
         failed_at: Optional[float] = None
+        # Whether the failure path already stopped the heartbeat.
+        stopped = False
         try:
             if seq in ctx.replayed_steps:
                 return _replay(ctx, seq, actual_tool_name)
@@ -897,6 +902,7 @@ def step(
                 if hb:
                     # Stopped before the release, so it renews nothing after it.
                     hb.stop_sync()
+                    stopped = True
                 # Cancellation too: a lease left held would refuse the step that
                 # takes this position next until it lapsed.
                 if fencing_token > 0 and hb is not None:
@@ -905,7 +911,7 @@ def step(
                     )
                 raise e
             finally:
-                if hb:
+                if hb and not stopped:
                     hb.stop_sync()
         except BaseException as exc:
             if live:

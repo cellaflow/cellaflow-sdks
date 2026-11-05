@@ -1306,10 +1306,12 @@ def _caught_then_returns(raise_in_step: BaseException) -> Callable[..., Any]:
 
 
 def test_a_record_that_cannot_be_written_after_the_workflow_returns_keeps_its_result(
-    mock_stub: MagicMock, mock_client: None, caplog: Any
+    mock_stub: MagicMock, mock_client: None, caplog: Any, monkeypatch: Any
 ) -> None:
-    """One attempt, then the record is dropped: the workflow's result never
-    waits on, or is replaced by, the bookkeeping."""
+    """Retried within its time, then dropped: the workflow's result is never
+    replaced by the bookkeeping."""
+    monkeypatch.setattr("cellaflow.context._FINAL_HELD_WAIT_S", 0.3)
+    monkeypatch.setattr("cellaflow.context._FINAL_RETRY_S", 0.05)
     _fresh(mock_stub, "sess-end")
     answer = mock_stub.CommitStep.side_effect
 
@@ -1322,7 +1324,7 @@ def test_a_record_that_cannot_be_written_after_the_workflow_returns_keeps_its_re
     wf = _caught_then_returns(PaymentDeclined("no funds"))
     with caplog.at_level("WARNING", logger="cellaflow.context"):
         assert wf() == "done"
-    assert mock_stub.CommitStep.call_count == 1
+    assert mock_stub.CommitStep.call_count > 1  # retried, not dropped at once
     assert "The workflow's result stands" in caplog.text
 
 
@@ -2242,7 +2244,7 @@ def test_the_last_failure_record_is_written_before_the_workflow_returns(
     order.append(f"returned {result}")
     assert order == ["commit charge", "returned done"]
     _, kwargs = mock_stub.CommitStep.call_args
-    assert kwargs.get("timeout") == 10.0  # every record call is bounded
+    assert 0 < kwargs["timeout"] <= 10.0  # every record call is bounded
 
 
 def test_the_last_record_waits_out_the_failed_steps_unreleased_lease(
@@ -2340,3 +2342,91 @@ def test_a_failed_steps_heartbeat_is_stopped_before_its_lease_is_released(
     _fresh(mock_stub, "sess-order")
     _caught_then_returns(PaymentDeclined("no funds"))()
     assert order.index("heartbeat stopped") < order.index("lease released")
+
+
+# --- Review fixes, round eleven -------------------------------------------------
+
+
+def test_the_last_record_is_retried_after_an_error_that_may_pass(
+    mock_stub: MagicMock, mock_client: None, monkeypatch: Any
+) -> None:
+    """One engine blip at the end must not lose it: a re-run would run the step
+    again."""
+    monkeypatch.setattr("cellaflow.context._FINAL_RETRY_S", 0.01)
+    _fresh(mock_stub, "sess-blip")
+    answer = mock_stub.CommitStep.side_effect
+    failures = [Unavailable()]
+
+    def commit(req: Any, **kwargs: Any) -> Any:
+        if req.step_result.status == FAILED and failures:
+            raise failures.pop()
+        return answer(req, **kwargs)
+
+    mock_stub.CommitStep.side_effect = commit
+    assert _caught_then_returns(PaymentDeclined("no funds"))() == "done"
+    assert _commits(mock_stub)[-1] == (1, "charge", FAILED)
+
+
+def test_the_last_record_tries_once_more_with_what_time_is_left(
+    mock_stub: MagicMock, mock_client: None, monkeypatch: Any
+) -> None:
+    """A wait longer than the time left is cut to what is left, not skipped."""
+    monkeypatch.setattr("cellaflow.context._FINAL_HELD_WAIT_S", 0.3)
+    _fresh(mock_stub, "sess-last-try")
+    acquired = mock_stub.CheckIdempotencyCache.return_value
+    held = [
+        idempotency_pb2.CheckCacheResponse(
+            status=idempotency_pb2.CACHE_STATUS_IN_PROGRESS, retry_after_ms=5000
+        )
+    ]
+
+    def check(req: Any, **kwargs: Any) -> Any:
+        if ":failure:" in req.idempotency_key and held:
+            return held.pop()
+        return acquired
+
+    mock_stub.CheckIdempotencyCache.side_effect = check
+    assert _caught_then_returns(PaymentDeclined("no funds"))() == "done"
+    assert _commits(mock_stub) == [(1, "charge", FAILED)]
+
+
+def test_a_refusal_replaces_an_exception_raised_from_it_explicitly(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """`raise PaymentFailed(...) from e`, not only the implicit chaining."""
+    from cellaflow import ReplayDivergedError
+
+    _history(mock_stub, "sess-from", [_succeeded(1, "warmup", "ok")])
+
+    @step
+    def charge() -> str:
+        return "charged"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            return charge()  # type: ignore[no-any-return]
+        except Exception as e:
+            raise PaymentFailed("declined") from e
+
+    with pytest.raises(ReplayDivergedError):
+        wf(_session_id="sess-from")  # type: ignore[call-arg]
+
+
+def test_a_failed_steps_heartbeat_is_stopped_once(
+    mock_stub: MagicMock, mock_client: None, monkeypatch: Any
+) -> None:
+    """A second stop would wait for a stuck renewal all over again."""
+    from cellaflow.lease import LeaseHeartbeat
+
+    stops: List[str] = []
+    original = LeaseHeartbeat.stop_sync
+
+    def stopping(self: Any) -> None:
+        stops.append("stop")
+        original(self)
+
+    monkeypatch.setattr(LeaseHeartbeat, "stop_sync", stopping)
+    _fresh(mock_stub, "sess-stop-once")
+    _caught_then_returns(PaymentDeclined("no funds"))()
+    assert stops == ["stop"]
