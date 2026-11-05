@@ -123,21 +123,28 @@ jobs:
     env:
       ENGINE_IMAGE: ghcr.io/cellaflow/cellaflow:0.2.0
       CELLAFLOW_TARGET: localhost:50051
+      # A second engine that requires a token, for the API key tests. The token
+      # guards a throwaway container on the runner, nothing else.
+      CELLAFLOW_AUTH_TARGET: localhost:50052
+      CELLAFLOW_AUTH_TEST_KEY: integration-test-key
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Start the engine
+      - name: Start the engines
         run: |
           docker run -d --name engine -p 50051:50051 \
             -e CELLAFLOW_ALLOW_UNAUTHENTICATED=true "$ENGINE_IMAGE"
-          for i in $(seq 1 60); do
-            if nc -z localhost 50051; then exit 0; fi
-            sleep 1
+          docker run -d --name engine-auth -p 50052:50051 \
+            -e CELLAFLOW_AUTH_TOKEN="$CELLAFLOW_AUTH_TEST_KEY" "$ENGINE_IMAGE"
+          for port in 50051 50052; do
+            for i in $(seq 1 60); do
+              if nc -z localhost $port; then break; fi
+              if [ "$i" = 60 ]; then docker logs engine; docker logs engine-auth; exit 1; fi
+              sleep 1
+            done
           done
-          docker logs engine
-          exit 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -171,4 +178,6 @@ jobs:
 
       - name: Engine logs
         if: failure()
-        run: docker logs engine
+        run: |
+          docker logs engine
+          docker logs engine-auth

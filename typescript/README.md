@@ -47,6 +47,20 @@ async function main() {
 main().catch(console.error);
 ```
 
+## Authenticating with the engine
+
+An engine started with a token (`CELLAFLOW_AUTH_TOKEN`) refuses calls without it. Set `CELLAFLOW_API_KEY` in the environment and every call sends it, with no code change. Or pass `apiKey` to `CellaflowClient`, `durableTools` or `executionLease`:
+
+```typescript
+await durableTools(threadId, { target: "engine.example.com:50051", secure: true, apiKey }, async () => {
+  // ...
+});
+```
+
+- **Where it comes from:** `apiKey` if given, then `CELLAFLOW_API_KEY`, then `CELLAFLOW_AUTH_TOKEN` (the engine's own variable). An empty `apiKey` means none.
+- **How it's sent:** as `authorization: Bearer <key>` on every call.
+- **Without TLS:** sending a key to a host other than localhost with `secure: false` warns once per target, since anyone on the path can read it.
+
 ## Coordinating agents across sessions
 
 A coordination id names the work several agents share: a ticket, a customer, a release. Give it to `durableTools`, and a tool declared with `IdempotencyScope.SHARED` deduplicates with every agent working under the same id, even in other sessions, other workflows, or the Python SDK.

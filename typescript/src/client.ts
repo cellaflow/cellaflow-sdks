@@ -1,5 +1,6 @@
 import {
   createPromiseClient,
+  Interceptor,
   PromiseClient,
   Transport,
 } from "@connectrpc/connect";
@@ -31,6 +32,51 @@ import { serialize, deserialize } from "./serialization.js";
 export interface CellaflowClientOptions {
   target?: string;
   secure?: boolean;
+  /**
+   * Authenticates every call, sent as `authorization: Bearer <apiKey>`. When it
+   * is not given, it is read from `CELLAFLOW_API_KEY`, then `CELLAFLOW_AUTH_TOKEN`
+   * (the engine's own name for its token); with neither set, calls go
+   * unauthenticated, which an engine started without a token accepts. An empty
+   * string means no key, even with the variables set.
+   */
+  apiKey?: string;
+}
+
+/** Where an API key is read from when none is passed, in order. */
+export const API_KEY_ENV_VARS = ["CELLAFLOW_API_KEY", "CELLAFLOW_AUTH_TOKEN"] as const;
+
+/** The API key to send: `apiKey` if given, else the first variable that is set. */
+export function resolveApiKey(apiKey?: string): string | undefined {
+  if (apiKey === undefined) {
+    for (const name of API_KEY_ENV_VARS) {
+      const value = process.env[name];
+      if (value) return value;
+    }
+    return undefined;
+  }
+  return apiKey || undefined;
+}
+
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+const warnedPlaintext = new Set<string>();
+
+function warnIfSentInTheClear(target: string): void {
+  const host = target.includes(":") ? target.slice(0, target.lastIndexOf(":")) : target;
+  if (LOCAL_HOSTS.has(host) || warnedPlaintext.has(target)) return;
+  warnedPlaintext.add(target);
+  console.warn(
+    `Cellaflow: sending an API key to ${target} without TLS, so anyone on the path ` +
+      "can read it. Pass secure: true to send it encrypted.",
+  );
+}
+
+/** Adds `authorization: Bearer <key>` to every call, so no call site can forget it. */
+function bearerKey(apiKey: string): Interceptor {
+  const header = `Bearer ${apiKey}`;
+  return (next) => async (req) => {
+    req.header.set("authorization", header);
+    return next(req);
+  };
 }
 
 export class CellaflowClient {
@@ -47,9 +93,23 @@ export class CellaflowClient {
     // Use http/https based on the secure flag
     const baseUrl = secure ? `https://${target}` : `http://${target}`;
 
+    const apiKey = resolveApiKey(options.apiKey);
+    const interceptors: Interceptor[] = [];
+    if (apiKey !== undefined) {
+      if (/[\r\n]/.test(apiKey) || apiKey !== apiKey.trim() || !/^[\x20-\x7e]*$/.test(apiKey)) {
+        throw new Error(
+          "The Cellaflow API key cannot be sent in a header: it has surrounding " +
+            "whitespace, a line break or a character outside printable ASCII.",
+        );
+      }
+      if (!secure) warnIfSentInTheClear(target);
+      interceptors.push(bearerKey(apiKey));
+    }
+
     const transport: Transport = createGrpcTransport({
       baseUrl,
       httpVersion: "2",
+      interceptors,
     });
 
     this.client = createPromiseClient(WorkflowEngineService, transport);

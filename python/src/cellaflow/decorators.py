@@ -38,8 +38,18 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 
 def workflow(
-    version: str = "1.0.0", target: str = "localhost:50051", secure: bool = False
+    version: str = "1.0.0",
+    target: str = "localhost:50051",
+    secure: bool = False,
+    api_key: Optional[str] = None,
 ) -> Callable[[F], F]:
+    """Makes a function a durable workflow: its `@step` calls are recorded in a
+    session, and a run with the same `_session_id` resumes from them.
+
+    `api_key` authenticates with the engine; when omitted it is read from
+    `CELLAFLOW_API_KEY` or `CELLAFLOW_AUTH_TOKEN`. See `CellaflowClient`.
+    """
+
     def decorator(func: F) -> F:
         @functools.wraps(func)
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -51,7 +61,7 @@ def workflow(
                 kwargs.pop("_coordination_id", None)
             )
 
-            client = CellaflowClient(target=target, secure=secure)
+            client = CellaflowClient(target=target, secure=secure, api_key=api_key)
             resp = client.start_session(
                 workflow_id=func.__name__,
                 version=version,
@@ -118,7 +128,7 @@ def workflow(
                 kwargs.pop("_coordination_id", None)
             )
 
-            client = CellaflowClient(target=target, secure=secure)
+            client = CellaflowClient(target=target, secure=secure, api_key=api_key)
             resp = client.start_session(
                 workflow_id=func.__name__,
                 version=version,

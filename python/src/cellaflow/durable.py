@@ -93,6 +93,7 @@ def durable_tools(
     target: str = "localhost:50051",
     secure: bool = False,
     coordination_id: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Iterator[Any]:
     """Leases the `@tool` calls made inside this block.
 
@@ -158,7 +159,7 @@ def durable_tools(
     session_id = tool_session_id(thread_id)
     coordination_id = normalize_coordination_id(coordination_id)
 
-    client = CellaflowClient(target=target, secure=secure)
+    client = CellaflowClient(target=target, secure=secure, api_key=api_key)
     resp = client.start_session(
         workflow_id=workflow_id,
         version=version,

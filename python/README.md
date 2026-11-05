@@ -563,7 +563,26 @@ flowchart TD
 
 ## Core Concepts
 
-### `@workflow(version="1.0.0", target="localhost:50051", secure=False)`
+### Authenticating with the engine
+
+An engine started with a token (`CELLAFLOW_AUTH_TOKEN`) refuses calls without it. Set `CELLAFLOW_API_KEY` in the SDK's environment and every call sends it, with no code change:
+
+```bash
+export CELLAFLOW_API_KEY=your-engine-token
+```
+
+Or pass it explicitly. Every entry point that talks to the engine takes `api_key`: `@workflow`, `durable_tools`, `execution_lease`, `async_execution_lease`, `task_lease`, `CellaflowSaver` and `CellaflowClient`.
+
+```python
+@workflow(version="1.0.0", target="engine.example.com:50051", secure=True, api_key=key)
+```
+
+- **Where it comes from:** `api_key` if given, then `CELLAFLOW_API_KEY`, then `CELLAFLOW_AUTH_TOKEN` (the engine's own variable, so a process that runs both sets it once). An empty `api_key` means none.
+- **How it's sent:** as `authorization: Bearer <key>` on every call.
+- **Kept out of sight:** the key never appears in logs, exceptions or `repr`.
+- **Without TLS:** sending a key to a host other than localhost with `secure=False` logs a warning, once per target, since anyone on the path can read it.
+
+### `@workflow(version="1.0.0", target="localhost:50051", secure=False, api_key=None)`
 Marks the entry point for a durable workflow execution:
 - **Automatic Client Management**: Transparently initializes the underlying gRPC client and session state.
 - **Context Isolation**: Uses Python's `contextvars` to manage session context safely across async event loops and threads.
@@ -639,7 +658,7 @@ For advanced use cases requiring manual session management, graph inspection, or
 from cellaflow import CellaflowClient
 from cellaflow.v1.common_pb2 import STEP_STATUS_SUCCESS
 
-# Initialize client
+# Initialize client (api_key, or CELLAFLOW_API_KEY, for an engine that requires a token)
 client = CellaflowClient(target="localhost:50051", secure=False)
 
 # 1. Start or resume a session

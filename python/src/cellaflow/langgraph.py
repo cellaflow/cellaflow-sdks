@@ -169,6 +169,7 @@ class CellaflowSaver(_BaseSaver):
         version: str = "v1",
         *,
         serde: Optional[SerializerProtocol] = None,
+        api_key: Optional[str] = None,
     ) -> None:
         """
         Initializes the CellaflowSaver checkpointer.
@@ -178,6 +179,9 @@ class CellaflowSaver(_BaseSaver):
                 a client is automatically constructed using `target` and `secure`.
             target: gRPC target endpoint for the CellaFlow Engine.
             secure: Whether to use TLS encryption for gRPC channel communication.
+            api_key: Authenticates with the engine when the client is built
+                here; when omitted it is read from `CELLAFLOW_API_KEY` or
+                `CELLAFLOW_AUTH_TOKEN`. Ignored when `client` is given.
             workflow_id: CellaFlow workflow identifier tag.
             version: Workflow schema version string.
             serde: Optional custom serializer conforming to `SerializerProtocol`.
@@ -195,7 +199,7 @@ class CellaflowSaver(_BaseSaver):
         self.client = (
             client
             if client is not None
-            else CellaflowClient(target=target, secure=secure)
+            else CellaflowClient(target=target, secure=secure, api_key=api_key)
         )
         self.workflow_id = workflow_id
         self.version = version

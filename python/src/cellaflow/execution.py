@@ -189,6 +189,7 @@ def execution_lease(
     worker_id: str,
     target: str = "localhost:50051",
     secure: bool = False,
+    api_key: Optional[str] = None,
     ttl_ms: int = _DEFAULT_TTL_MS,
     heartbeat_interval_ms: int = _DEFAULT_HEARTBEAT_INTERVAL_MS,
     on_lease_lost: Optional[Callable[[], None]] = None,
@@ -239,7 +240,7 @@ def execution_lease(
     LeaseNotAcquired
         If the lease cannot be acquired.
     """
-    client = CellaflowClient(target=target, secure=secure)
+    client = CellaflowClient(target=target, secure=secure, api_key=api_key)
     try:
         resp = _acquire(client, key, worker_id, ttl_ms)
         token = resp.fencing_token
@@ -303,6 +304,7 @@ async def async_execution_lease(
     worker_id: str,
     target: str = "localhost:50051",
     secure: bool = False,
+    api_key: Optional[str] = None,
     ttl_ms: int = _DEFAULT_TTL_MS,
     heartbeat_interval_ms: int = _DEFAULT_HEARTBEAT_INTERVAL_MS,
     on_lease_lost: Optional[Callable[[], None]] = None,
@@ -339,7 +341,7 @@ async def async_execution_lease(
     asyncio.CancelledError
         If the lease is lost mid-execution and ``preempt`` is ``True``.
     """
-    client = CellaflowClient(target=target, secure=secure)
+    client = CellaflowClient(target=target, secure=secure, api_key=api_key)
     try:
         # Offload sync gRPC call to a thread
         resp = await asyncio.to_thread(_acquire, client, key, worker_id, ttl_ms)
@@ -414,6 +416,7 @@ def task_lease(
     worker_id: str,
     target: str = "localhost:50051",
     secure: bool = False,
+    api_key: Optional[str] = None,
     ttl_ms: int = _DEFAULT_TTL_MS,
     heartbeat_interval_ms: int = _DEFAULT_HEARTBEAT_INTERVAL_MS,
     on_lease_lost: Optional[Callable[[], None]] = None,
@@ -468,6 +471,7 @@ def task_lease(
                     worker_id=worker_id,
                     target=target,
                     secure=secure,
+                    api_key=api_key,
                     ttl_ms=ttl_ms,
                     heartbeat_interval_ms=heartbeat_interval_ms,
                     on_lease_lost=on_lease_lost,
@@ -484,6 +488,7 @@ def task_lease(
                 worker_id=worker_id,
                 target=target,
                 secure=secure,
+                api_key=api_key,
                 ttl_ms=ttl_ms,
                 heartbeat_interval_ms=heartbeat_interval_ms,
                 on_lease_lost=on_lease_lost,

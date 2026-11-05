@@ -128,6 +128,8 @@ export interface ExecutionLeaseOptions {
   workerId: string;
   target?: string;
   secure?: boolean;
+  /** Authenticates with the engine. See {@link CellaflowClientOptions.apiKey}. */
+  apiKey?: string;
   /**
    * How long the lease lasts without a renewal. Each renewal extends it by the
    * same amount. Defaults to 30 000.
@@ -188,7 +190,7 @@ export async function executionLease<T>(
     waitMs = 0,
   } = options;
 
-  const client = new CellaflowClient({ target, secure });
+  const client = new CellaflowClient({ target, secure, apiKey: options.apiKey });
   let hb: LeaseHeartbeat | undefined;
   let handle: LeaseHandle | undefined;
   let fencingToken = 0;
