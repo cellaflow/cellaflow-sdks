@@ -705,6 +705,17 @@ flake8 src tests
 mypy src tests
 ```
 
+The tests in `tests/integration/` run against a real engine, and are skipped unless `CELLAFLOW_TARGET` names one. They check what a stubbed engine cannot: that the engine accepts the records the SDK writes, refuses what it should, and that a resumed run replays what a first run committed. CI runs them against the pinned engine image.
+
+```bash
+docker run -d -p 50051:50051 -e CELLAFLOW_ALLOW_UNAUTHENTICATED=true \
+  ghcr.io/cellaflow/cellaflow:0.2.0
+CELLAFLOW_TARGET=localhost:50051 pytest --no-cov tests/integration
+
+# The TypeScript SDK's, from typescript/
+CELLAFLOW_TARGET=localhost:50051 npm run test:integration
+```
+
 ---
 
 ## Examples
