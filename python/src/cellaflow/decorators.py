@@ -10,13 +10,12 @@ import grpc
 
 from cellaflow.client import CellaflowClient
 from cellaflow.context import (
-    _EXIT_WAIT_S,
     WorkflowContext,
     has_record_writes,
+    wait_before_starting,
     set_context,
     reset_context,
     get_context,
-    wait_for_record_writes,
     session_coordination_id,
 )
 from cellaflow.failures import ReplayedFailureError, rebuild
@@ -59,9 +58,7 @@ def workflow(
             # put this run's next step on that position. Waited for on a worker
             # thread, so other tasks on the loop keep running.
             if has_record_writes(session_id):
-                await asyncio.to_thread(
-                    wait_for_record_writes, _EXIT_WAIT_S, session_id
-                )
+                await asyncio.to_thread(wait_before_starting, session_id)
             client = CellaflowClient(target=target, secure=secure)
             resp = client.start_session(
                 workflow_id=func.__name__,
@@ -130,7 +127,8 @@ def workflow(
             # A run of this session that just returned may still be writing its
             # last failure record; reading the history before it lands would
             # put this run's next step on that position.
-            wait_for_record_writes(_EXIT_WAIT_S, session_id=session_id)
+            if has_record_writes(session_id):
+                wait_before_starting(session_id)
             client = CellaflowClient(target=target, secure=secure)
             resp = client.start_session(
                 workflow_id=func.__name__,
@@ -413,12 +411,14 @@ def _release_after_failure(
             name,
             exc_info=True,
         )
-        ttl_ms = hb.lease_ttl_ms
+        # A renewal already on its way when the heartbeat is told to stop can
+        # still reach the engine, up to its RPC timeout from now, and extend
+        # the lease a full lifetime from there.
         return {
             "agent_id": agent_id,
             "key": ikey,
             "token": fencing_token,
-            "lapses_in_s": ttl_ms / 1000.0 + 1.0,
+            "lapses_in_s": hb.rpc_timeout_sec + hb.lease_ttl_ms / 1000.0 + 1.0,
         }
     return None
 

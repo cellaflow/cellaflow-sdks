@@ -62,9 +62,17 @@ _writers_lock = threading.Lock()
 _EXIT_WAIT_S = 10.0
 
 
+class RecordStillBeingWritten(RuntimeError):
+    """A previous run of this session is still writing its last failure record.
+
+    Starting now could read the history before the record lands and run that
+    step again at its position. Nothing has run; try again shortly.
+    """
+
+
 def wait_for_record_writes(
     timeout: Optional[float] = None, session_id: Optional[str] = None
-) -> None:
+) -> bool:
     """Waits for failure records still being written for workflows that have
     returned, in one session or in all.
 
@@ -72,7 +80,7 @@ def wait_for_record_writes(
     them. A workflow starting a session waits for that session's writes first,
     and the process waits up to `_EXIT_WAIT_S` for all of them before it exits;
     call this to be sure of them sooner, as a test does before reading the
-    history.
+    history. Returns whether they all finished within `timeout`.
     """
     with _writers_lock:
         if session_id is None:
@@ -86,6 +94,24 @@ def wait_for_record_writes(
             writer.join()
         else:
             writer.join(max(0.0, deadline - time.monotonic()))
+    return not any(writer.is_alive() for writer in writers)
+
+
+def wait_before_starting(session_id: str) -> None:
+    """Waits for a previous run of `session_id` to finish writing its last
+    failure record, and refuses to start if it does not in time.
+
+    Going ahead without it would read a history missing that position, so the
+    step there would run again, and could take a different branch: a refusal
+    the caller can retry is the safer side (rule 2 over rule 3).
+    """
+    if not wait_for_record_writes(_EXIT_WAIT_S, session_id=session_id):
+        raise RecordStillBeingWritten(
+            f"A previous run of session {session_id} is still writing its last "
+            f"failure record after {_EXIT_WAIT_S:.0f} s, so this run did not "
+            f"start: reading the history now could run that step again. Nothing "
+            f"has run; try again shortly."
+        )
 
 
 def has_record_writes(session_id: str) -> bool:
@@ -500,8 +526,9 @@ class WorkflowContext:
         for it to lapse. It lives and goes with the record. See `_write_record`.
         """
         if unreleased is not None:
-            # Counted from now: the step's heartbeat has stopped, so no renewal
-            # can extend the lease past this.
+            # Counted from now: the step's heartbeat has been told to stop, and
+            # `lapses_in_s` already allows for a renewal still on its way. See
+            # `decorators._release_after_failure`.
             unreleased = dict(unreleased)
             unreleased["lapses_at"] = time.monotonic() + unreleased["lapses_in_s"]
         with self._lock:
@@ -664,12 +691,29 @@ class WorkflowContext:
                 self._refusal = refusal
 
     def raise_if_refused(self, cause: Optional[BaseException] = None) -> None:
-        """Raises the refusal recorded by `refuse`, if any."""
+        """Raises the refusal recorded by `refuse`, if any: the original, so its
+        traceback still shows where the replay refused.
+
+        `cause` is the exception the workflow is ending with, if it is ending
+        with one. A refusal does not replace a cancellation or a process exit
+        (anything not an `Exception`), which must keep propagating as itself,
+        nor an exception that already carries the refusal in its chain.
+        """
         refusal = self._refusal
-        if refusal is None or refusal is cause:
+        if refusal is None:
             return
-        again = type(refusal)(*refusal.args)
-        raise again from cause
+        if cause is not None:
+            if not isinstance(cause, Exception):
+                return
+            link: Optional[BaseException] = cause
+            for _ in range(20):
+                if link is None:
+                    break
+                if link is refusal:
+                    return
+                link = link.__cause__ or link.__context__
+            raise refusal from cause
+        raise refusal
 
     def note_run_ended(self, exc: BaseException) -> None:
         """Warns when the workflow ends by raising a failure that was recorded.
@@ -747,15 +791,6 @@ class WorkflowContext:
         """
         pending = self._pending_hit
         if pending is None or pending.get("kind") != "failure":
-            return
-        if "cancelled" in (pending.get("payload") or {}):
-            # Nothing follows it, so no position needs filling, and a resume
-            # refuses at a recorded cancellation: recording it would only stop
-            # this session from being replayed, even to read its result. Left
-            # unrecorded, a resume runs the step again, as before.
-            with self._lock:
-                if self._pending_hit is pending:
-                    self._pending_hit = None
             return
         writer = threading.Thread(
             target=self._try_record_failure, name="cellaflow-record", daemon=True

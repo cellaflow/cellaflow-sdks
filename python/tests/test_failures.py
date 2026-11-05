@@ -2142,16 +2142,21 @@ def test_a_new_run_of_a_session_waits_for_its_last_record(
 # --- Review fixes, round eight --------------------------------------------------
 
 
-def test_a_cancellation_nothing_follows_is_not_recorded(
+def test_a_cancellation_nothing_follows_is_recorded_and_a_rerun_refuses(
     mock_stub: MagicMock, mock_client: None
 ) -> None:
-    """No position needs filling, and a resume refuses at a recorded
-    cancellation: recording it would only stop the finished session from being
-    replayed, even to read its result."""
+    """Left unrecorded, a re-run of the finished session would run the
+    cancelled step's body again: its side effect could repeat, and if it now
+    succeeds, the run takes a different branch (rules 1 and 2). Recorded, a
+    re-run refuses there (rule 3 gives way)."""
+    from cellaflow import FailureNotReplayableError
+
     _fresh(mock_stub, "sess-cancel-last")
+    ran: List[str] = []
 
     @step
     async def charge() -> str:
+        ran.append("charge")
         await asyncio.sleep(5)
         return "charged"
 
@@ -2163,7 +2168,14 @@ def test_a_cancellation_nothing_follows_is_not_recorded(
             return "timed out"
 
     assert asyncio.run(wf()) == "timed out"
-    assert _commits(mock_stub) == []
+    assert _commits(mock_stub) == [(1, "charge", FAILED)]
+
+    first = mock_stub.CommitStep.call_args_list[0][0][0]
+    _history(mock_stub, "sess-cancel-last", [first.step_result])
+    run_wf: Any = wf
+    with pytest.raises(FailureNotReplayableError):
+        asyncio.run(run_wf(_session_id="sess-cancel-last"))
+    assert ran == ["charge"]
 
 
 def test_waiting_for_record_writes_has_one_deadline_for_all() -> None:
@@ -2284,3 +2296,104 @@ def test_a_failed_steps_exception_is_not_replaced_while_its_heartbeat_stops(
     assert asyncio.run(wf()) == "fell back"
     first = mock_stub.CommitStep.call_args_list[0][0][0]
     assert "error" in deserialize(first.step_result.output_payload)
+
+
+# --- Review fixes, round nine ---------------------------------------------------
+
+
+def test_an_unreleased_lease_allows_for_a_renewal_still_on_its_way() -> None:
+    """The heartbeat is told to stop without waiting, so a renewal sent just
+    before can still reach the engine, up to its RPC timeout later, and extend
+    the lease a full lifetime from there."""
+    from cellaflow.decorators import _release_after_failure
+
+    ctx = MagicMock()
+    ctx.client.release_lease.side_effect = Unavailable()
+    hb = MagicMock(lease_ttl_ms=20_000, rpc_timeout_sec=5.0)
+    lease = _release_after_failure(ctx, "agent", "key", 7, "charge", hb)
+    assert lease is not None and lease["lapses_in_s"] == 26.0
+
+
+@pytest.mark.background_records
+def test_a_run_refuses_to_start_while_a_previous_run_is_still_writing(
+    mock_stub: MagicMock, mock_client: None, monkeypatch: Any
+) -> None:
+    """Rather than read a history missing that position and run the step
+    there again."""
+    import threading
+    import time
+
+    from cellaflow import RecordStillBeingWritten, context
+
+    monkeypatch.setattr("cellaflow.context._EXIT_WAIT_S", 0.1)
+    stalled = threading.Thread(target=time.sleep, args=(1.0,), daemon=True)
+    stalled.start()
+    context._writers["sess-busy"] = {stalled}
+    try:
+        with pytest.raises(RecordStillBeingWritten, match="try again shortly"):
+            _caught_then_returns(PaymentDeclined("no funds"))(
+                _session_id="sess-busy"
+            )
+        mock_stub.StartSession.assert_not_called()
+    finally:
+        del context._writers["sess-busy"]
+
+
+def _refused_then(then: Callable[[], Any]) -> Callable[..., Any]:
+    """A workflow whose replay refuses at its first step, which it catches."""
+
+    @step
+    def charge() -> str:
+        return "charged"
+
+    @workflow(version="1.0.0")
+    def wf() -> Any:
+        try:
+            charge()
+        except Exception:
+            pass
+        return then()
+
+    return wf
+
+
+def test_a_refusal_does_not_replace_an_interrupt_the_run_ends_with(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """Ctrl-C and a process exit keep propagating as themselves."""
+    _history(mock_stub, "sess-interrupt", [_succeeded(1, "warmup", "ok")])
+
+    def interrupted() -> Any:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _refused_then(interrupted)(_session_id="sess-interrupt")
+
+
+def test_a_refusal_raised_again_is_the_original_with_its_traceback(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    from cellaflow import ReplayDivergedError
+
+    _history(mock_stub, "sess-original", [_succeeded(1, "warmup", "ok")])
+    caught: List[BaseException] = []
+
+    @step
+    def charge() -> str:
+        return "charged"
+
+    @step
+    def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            charge()
+        except Exception as first:
+            caught.append(first)
+        return notify()  # type: ignore[no-any-return]
+
+    with pytest.raises(ReplayDivergedError) as again:
+        wf(_session_id="sess-original")  # type: ignore[call-arg]
+    assert again.value is caught[0]

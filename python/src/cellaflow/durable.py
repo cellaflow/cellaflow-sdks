@@ -146,23 +146,18 @@ def durable_tools(
     accepted too, for callers who have no config to hand.
     """
     from cellaflow.context import (
-        _EXIT_WAIT_S,
         WorkflowContext,
         set_context,
         reset_context,
         session_coordination_id,
         _register_session,
         _deregister_session,
-        wait_for_record_writes,
     )
 
     thread_id = _thread_id_from(config)
     session_id = tool_session_id(thread_id)
     coordination_id = normalize_coordination_id(coordination_id)
 
-    # A run of this session that just returned may still be writing its last
-    # failure record. See `WorkflowContext._record_in_background`.
-    wait_for_record_writes(_EXIT_WAIT_S, session_id=session_id)
     client = CellaflowClient(target=target, secure=secure)
     resp = client.start_session(
         workflow_id=workflow_id,

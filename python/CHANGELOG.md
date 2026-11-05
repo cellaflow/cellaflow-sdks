@@ -54,8 +54,9 @@ All notable changes to the CellaFlow Python SDK.
   recording, so no later failure is recorded above the position it left empty; nor is one in a run that has
   not read the session's history (a resumed `durable_tools` thread). A record still unwritten when
   the workflow returns is written in the background, in one attempt, after the result has been
-  returned, so the result never waits on it; a new run of the same session waits for the write
-  before starting, the process waits up to 10 seconds for it before exiting, and
+  returned, so the result never waits on it; a new run of the same session waits up to 10 seconds
+  for the write before starting, and raises `RecordStillBeingWritten` rather than start without it,
+  the process waits up to 10 seconds for it before exiting, and
   `cellaflow.context.wait_for_record_writes()` waits for it sooner. If it cannot be written at once,
   it is dropped with a warning, and a resume runs the step again. If the failed step's lease could not be released, the record
   retries the release, or waits for the lease to lapse (counted from when the step's heartbeat
@@ -69,9 +70,10 @@ All notable changes to the CellaFlow Python SDK.
   `TimeoutError`, one from outside arrives as `CancelledError`), which the record cannot say, and
   waiting to be cancelled again cannot reliably tell either, since earlier steps replay instantly
   and move every timer. A timeout inside the step's body (`return await asyncio.wait_for(call(),
-  5)`) records a plain `TimeoutError` instead, which replays exactly. A cancellation nothing
-  follows is not recorded, since no position needs filling, so a finished session can still be
-  replayed. A `CancelledError` raised out of a synchronous step is that step's own exception, and
+  5)`) records a plain `TimeoutError` instead, which replays exactly. A cancellation the workflow
+  carries on past is recorded even when nothing follows it, so re-running a finished session
+  refuses there rather than run the cancelled step again; read the session's history to see how it
+  ended. A `CancelledError` raised out of a synchronous step is that step's own exception, and
   is recorded and replayed as one.
 
   A refusal stops the run even when the workflow catches it: every later step raises it again

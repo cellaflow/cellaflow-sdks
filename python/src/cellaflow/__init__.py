@@ -10,6 +10,7 @@ from cellaflow.decorators import (
     NondeterministicWorkflowError,
     ReplayDivergedError,
 )
+from cellaflow.context import RecordStillBeingWritten
 from cellaflow.idempotency import IdempotencyScope
 
 # durable_tools works with any framework, so it does not come through the
@@ -38,6 +39,7 @@ __all__ = [
     "NondeterministicWorkflowError",
     "ReplayDivergedError",
     "FailureNotReplayableError",
+    "RecordStillBeingWritten",
     "CellaflowClient",
     "workflow",
     "step",
