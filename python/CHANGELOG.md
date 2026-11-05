@@ -48,11 +48,13 @@ All notable changes to the CellaFlow Python SDK.
   step runs while it propagates (a cleanup in a `finally`): that step needs the next position, so
   the failure is recorded to fill it, and a resume ends with the same exception. The run warns when
   it ends that way, and says to start a new session to run the step again. A failure
-  while another step of the session is in flight is not recorded either, nor one in a run that has
+  while another step of the session is in flight is not recorded either, and the run then stops
+  recording, so no later failure is recorded above the position it left empty; nor is one in a run that has
   not read the session's history (a resumed `durable_tools` thread). A record still unwritten when
-  the workflow returns is written then, in one attempt with no waiting, so the result is never
-  delayed by it; if it cannot be written at once, the workflow's result stands, with a warning, and
-  a resume runs the step again. If the failed step's lease could not be released, the record
+  the workflow returns is written in the background, in one attempt, after the result has been
+  returned, so the result never waits on it; the process waits for the write before exiting, and
+  `cellaflow.context.wait_for_record_writes()` waits for it sooner. If it cannot be written at once,
+  it is dropped with a warning, and a resume runs the step again. If the failed step's lease could not be released, the record
   retries the release, or waits for the lease to lapse (counted from when the step's heartbeat
   stopped), rather than be refused at a position that lease still claims. In an async workflow, records are written on a worker
   thread, so the event loop is not held up.

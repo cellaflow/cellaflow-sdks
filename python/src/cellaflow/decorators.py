@@ -231,9 +231,6 @@ _CANCEL_WAIT_EXTRA_S = 0.25
 #: A replayed cancellation that waits longer than this says why, so a resume
 #: that pauses there is not mistaken for a hang.
 _CANCEL_WAIT_LOG_S = 5.0
-#: How long a lease lasts when there is no heartbeat to say: four of the
-#: engine's default 5-second heartbeat intervals.
-_DEFAULT_LEASE_TTL_MS = 20_000
 
 
 def _cancellation(recorded: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -408,7 +405,7 @@ def _release_after_failure(
     ikey: str,
     fencing_token: int,
     name: str,
-    hb: Optional[LeaseHeartbeat],
+    hb: LeaseHeartbeat,
 ) -> Optional[Dict[str, Any]]:
     """Releases the lease of a step that failed or was cancelled, so the step
     that takes this position next is not refused until it lapses.
@@ -435,7 +432,7 @@ def _release_after_failure(
             name,
             exc_info=True,
         )
-        ttl_ms = hb.lease_ttl_ms if hb else _DEFAULT_LEASE_TTL_MS
+        ttl_ms = hb.lease_ttl_ms
         return {
             "agent_id": agent_id,
             "key": ikey,
@@ -453,10 +450,15 @@ def _note_failure(
     call_coordination: Optional[str],
     agent_id: str,
     ikey: Optional[str],
-    elapsed_s: float,
+    started: float,
+    failed_at: float,
     unreleased: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Holds a live step's failure or cancellation to be recorded at its position.
+
+    `started` and `failed_at` are when the step started and when it failed, on
+    the monotonic clock: a cancellation records the time between, and how far
+    into the run it came, without the release and heartbeat stop after it.
 
     Not for a refused lease: another writer owns that position and fills it.
     A cancellation (`asyncio.CancelledError`) is recorded with how long the step
@@ -472,11 +474,11 @@ def _note_failure(
             ctx.defer_cancellation_record(
                 seq,
                 name,
-                elapsed_s,
+                failed_at - started,
                 call_coordination,
                 agent_id=agent_id,
                 step_key=ikey or "",
-                since_run_start_s=time.monotonic() - ctx.run_started,
+                since_run_start_s=failed_at - ctx.run_started,
                 source=exc,
                 unreleased=unreleased,
             )
@@ -635,6 +637,9 @@ def step(
         # failure record. See `_release_after_failure`.
         unreleased: Optional[Dict[str, Any]] = None
         started = time.monotonic()
+        # When the step failed, before releasing its lease and stopping its
+        # heartbeat, which a replayed cancellation must not count.
+        failed_at: Optional[float] = None
         try:
             if seq in ctx.replayed_steps:
                 return await _replay_async(ctx, seq, actual_tool_name)
@@ -744,9 +749,10 @@ def step(
                 committed = True
                 return result
             except BaseException as e:
+                failed_at = time.monotonic()
                 # Cancellation too: a lease left held would refuse the step that
                 # takes this position next until it lapsed.
-                if fencing_token > 0:
+                if fencing_token > 0 and hb is not None:
                     unreleased = _release_after_failure(
                         ctx, agent_id, ikey, fencing_token, actual_tool_name, hb
                     )
@@ -769,7 +775,8 @@ def step(
                     call_coordination,
                     agent_id,
                     ikey,
-                    time.monotonic() - started,
+                    started,
+                    failed_at or time.monotonic(),
                     unreleased,
                 )
             raise
@@ -799,6 +806,9 @@ def step(
         # failure record. See `_release_after_failure`.
         unreleased: Optional[Dict[str, Any]] = None
         started = time.monotonic()
+        # When the step failed, before releasing its lease and stopping its
+        # heartbeat, which a replayed cancellation must not count.
+        failed_at: Optional[float] = None
         try:
             if seq in ctx.replayed_steps:
                 return _replay(ctx, seq, actual_tool_name)
@@ -906,9 +916,10 @@ def step(
                 )
                 return result
             except BaseException as e:
+                failed_at = time.monotonic()
                 # Cancellation too: a lease left held would refuse the step that
                 # takes this position next until it lapsed.
-                if fencing_token > 0:
+                if fencing_token > 0 and hb is not None:
                     unreleased = _release_after_failure(
                         ctx, agent_id, ikey, fencing_token, actual_tool_name, hb
                     )
@@ -926,7 +937,8 @@ def step(
                     call_coordination,
                     agent_id,
                     ikey,
-                    time.monotonic() - started,
+                    started,
+                    failed_at or time.monotonic(),
                     unreleased,
                 )
             raise

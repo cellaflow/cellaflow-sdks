@@ -215,7 +215,15 @@ export class WorkflowContext {
   ): void {
     // As for a hit: a run that does not know everything the session holds (a
     // resumed `durableTools` session) would record at a position already filled.
-    if (!(this.historyKnown && this.inFlight === 1 && this.sequence === sequence)) return;
+    if (!this.historyKnown) return;
+    if (!(this.inFlight === 1 && this.sequence === sequence)) {
+      // It overlapped another call, so its position stays empty, and the run
+      // stops recording, as for a hit: a later failure held above that empty
+      // position would be written out of order, and the call after it would
+      // claim a position the engine refuses after its side effect ran.
+      this.historyKnown = false;
+      return;
+    }
     // Counted from now: the call's heartbeat has stopped, so no renewal can
     // extend the lease past this.
     const lease = unreleased && { ...unreleased, lapsesAt: Date.now() + unreleased.lapsesInMs };
@@ -392,25 +400,9 @@ export class WorkflowContext {
       pending.kind === "failure"
         ? failureIdempotencyKey(this.sessionId, pending.sequence, pending.name, pending.receivedKey)
         : recordIdempotencyKey(this.sessionId, pending.sequence, pending.receivedKey);
-    const unreleased = pending.unreleased;
-    if (unreleased) {
-      // The failed call's own lease still claims this position, so the engine
-      // would refuse the record. Try the release again first.
-      try {
-        await this.client.releaseLease(
-          unreleased.agentId,
-          unreleased.key,
-          unreleased.token,
-          "TOOL_ERROR",
-        );
-        pending.unreleased = undefined;
-      } catch (err) {
-        // Already released or lapsed: nothing is left to free.
-        if (!isRetryable(err)) pending.unreleased = undefined;
-      }
-    }
     let token = 0;
     for (;;) {
+      await this.retryRelease(pending);
       let resp;
       try {
         resp = await this.client.checkIdempotencyCache(
@@ -471,6 +463,28 @@ export class WorkflowContext {
         // error that caused it.
       });
       throw err;
+    }
+  }
+
+  /**
+   * Tries again to release a failed call's lease that still claims the record's
+   * position, before each attempt to lease the record: the engine may be back
+   * well before the lease lapses.
+   */
+  private async retryRelease(pending: PendingHit): Promise<void> {
+    const unreleased = pending.unreleased;
+    if (!unreleased) return;
+    try {
+      await this.client.releaseLease(
+        unreleased.agentId,
+        unreleased.key,
+        unreleased.token,
+        "TOOL_ERROR",
+      );
+      pending.unreleased = undefined;
+    } catch (err) {
+      // Already released or lapsed: nothing is left to free.
+      if (!isRetryable(err)) pending.unreleased = undefined;
     }
   }
 

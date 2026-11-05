@@ -56,6 +56,23 @@ class _RecordHeld(Exception):
 #: kept for the next step to retry; any other failure drops it. INTERNAL is how
 #: the engine reports a failed storage write, which it does not retry itself, and
 #: CANCELLED is the call being abandoned rather than refused.
+#: Threads writing the last failure record of a workflow that has returned.
+#: See `WorkflowContext._record_in_background`.
+_writers: "set[threading.Thread]" = set()
+_writers_lock = threading.Lock()
+
+
+def wait_for_record_writes(timeout: Optional[float] = None) -> None:
+    """Waits for failure records still being written for workflows that have
+    returned. They are written in the background so a workflow's result never
+    waits on them, and the process waits for them before it exits; call this
+    to be sure of them sooner, as a test does before reading the history."""
+    with _writers_lock:
+        writers = list(_writers)
+    for writer in writers:
+        writer.join(timeout)
+
+
 _RETRYABLE_CODES = frozenset(
     {
         grpc.StatusCode.UNAVAILABLE,
@@ -195,23 +212,31 @@ class WorkflowContext:
         """Writes a pending record, or says how long to wait before trying again."""
         self._prepare_pending()
         with self._lock:
-            try:
-                self.reconcile_sequence()
-            except _RecordHeld as held:
-                return held.retry_after_s
-            return 0.0
+            return self._reconcile_or_wait()
 
     def _try_claim(self) -> Tuple[Optional[int], float]:
-        """One attempt to claim a position: the position, or how long to wait."""
+        """One attempt to claim a position: the position, or how long to wait.
+
+        Settling the pending record and claiming are one locked step, so no
+        other call can hold a new record in between.
+        """
         self._prepare_pending()
         with self._lock:
-            try:
-                self.reconcile_sequence()
-            except _RecordHeld as held:
-                return None, held.retry_after_s
+            wait = self._reconcile_or_wait()
+            if wait:
+                return None, wait
             self.sequence += 1
             self._in_flight += 1
             return self.sequence, 0.0
+
+    def _reconcile_or_wait(self) -> float:
+        """`reconcile_sequence`, or how long a held record says to wait. Under
+        the lock."""
+        try:
+            self.reconcile_sequence()
+        except _RecordHeld as held:
+            return held.retry_after_s
+        return 0.0
 
     def end_call(self) -> None:
         """Marks a step claimed by `begin_call` as returned."""
@@ -434,12 +459,19 @@ class WorkflowContext:
         and no later position was claimed meanwhile, and only in a run that knows
         everything the session holds (not a resumed `durable_tools` thread, which
         would record at a position the session already filled).
+
+        A failure that overlapped another call is not recorded, so its position
+        stays empty, and the run stops recording, as it does for a hit: a later
+        failure held above that empty position would be written out of order,
+        and the step after it would claim a position the engine then refuses
+        after its side effect ran.
         """
-        return (
-            self.history_known
-            and self._in_flight == 1
-            and self.sequence == sequence
-        )
+        if not self.history_known:
+            return False
+        if self._in_flight == 1 and self.sequence == sequence:
+            return True
+        self.history_known = False
+        return False
 
     def _prepare_pending(self) -> None:
         """Warns about what a resume could not reproduce of a held failure.
@@ -598,15 +630,34 @@ class WorkflowContext:
         Called when a workflow returns normally. A failure followed by a later
         step is recorded when that step starts; this covers one followed by none.
         """
-        self._try_record_failure()
+        self._record_in_background()
 
     async def record_pending_failure_async(self) -> None:
-        """`record_pending_failure` for an async workflow, written on a worker
-        thread so the event loop is not stalled."""
-        await asyncio.to_thread(self._try_record_failure)
+        """`record_pending_failure` for an async workflow."""
+        self._record_in_background()
+
+    def _record_in_background(self) -> None:
+        """Writes the last failure record without making the workflow wait.
+
+        The workflow has already produced its result, so recording must neither
+        delay nor replace it: a caller with a timeout would otherwise lose a
+        finished run to bookkeeping. The write runs on its own thread, which
+        the process waits for before exiting, and nothing is started when no
+        failure is pending. See `wait_for_record_writes`.
+        """
+        pending = self._pending_hit
+        if pending is None or pending.get("kind") != "failure":
+            return
+        writer = threading.Thread(
+            target=self._try_record_failure, name="cellaflow-record", daemon=False
+        )
+        with _writers_lock:
+            _writers.add(writer)
+        writer.start()
 
     def _try_record_failure(self) -> None:
-        """One attempt, and no waiting.
+        """One attempt, and no waiting. On its own thread; see
+        `_record_in_background`.
 
         The workflow has already produced its result, so recording it must not
         delay or replace that result: a caller with a timeout would otherwise
@@ -615,29 +666,33 @@ class WorkflowContext:
         with a warning, and a resume runs the step again, as before failures
         were recorded.
         """
-        self._prepare_pending()
-        with self._lock:
-            pending = self._pending_hit
-            if pending is None or pending.get("kind") != "failure":
-                return
-            try:
-                self.reconcile_sequence()
-                return
-            except _RecordHeld:
-                reason = "a lease still holds its position"
-            except Exception as exc:
-                reason = f"{type(exc).__name__}: {exc}"
-            if self._pending_hit is pending:
-                self._pending_hit = None
-            logger.warning(
-                "Cellaflow: the failure of %r at position %d of session %s was not "
-                "recorded (%s). The workflow's result stands; a resume of this "
-                "session runs that step again.",
-                pending["name"],
-                pending["sequence"],
-                self.session_id,
-                reason,
-            )
+        try:
+            self._prepare_pending()
+            with self._lock:
+                pending = self._pending_hit
+                if pending is None or pending.get("kind") != "failure":
+                    return
+                try:
+                    self.reconcile_sequence()
+                    return
+                except _RecordHeld:
+                    reason = "a lease still holds its position"
+                except Exception as exc:
+                    reason = f"{type(exc).__name__}: {exc}"
+                if self._pending_hit is pending:
+                    self._pending_hit = None
+                logger.warning(
+                    "Cellaflow: the failure of %r at position %d of session %s was "
+                    "not recorded (%s). The workflow's result stands; a resume of "
+                    "this session runs that step again.",
+                    pending["name"],
+                    pending["sequence"],
+                    self.session_id,
+                    reason,
+                )
+        finally:
+            with _writers_lock:
+                _writers.discard(threading.current_thread())
 
     def reconcile_sequence(self) -> None:
         """Records a deferred hit, then adopts the position the engine reported.

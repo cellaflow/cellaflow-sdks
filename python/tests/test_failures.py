@@ -2059,3 +2059,121 @@ def test_a_release_retried_by_the_record_is_timed_from_the_heartbeat_stopping(
     held = ctx._pending_hit
     assert held is not None and held["unreleased"]["lapses_at"] >= before + 21.0
     assert "lapses_at" not in lease  # the caller's copy is left alone
+
+
+@pytest.mark.background_records
+def test_a_workflows_result_does_not_wait_for_its_last_record(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The record is written on its own thread, after the result is returned,
+    and `wait_for_record_writes` waits for it."""
+    import threading
+    import time
+
+    from cellaflow.context import wait_for_record_writes
+
+    _fresh(mock_stub, "sess-background")
+    answer = mock_stub.CommitStep.side_effect
+    writing = threading.Event()
+
+    def slow_commit(req: Any, **kwargs: Any) -> Any:
+        if req.step_result.status == FAILED:
+            writing.set()
+            time.sleep(0.5)
+        return answer(req, **kwargs)
+
+    mock_stub.CommitStep.side_effect = slow_commit
+    started = time.monotonic()
+    assert _caught_then_returns(PaymentDeclined("no funds"))() == "done"
+    assert time.monotonic() - started < 0.4
+    assert writing.wait(timeout=2)
+    wait_for_record_writes()
+    assert _commits(mock_stub) == [(1, "charge", FAILED)]
+
+
+@pytest.mark.background_records
+def test_a_workflow_with_nothing_to_record_starts_no_writer(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    import threading
+
+    _fresh(mock_stub, "sess-nothing")
+
+    @step
+    def charge() -> str:
+        return "charged"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        return charge()  # type: ignore[no-any-return]
+
+    before = {t.name for t in threading.enumerate()}
+    assert wf() == "charged"
+    assert "cellaflow-record" not in {t.name for t in threading.enumerate()} - before
+
+
+def test_steps_failing_together_stop_recording_rather_than_skip_a_position(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The first failure overlaps the other step, so it is not recorded and its
+    position stays empty. The second must not be recorded above that gap: the
+    run stops recording, as for a hit, and later failures are not held."""
+    _fresh(mock_stub, "sess-gather")
+
+    @step
+    async def a() -> str:
+        raise PaymentDeclined("a")
+
+    @step
+    async def b() -> str:
+        await asyncio.sleep(0.05)
+        raise PaymentDeclined("b")
+
+    @workflow(version="1.0.0")
+    async def wf() -> bool:
+        await asyncio.gather(a(), b(), return_exceptions=True)
+        from cellaflow.context import get_context
+
+        ctx = get_context()
+        return bool(ctx.history_known or ctx._pending_hit is not None)
+
+    run_wf: Any = wf
+    assert asyncio.run(run_wf()) is False
+    assert not any(status == FAILED for _, _, status in _commits(mock_stub))
+
+
+def test_a_cancellation_records_how_long_the_step_ran_not_its_cleanup(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The release after a failure can be slow; it is not part of how long the
+    step ran before it was cancelled, which a replay waits to reproduce."""
+    import time
+
+    _fresh(mock_stub, "sess-slow-release")
+
+    def slow_release(req: Any, **kwargs: Any) -> Any:
+        time.sleep(0.4)
+        return idempotency_pb2.ReleaseLeaseResponse()
+
+    mock_stub.ReleaseLease.side_effect = slow_release
+
+    @step
+    async def charge() -> str:
+        await asyncio.sleep(5)
+        return "charged"
+
+    @step
+    async def fallback() -> str:
+        return "fallback"
+
+    @workflow(version="1.0.0")
+    async def wf() -> str:
+        try:
+            return await asyncio.wait_for(charge(), 0.1)
+        except asyncio.TimeoutError:
+            return await fallback()  # type: ignore[no-any-return]
+
+    assert asyncio.run(wf()) == "fallback"
+    first = mock_stub.CommitStep.call_args_list[0][0][0]
+    record = deserialize(first.step_result.output_payload)["cancelled"]
+    assert record["elapsed_s"] < 0.3
