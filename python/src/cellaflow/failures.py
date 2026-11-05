@@ -219,6 +219,12 @@ def findable(cls: type) -> bool:
     return _resolve(type_location(cls)) is cls
 
 
+def loaded_modules() -> "frozenset[str]":
+    """The names of the modules loaded now. `copy` takes them in one step, so an
+    import on another thread cannot change the dict while it is read."""
+    return frozenset(sys.modules.copy())
+
+
 #: Bounds on a recorded failure, so a record always fits in a commit. A value over
 #: `_MAX_VALUE_BYTES` is not recorded (reading it on replay raises), the traceback
 #: keeps its last `_MAX_TRACEBACK_CHARS`, and a record still over
@@ -561,6 +567,18 @@ def _rebuild(recorded: Any, where: str) -> BaseException:
 
     location = recorded["type"]
     cls = _resolve(location)
+    module_name = location.partition(":")[0]
+    if cls is None and module_name not in sys.modules and module_name != "__main__":
+        # Usually a library imported inside the step that raised it: the step's
+        # body does not run on a resume, so neither does its import.
+        raise ReplayedFailureError(
+            f"Cannot replay {where}: its exception type {location} is in module "
+            f"{module_name}, which this process has not imported. A resume does "
+            f"not run a step's body, so an import inside the step does not happen. "
+            f"Add `import {module_name}` where the workflow is defined, then "
+            f"resume this session again: nothing has run twice, and it resumes "
+            f"from here."
+        )
     if not (isinstance(cls, type) and issubclass(cls, BaseException)):
         raise ReplayedFailureError(
             f"Cannot replay {where}: its exception type {location} is not defined "

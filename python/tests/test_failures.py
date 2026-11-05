@@ -507,7 +507,7 @@ def test_a_location_that_is_not_an_exception_class_is_refused() -> None:
 
     with pytest.raises(ReplayedFailureError, match="not defined in any module"):
         rebuild({"type": "os:path", "args": []}, "step", 4)
-    with pytest.raises(ReplayedFailureError, match="not defined in any module"):
+    with pytest.raises(ReplayedFailureError, match="has not imported"):
         rebuild({"type": "no.such.module:Thing", "args": []}, "step", 4)
 
 
@@ -551,7 +551,7 @@ def test_replay_never_imports_a_module(tmp_path: Any, monkeypatch: Any) -> None:
     monkeypatch.syspath_prepend(str(tmp_path))
     import builtins
 
-    with pytest.raises(ReplayedFailureError, match="not defined in any module"):
+    with pytest.raises(ReplayedFailureError, match="has not imported"):
         rebuild({"type": "side_effect_on_import:Boom", "args": []}, "step", 1)
     assert not hasattr(builtins, "CELLAFLOW_IMPORTED")
 
@@ -1683,3 +1683,94 @@ def test_an_async_workflow_writes_failure_records_off_the_event_loop(
     assert asyncio.run(wf()) == "done"
     # Each failure record off the loop: at the next step, and after the return.
     assert threads == [("charge", False), ("notify", True), ("charge", False)]
+
+
+def _lazy_module(name: str) -> Any:
+    """A module created the way `import` inside a step loads a library: during
+    the run, after the workflow started."""
+    import types
+
+    module = types.ModuleType(name)
+    exec("class LazyError(Exception):\n    pass\n", module.__dict__)
+    module.LazyError.__module__ = name
+    sys.modules[name] = module
+    return module
+
+
+def test_an_exception_from_a_module_a_step_imported_is_warned_about(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
+) -> None:
+    """A resume does not run the step, so it does not run its import either.
+    The run says so while it can still be fixed."""
+    _fresh(mock_stub, "sess-lazy")
+
+    @step
+    def charge() -> str:
+        lazy = _lazy_module("lazy_payments")
+        raise lazy.LazyError("card declined")
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            charge()
+        except Exception:
+            return "fallback"
+        return "charged"
+
+    try:
+        with caplog.at_level("WARNING", logger="cellaflow.context"):
+            assert wf() == "fallback"
+    finally:
+        sys.modules.pop("lazy_payments", None)
+    assert "first imported during this run" in caplog.text
+    assert "Add `import lazy_payments` where the workflow is defined" in caplog.text
+
+
+def test_a_module_loaded_before_the_run_is_not_warned_about(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
+) -> None:
+    _fresh(mock_stub, "sess-eager")
+    lazy = _lazy_module("eager_payments")
+
+    @step
+    def charge() -> str:
+        raise lazy.LazyError("card declined")
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            charge()
+        except Exception:
+            return "fallback"
+        return "charged"
+
+    try:
+        with caplog.at_level("WARNING", logger="cellaflow.context"):
+            assert wf() == "fallback"
+    finally:
+        sys.modules.pop("eager_payments", None)
+    assert "first imported during this run" not in caplog.text
+
+
+def test_a_resume_names_the_import_a_missing_module_needs() -> None:
+    """Nothing is imported on replay, so the refusal says which import to add.
+    Once it is there, the same session resumes."""
+    from cellaflow.failures import ReplayedFailureError, rebuild
+
+    lazy = _lazy_module("unloaded_payments")
+    try:
+        recorded = capture(lazy.LazyError("card declined"))
+    finally:
+        sys.modules.pop("unloaded_payments", None)
+    with pytest.raises(ReplayedFailureError) as refused:
+        rebuild(recorded, "charge", 1)
+    assert "Add `import unloaded_payments` where the workflow is defined" in str(
+        refused.value
+    )
+    assert "resumes from here" in str(refused.value)
+
+    _lazy_module("unloaded_payments")
+    try:
+        assert str(rebuild(recorded, "charge", 1)) == "card declined"
+    finally:
+        sys.modules.pop("unloaded_payments", None)

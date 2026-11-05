@@ -17,7 +17,10 @@ All notable changes to the CellaFlow Python SDK.
   imported, and the class's own `__new__` and `__init__` are not called. A class that only
   compiled code in an extension module can construct, such as pydantic's `ValidationError`, cannot
   be rebuilt that way, so its resume is refused. Its class must be defined
-  at module level in a module the workflow imports, as it is when an `except` clause names it.
+  at module level in a module the workflow imports, as it is when an `except` clause names it. A
+  library the step imports inside its own body is not imported on resume, since the step does not
+  run; the run warns when such a class is recorded, and a resume that cannot find it names the
+  import to add, after which the same session resumes.
   Otherwise the resume stops with `FailureNotReplayableError` rather than run the step again.
   The original run logs a warning when the failure is recorded if the class cannot be found by name,
   is defined in `__main__`, or has values that cannot be recorded, such as an HTTP response

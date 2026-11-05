@@ -18,7 +18,9 @@ from cellaflow.failures import (
     capture,
     findable,
     incomplete_group,
+    loaded_modules,
     rebuild,
+    type_location,
     unrecorded,
 )
 from cellaflow.idempotency import failure_idempotency_key, record_idempotency_key
@@ -103,6 +105,12 @@ class WorkflowContext:
     # whatever cancelled it to do so again. See `decorators._replay_cancellation`.
     run_started: float = field(
         default_factory=time.monotonic, repr=False, compare=False
+    )
+    # The modules loaded when this run started. A failure whose class comes from
+    # a module loaded later was most likely imported by a step, and a resume
+    # does not run steps, so the run warns. See `_warn_if_not_replayable`.
+    _modules_at_start: "frozenset[str]" = field(
+        default_factory=loaded_modules, repr=False, compare=False
     )
     # Leases of failed steps that could not be released, by position, with when
     # each lapses on its own. A failure record at that position waits for it.
@@ -435,6 +443,20 @@ class WorkflowContext:
                 sequence,
             )
             return
+        module = type_location(cls).partition(":")[0]
+        if module not in self._modules_at_start and module != "__main__":
+            logger.warning(
+                "Cellaflow: %s raised by %r at position %d comes from module %s, "
+                "which was first imported during this run, most likely by a step. "
+                "A resume does not run steps, so it may not be imported then, and "
+                "the resume would refuse at this position. Add `import %s` where "
+                "the workflow is defined.",
+                cls.__qualname__,
+                name,
+                sequence,
+                module,
+                module,
+            )
         if cls.__module__ == "__main__":
             logger.warning(
                 "Cellaflow: %s raised by %r is defined in the script being run "

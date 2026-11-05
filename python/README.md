@@ -452,7 +452,7 @@ A step that raised, or was cancelled, and that the workflow carried on past, is 
 - **Exception groups** keep every member's type and message, so `except*` matches the same members. A group with more than 2,000 members, or too large to record even member by member, cannot be replayed: the SDK warns when it happens, and a resume stops at that position.
 - **A cancellation** is replayed by waiting to be cancelled again, because what the workflow saw depended on what cancelled it: `asyncio.wait_for` turns its own cancellation into `TimeoutError`, `task.cancel()` arrives as `CancelledError`. If nothing cancels the step within twice the time it ran the first time (and, for a timeout around several steps, until the run is as far in as it was, up to two minutes more), the replay raises `CancelledError` itself.
 
-Define the exceptions a step raises at module level, in a module the workflow imports. A class defined inside a function, or only in the script being run, cannot be found by a resumed process. The SDK warns about both when the failure happens.
+Define the exceptions a step raises at module level, in a module the workflow imports. A class defined inside a function, or only in the script being run, cannot be found by a resumed process. Nor can one from a library the step imports inside its own body (`import stripe` inside the tool): a resume does not run the step, so it does not run that import, and the SDK never imports anything itself on replay. Import such libraries where the workflow is defined. The SDK warns about all three when the failure is recorded.
 
 #### When a resume cannot go on
 
@@ -477,15 +477,16 @@ ran twice. To go on, start a new session for this work.
 
 ```
 FailureNotReplayableError: Cannot replay the failure of 'charge' at position 2:
-its exception type billing.errors:PaymentDeclined is not defined in any module
-this process has loaded. Define the exceptions a step raises at module level, in
-a module the workflow imports, and keep them there while runs that raised them
-may still resume.
+its exception type stripe._error:CardError is in module stripe._error, which this
+process has not imported. A resume does not run a step's body, so an import
+inside the step does not happen. Add `import stripe._error` where the workflow is
+defined, then resume this session again: nothing has run twice, and it resumes
+from here.
 ```
 
-Other causes: the failure was recorded by the TypeScript SDK, the exception group was too large to record, or the step was cancelled as an async step and is now synchronous.
+That one is fixed by the import it names, and the same session then resumes. Other causes need a new session: the exception's class is defined inside a function or was renamed, the class can only be built by an extension module's compiled code (pydantic's `ValidationError`), the failure was recorded by the TypeScript SDK, the exception group was too large to record, or the step was cancelled as an async step and is now synchronous.
 
-In every case nothing ran twice, and the session's history is unchanged. To go on, start a new session for the work.
+In every case nothing ran twice, and the session's history is unchanged.
 
 A related error, `Cannot verify replay at sequence N: the recorded step has no name`, raised as `NondeterministicWorkflowError` itself, means the history was not written by this SDK. Every step it commits records a name, so a nameless record cannot be checked and is refused rather than replayed positionally.
 
