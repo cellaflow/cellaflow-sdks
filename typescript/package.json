@@ -24,7 +24,8 @@
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build",
-    "test": "tsc && node --test tests/*.test.mjs"
+    "test": "tsc && node --test tests/*.test.mjs",
+    "test:integration": "tsc && node --test tests/integration/*.test.mjs"
   },
   "keywords": [
     "cellaflow",
