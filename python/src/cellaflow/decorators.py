@@ -220,6 +220,9 @@ class FailureNotReplayableError(NondeterministicWorkflowError):
 #: that whatever cancelled it then (a `wait_for` timer) does so again first.
 _CANCEL_WAIT_FACTOR = 2.0
 _CANCEL_WAIT_EXTRA_S = 0.25
+#: How long a lease lasts when there is no heartbeat to say: four of the
+#: engine's default 5-second heartbeat intervals.
+_DEFAULT_LEASE_TTL_MS = 20_000
 #: The most a replay waits, for a timeout around several steps, beyond what the
 #: step's own run time calls for. Earlier steps replay instantly, so that timeout
 #: fires later than it did; a wait without a bound would hold a resumed run for
@@ -371,7 +374,13 @@ async def _replay_async(ctx: WorkflowContext, seq: int, expected_name: str) -> A
 
 
 def _release_after_failure(
-    ctx: WorkflowContext, agent_id: str, ikey: str, fencing_token: int, name: str
+    ctx: WorkflowContext,
+    agent_id: str,
+    ikey: str,
+    fencing_token: int,
+    name: str,
+    seq: int,
+    hb: Optional[LeaseHeartbeat],
 ) -> None:
     """Releases the lease of a step that failed or was cancelled, so the step
     that takes this position next is not refused until it lapses."""
@@ -391,6 +400,8 @@ def _release_after_failure(
             name,
             exc_info=True,
         )
+        lapses_in_s = (hb.lease_ttl_ms if hb else _DEFAULT_LEASE_TTL_MS) / 1000.0
+        ctx.note_unreleased(seq, agent_id, ikey, fencing_token, lapses_in_s + 1.0)
 
 
 def _note_failure(
@@ -684,7 +695,7 @@ def step(
                 # takes this position next until it lapsed.
                 if fencing_token > 0:
                     _release_after_failure(
-                        ctx, agent_id, ikey, fencing_token, actual_tool_name
+                        ctx, agent_id, ikey, fencing_token, actual_tool_name, seq, hb
                     )
                 raise e
             finally:
@@ -842,7 +853,7 @@ def step(
                 # takes this position next until it lapsed.
                 if fencing_token > 0:
                     _release_after_failure(
-                        ctx, agent_id, ikey, fencing_token, actual_tool_name
+                        ctx, agent_id, ikey, fencing_token, actual_tool_name, seq, hb
                     )
                 raise e
             finally:

@@ -45,6 +45,9 @@ FAILURE_FORMAT = 1
 
 #: Marks a recorded tuple, which MessagePack would otherwise turn into a list.
 _TUPLE = "__cellaflow_tuple__"
+#: Wraps a recorded dict whose only key is one of these markers, so it comes
+#: back as that dict rather than as what the marker stands for.
+_DICT = "__cellaflow_dict__"
 
 
 class UnavailableOnReplay:
@@ -54,10 +57,25 @@ class UnavailableOnReplay:
     converting it, iterating, calling. The exception carrying it keeps its exact
     class, and no code of that class runs to make room for it. Only an identity
     check (`value is None`) passes silently, and reads as "not None".
+
+    Printing it gives what the value printed as when it was recorded, when that
+    was recorded: an exception's message is made from its arguments (their
+    `str` for one, their `repr` for several), so `str(e)` and
+    `f"failed: {e}"` read as they did the first time.
     """
 
-    def __init__(self, what: str) -> None:
+    def __init__(
+        self, what: str, text: Optional[str] = None, repr_text: Optional[str] = None
+    ) -> None:
         object.__setattr__(self, "_what", what)
+        object.__setattr__(self, "_text", text)
+        object.__setattr__(self, "_repr_text", repr_text)
+
+    def __str__(self) -> str:
+        text = object.__getattribute__(self, "_text")
+        if text is None:
+            return self._unavailable()  # type: ignore[no-any-return]
+        return text  # type: ignore[no-any-return]
 
     def _unavailable(self, *args: Any, **kwargs: Any) -> Any:
         raise AttributeError(
@@ -66,6 +84,9 @@ class UnavailableOnReplay:
         )
 
     def __repr__(self) -> str:
+        repr_text = object.__getattribute__(self, "_repr_text")
+        if repr_text is not None:
+            return repr_text  # type: ignore[no-any-return]
         what = object.__getattribute__(self, "_what")
         return f"<{what}: not recorded, so not available on replay>"
 
@@ -79,7 +100,6 @@ class UnavailableOnReplay:
     __lt__ = _unavailable
     __gt__ = _unavailable
     __hash__ = _unavailable
-    __str__ = _unavailable
     __int__ = _unavailable
     __float__ = _unavailable
     __index__ = _unavailable
@@ -156,6 +176,8 @@ def _encode(value: Any) -> Tuple[bool, Any]:
             if not (ok_key and ok) or not isinstance(encoded_key, (str, int)):
                 return False, None
             out[encoded_key] = encoded
+        if set(out) in ({_TUPLE}, {_DICT}):
+            return True, {_DICT: out}
         return True, out
     return False, None
 
@@ -166,6 +188,8 @@ def _decode(value: Any) -> Any:
     if isinstance(value, dict):
         if set(value) == {_TUPLE}:
             return tuple(_decode(item) for item in value[_TUPLE])
+        if set(value) == {_DICT}:
+            return {key: _decode(item) for key, item in value[_DICT].items()}
         return {key: _decode(item) for key, item in value.items()}
     return value
 
@@ -226,6 +250,22 @@ def _safe_encode(value: Any) -> Tuple[bool, Any]:
         return _encode(value)
     except RecursionError:
         return False, None
+
+
+#: The longest text kept for a value that could not be recorded.
+_MAX_TEXT_CHARS = 1024
+
+
+def _texts(value: Any) -> List[str]:
+    """How `value` printed, as `str` and `repr`, for its placeholder on replay.
+    Never raises."""
+    texts = []
+    for convert in (str, repr):
+        try:
+            texts.append(convert(value)[:_MAX_TEXT_CHARS])
+        except Exception:
+            texts.append(f"<{type(value).__name__}: {convert.__name__}() raised>")
+    return texts
 
 
 def _small_enough(encoded: Any) -> bool:
@@ -319,6 +359,7 @@ def _capture(exc: BaseException, depth: int) -> Dict[str, Any]:
 
     args: List[Any] = []
     unavailable_args: List[int] = []
+    arg_texts: Dict[str, List[str]] = {}
     if "group" not in recorded:
         for i, arg in enumerate(exc.args):
             ok, encoded = _safe_encode(arg)
@@ -326,6 +367,7 @@ def _capture(exc: BaseException, depth: int) -> Dict[str, Any]:
             args.append(encoded if ok else None)
             if not ok:
                 unavailable_args.append(i)
+                arg_texts[str(i)] = _texts(arg)
 
     fields = {**_builtin_fields(exc), **dict(vars(exc))}
     if "group" in recorded:
@@ -345,6 +387,7 @@ def _capture(exc: BaseException, depth: int) -> Dict[str, Any]:
     recorded.update(
         args=args,
         unavailable_args=unavailable_args,
+        unavailable_arg_texts=arg_texts,
         attrs=attrs,
         unavailable_attrs=unavailable_attrs,
     )
@@ -357,6 +400,8 @@ def _capture(exc: BaseException, depth: int) -> Dict[str, Any]:
         recorded.update(
             args=[None] * len(exc.args),
             unavailable_args=list(range(len(exc.args))),
+            # A single argument is what the message was made from.
+            unavailable_arg_texts={"0": [message]} if len(exc.args) == 1 else {},
             attrs={},
             unavailable_attrs=sorted(n for n in fields if not n.startswith("__")),
         )
@@ -443,7 +488,13 @@ def _group(exc: Any, depth: int, full: bool) -> Dict[str, Any]:
 
 
 def _builtin_new(cls: type) -> Any:
-    """The nearest `__new__` in `cls`'s hierarchy that Python itself defines."""
+    """The nearest `__new__` in `cls`'s hierarchy, if Python itself defines it.
+
+    A `__new__` written in Python is skipped: it is the class's own code, and
+    never runs on replay. One compiled into an extension module (pydantic's
+    `ValidationError`, say) is third-party code too, and Python will not let it
+    be skipped, so such a class cannot be rebuilt and is refused.
+    """
     for klass in cls.__mro__:
         new = klass.__dict__.get("__new__")
         if new is None:
@@ -452,8 +503,17 @@ def _builtin_new(cls: type) -> Any:
             new = new.__func__
         if isinstance(new, types.FunctionType):
             continue  # defined in Python by the class: never run on replay
+        if klass.__module__ != "builtins":
+            raise _ExtensionClass(
+                f"{klass.__module__}.{klass.__qualname__} is built by compiled "
+                f"code in an extension module, which a replay does not run"
+            )
         return new
     return BaseException.__new__
+
+
+class _ExtensionClass(Exception):
+    """A class that only an extension module's own code can construct."""
 
 
 def rebuild(recorded: Any, step_name: str, sequence: int) -> BaseException:
@@ -523,18 +583,30 @@ def _rebuild(recorded: Any, where: str) -> BaseException:
         args: List[Any] = [group.get("message", ""), members]
     else:
         args = [_decode(arg) for arg in recorded.get("args", [])]
+        texts = recorded.get("unavailable_arg_texts") or {}
         for i in recorded.get("unavailable_args", []):
-            args[i] = UnavailableOnReplay(f"argument {i} of {cls.__name__}")
+            printed = list(texts.get(str(i)) or []) + [None, None]
+            args[i] = UnavailableOnReplay(
+                f"argument {i} of {cls.__name__}", printed[0], printed[1]
+            )
     unavailable = list(recorded.get("unavailable_attrs", []))
 
     try:
         exc: BaseException = _builtin_new(cls)(cls, *args)
         init = inspect.getattr_static(cls, "__init__")
-        if isinstance(init, types.WrapperDescriptorType):
+        if (
+            isinstance(init, types.WrapperDescriptorType)
+            and init.__objclass__.__module__ == "builtins"
+        ):
             # Python's own __init__, which only stores fields from the arguments,
             # such as a UnicodeError's positions. The class defines none of its
             # own, so this is all its construction ever did.
             cls.__init__(exc, *args)
+    except _ExtensionClass as error:
+        raise ReplayedFailureError(
+            f"Cannot replay {where}: {error}. Catch it inside the step and raise "
+            f"an exception of your own instead."
+        ) from None
     except Exception as error:
         raise ReplayedFailureError(
             f"Cannot replay {where}: {location} could not be recreated ({error})."

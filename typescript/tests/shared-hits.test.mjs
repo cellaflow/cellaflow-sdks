@@ -596,6 +596,63 @@ test("a thrown value that cannot be inspected still reaches the caller", async (
   assert.match(error.message, /could not be converted/);
 });
 
+test("a failure is not recorded by a session whose history the run did not read", async () => {
+  // A resumed durableTools session counts positions from 0, so it would record
+  // at a position the session already filled.
+  const client = scriptedClient([acquired(), acquired()]);
+  const charge = tool(async () => { throw new Error("boom"); }, { toolName: "charge" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client, false), async () => {
+    await assert.rejects(charge(), /boom/);
+    await notify();
+  });
+  assert.deepEqual(client.recordLeases, []);
+});
+
+test("a release that failed is tried again before the failure is recorded", async () => {
+  const client = scriptedClient([acquired(), acquired()]);
+  const releaseOnce = client.releaseLease;
+  let releaseFailures = 1;
+  client.releaseLease = async (...args) => {
+    if (releaseFailures-- > 0) throw Object.assign(new Error("engine unavailable"), { code: 14 });
+    return releaseOnce(...args);
+  };
+  const charge = tool(async () => { throw new Error("boom"); }, { toolName: "charge" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), /boom/);
+    assert.equal(await notify(), "notified");
+  });
+  assert.equal(client.releases.length, 1);
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [[1, "charge"], [2, "notify"]],
+  );
+});
+
+test("a failure record waits for an unreleased lease to lapse", async () => {
+  let refusals = 1;
+  const client = scriptedClient([acquired(), acquired()], {
+    recordLease: () => {
+      if (refusals-- > 0) throw Object.assign(new Error("position claimed"), { code: 9 });
+      return { status: CacheStatus.ACQUIRED, fencingToken: 99n, heartbeatIntervalMs: 60_000n };
+    },
+  });
+  client.releaseLease = async () => {
+    throw Object.assign(new Error("engine unavailable"), { code: 14 });
+  };
+  const charge = tool(async () => { throw new Error("boom"); }, { toolName: "charge" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), /boom/);
+    assert.equal(await notify(), "notified");
+  });
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [[1, "charge"], [2, "notify"]],
+  );
+});
+
 test("a failure nothing follows records nothing", async () => {
   const client = scriptedClient([acquired()]);
   const charge = tool(async () => { throw new Error("boom"); }, { toolName: "charge" });

@@ -14,13 +14,18 @@ All notable changes to the CellaFlow Python SDK.
   The exception comes back as an instance of its own class, with its arguments and attributes, so
   `except` clauses and `isinstance` checks behave as they did. Rebuilding it runs no code the
   record can choose: the class is looked up only among modules already loaded, nothing is
-  imported, and the class's own `__new__` and `__init__` are not called. Its class must be defined
+  imported, and the class's own `__new__` and `__init__` are not called. A class that only
+  compiled code in an extension module can construct, such as pydantic's `ValidationError`, cannot
+  be rebuilt that way, so its resume is refused. Its class must be defined
   at module level in a module the workflow imports, as it is when an `except` clause names it.
   Otherwise the resume stops with `FailureNotReplayableError` rather than run the step again.
   The original run logs a warning when the failure is recorded if the class cannot be found by name,
   is defined in `__main__`, or has values that cannot be recorded, such as an HTTP response
   object; each comes back as a placeholder, and using it raises `AttributeError` (Python's
-  `AttributeError.obj` is replayed the same way, without a warning). These warnings come when the
+  `AttributeError.obj` is replayed the same way, without a warning). A placeholder prints as the
+  value did, so an exception whose argument was not recorded keeps its message. The run also
+  warns about anything else a resume would refuse, because the record is rebuilt once as a resume
+  would rebuild it. These warnings come when the
   failure is recorded, so a failure the workflow lets propagate says nothing. Tuples,
   enums and subclasses of plain types are recorded, the last two as their plain value, as are the
   fields Python keeps outside `args` (`OSError.errno`, `ImportError.name` and the like). An
@@ -33,7 +38,13 @@ All notable changes to the CellaFlow Python SDK.
   released after it.
 
   A failure the workflow lets propagate is not recorded, so resuming retries the step. A failure
-  while another step of the session is in flight is not recorded either.
+  while another step of the session is in flight is not recorded either, nor one in a run that has
+  not read the session's history (a resumed `durable_tools` thread). A record still unwritten when
+  the workflow returns is written then; if that fails after a few retries, the workflow's result
+  stands, with a warning, and a resume runs the step again. If the failed step's lease could not be
+  released, the record retries the release, or waits for the lease to lapse, rather than be refused
+  at a position that lease still claims. In an async workflow, records are written on a worker
+  thread, so the event loop is not held up.
 
   A cancelled async step (`asyncio.CancelledError`) is recorded the same way, with how long it ran
   before the cancellation, and its lease is released. On replay it does not raise at once: it waits,

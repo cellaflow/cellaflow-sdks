@@ -490,11 +490,14 @@ def test_a_rebuilt_exception_matches_the_original(exc: BaseException) -> None:
 def test_an_argument_that_cannot_be_recorded_cannot_be_used_on_replay() -> None:
     from cellaflow.failures import UnavailableOnReplay
 
-    rebuilt = _round_trip(ValueError("bad", object()))
+    value = object()
+    rebuilt = _round_trip(ValueError("bad", value))
     assert rebuilt.args[0] == "bad"
     placeholder = rebuilt.args[1]
     assert isinstance(placeholder, UnavailableOnReplay)
-    assert "not available on replay" in repr(placeholder)
+    # Prints as it did, so the exception's message is unchanged.
+    assert repr(placeholder) == repr(value)
+    assert str(rebuilt) == str(ValueError("bad", value))
     with pytest.raises(AttributeError, match="not available on replay"):
         placeholder.anything
 
@@ -1421,3 +1424,262 @@ def test_a_member_that_cannot_be_printed_is_kept_by_its_type() -> None:
 
     member = failures._minimal(Unprintable(), 1)
     assert member["type"] == f"{__name__}:Unprintable" and member["message"] == ""
+
+
+# --- Review fixes, round four ---------------------------------------------------
+
+
+class Response:
+    """Stands for an HTTP client's response object, which cannot be recorded."""
+
+    status = 503
+
+    def __str__(self) -> str:
+        return "503 Service Unavailable"
+
+
+class HTTPFailed(Exception):
+    pass
+
+
+def test_an_exception_whose_argument_was_not_recorded_prints_as_it_did() -> None:
+    """A handler that formats the exception reads what it read the first time;
+    only using the value itself raises."""
+    rebuilt: Any = _round_trip(HTTPFailed(Response()))
+    assert type(rebuilt) is HTTPFailed
+    assert str(rebuilt) == "503 Service Unavailable"
+    assert f"charge failed: {rebuilt}" == "charge failed: 503 Service Unavailable"
+    with pytest.raises(AttributeError, match="not available on replay"):
+        rebuilt.args[0].status
+
+    original = HTTPFailed("upstream", Response())
+    assert str(_round_trip(original)) == str(original)
+
+
+class WithData(Exception):
+    pass
+
+
+def test_a_dict_that_looks_like_a_recorded_tuple_comes_back_as_a_dict() -> None:
+    exc = WithData("x")
+    exc.data = {"__cellaflow_tuple__": [1, 2]}  # type: ignore[attr-defined]
+    exc.other = {"__cellaflow_dict__": {"a": 1}}  # type: ignore[attr-defined]
+    rebuilt: Any = _round_trip(exc)
+    assert rebuilt.data == {"__cellaflow_tuple__": [1, 2]}
+    assert rebuilt.other == {"__cellaflow_dict__": {"a": 1}}
+
+
+def test_an_exception_only_its_extension_module_can_build_is_refused_and_warned(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
+) -> None:
+    """pydantic's ValidationError is constructed by compiled code, which a replay
+    does not run. The run says so when the failure is recorded."""
+    pydantic = pytest.importorskip("pydantic")
+    from cellaflow.failures import ReplayedFailureError
+
+    Order = pydantic.create_model("Order", quantity=(int, ...))
+
+    try:
+        Order(quantity="many")
+    except pydantic.ValidationError as live:
+        with pytest.raises(ReplayedFailureError, match="compiled code"):
+            _round_trip(live)
+
+    _fresh(mock_stub, "sess-pydantic")
+
+    @step
+    def parse() -> Any:
+        return Order(quantity="many")
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            parse()
+        except pydantic.ValidationError:
+            return "asked again"
+        return "parsed"
+
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert wf() == "asked again"
+    assert "cannot be raised again by a resumed run" in caplog.text
+    assert "compiled code" in caplog.text
+
+
+def _caught_then_returns(raise_in_step: BaseException) -> Callable[..., Any]:
+    @step
+    def charge() -> str:
+        raise raise_in_step
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            charge()
+        except Exception:
+            pass
+        return "done"
+
+    return wf
+
+
+def test_a_record_that_cannot_be_written_after_the_workflow_returns_keeps_its_result(
+    mock_stub: MagicMock, mock_client: None, caplog: Any, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr("cellaflow.context._END_RETRY_BASE_S", 0.0)
+    _fresh(mock_stub, "sess-end")
+    answer = mock_stub.CommitStep.side_effect
+
+    def commit(req: Any, **kwargs: Any) -> Any:
+        if req.step_result.status == FAILED:
+            raise Unavailable()
+        return answer(req, **kwargs)
+
+    mock_stub.CommitStep.side_effect = commit
+    wf = _caught_then_returns(PaymentDeclined("no funds"))
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert wf() == "done"
+    assert mock_stub.CommitStep.call_count == 4  # the first try and three retries
+    assert "The workflow's result stands" in caplog.text
+
+
+def test_a_record_that_lands_on_a_retry_after_the_workflow_returns_is_kept(
+    mock_stub: MagicMock, mock_client: None, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr("cellaflow.context._END_RETRY_BASE_S", 0.0)
+    _fresh(mock_stub, "sess-end-retry")
+    answer = mock_stub.CommitStep.side_effect
+    failures = [Unavailable()]
+
+    def commit(req: Any, **kwargs: Any) -> Any:
+        if failures:
+            raise failures.pop()
+        return answer(req, **kwargs)
+
+    mock_stub.CommitStep.side_effect = commit
+    assert _caught_then_returns(PaymentDeclined("no funds"))() == "done"
+    assert _commits(mock_stub)[-1] == (1, "charge", FAILED)
+
+
+def test_a_failure_is_not_recorded_by_a_run_that_does_not_know_the_history() -> None:
+    """As for a hit: a resumed `durable_tools` thread counts positions from 0, so
+    it would record at a position the session already filled."""
+    from cellaflow.context import WorkflowContext
+
+    for known in (False, True):
+        ctx = WorkflowContext(
+            client=MagicMock(),
+            session_id="s",
+            workflow_version="1",
+            sequence=1,
+            replayed_steps={},
+            history_known=known,
+        )
+        ctx._in_flight = 1
+        ctx.defer_failure_record(1, "charge", ValueError("x"), None)
+        assert (ctx._pending_hit is not None) is known
+
+
+class Claimed(grpc.RpcError):  # type: ignore[misc]
+    def code(self) -> grpc.StatusCode:
+        return grpc.StatusCode.FAILED_PRECONDITION
+
+    def details(self) -> str:
+        return "position claimed"
+
+
+def _failure_then_next(mock_stub: MagicMock, session_id: str) -> Callable[..., Any]:
+    _fresh(mock_stub, session_id)
+
+    @step
+    def charge() -> str:
+        raise PaymentDeclined("no funds")
+
+    @step
+    def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            charge()
+        except PaymentDeclined:
+            return notify()  # type: ignore[no-any-return]
+        return "charged"
+
+    return wf
+
+
+def test_a_release_that_failed_is_tried_again_before_the_failure_is_recorded(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The failed step's lease would otherwise still claim its position, the
+    record would be refused there, and the next step refused as divergent."""
+    releases = [Unavailable()]
+
+    def release(req: Any, **kwargs: Any) -> Any:
+        if releases:
+            raise releases.pop()
+        return idempotency_pb2.ReleaseLeaseResponse()
+
+    mock_stub.ReleaseLease.side_effect = release
+    assert _failure_then_next(mock_stub, "sess-release")() == "notified"
+    assert mock_stub.ReleaseLease.call_count == 2
+    assert _commits(mock_stub) == [(1, "charge", FAILED), (2, "notify", SUCCESS)]
+
+
+def test_a_record_waits_for_an_unreleased_lease_to_lapse(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    mock_stub.ReleaseLease.side_effect = Unavailable()
+    acquired = mock_stub.CheckIdempotencyCache.return_value
+    refusals = [Claimed()]
+
+    def check(req: Any, **kwargs: Any) -> Any:
+        if ":failure:" in req.idempotency_key and refusals:
+            raise refusals.pop()
+        return acquired
+
+    mock_stub.CheckIdempotencyCache.side_effect = check
+    assert _failure_then_next(mock_stub, "sess-lapse")() == "notified"
+    assert _commits(mock_stub) == [(1, "charge", FAILED), (2, "notify", SUCCESS)]
+
+
+def test_an_async_workflow_writes_failure_records_off_the_event_loop(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    import threading
+
+    _fresh(mock_stub, "sess-off-loop")
+    answer = mock_stub.CommitStep.side_effect
+    threads: List[Tuple[str, bool]] = []
+
+    def commit(req: Any, **kwargs: Any) -> Any:
+        on_main = threading.current_thread() is threading.main_thread()
+        threads.append((req.step_result.name, on_main))
+        return answer(req, **kwargs)
+
+    mock_stub.CommitStep.side_effect = commit
+
+    @step
+    async def charge() -> str:
+        raise PaymentDeclined("no funds")
+
+    @step
+    async def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    async def wf() -> str:
+        try:
+            await charge()
+        except PaymentDeclined:
+            pass
+        await notify()
+        try:
+            await charge()
+        except PaymentDeclined:
+            pass
+        return "done"
+
+    assert asyncio.run(wf()) == "done"
+    # Each failure record off the loop: at the next step, and after the return.
+    assert threads == [("charge", False), ("notify", True), ("charge", False)]

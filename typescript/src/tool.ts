@@ -204,6 +204,7 @@ export function tool<A extends unknown[], R>(
     known.key = ikey;
 
     let fencingToken = 0;
+    let intervalMs = 5000;
     let hb: LeaseHeartbeat | undefined;
 
     // Arbitrate. Loop because IN_PROGRESS means another worker holds it and the
@@ -262,7 +263,7 @@ export function tool<A extends unknown[], R>(
 
       if (resp.status === CacheStatus.ACQUIRED) {
         fencingToken = Number(resp.fencingToken ?? 0n);
-        const intervalMs = Number(resp.heartbeatIntervalMs ?? 5000n);
+        intervalMs = Number(resp.heartbeatIntervalMs ?? 5000n);
         hb = new LeaseHeartbeat({
           client: ctx.client,
           agentId,
@@ -299,7 +300,10 @@ export function tool<A extends unknown[], R>(
           .releaseLease(agentId, ikey, fencingToken, "TOOL_ERROR")
           .catch(() => {
             // The lease expires on its own. Losing the release is not worth
-            // masking the error that caused it.
+            // masking the error that caused it. Until it does, it still claims
+            // this position, so the failure record there retries the release
+            // or waits for it. Renewals extend it by at most three intervals.
+            ctx.noteUnreleased(seq, agentId, ikey, fencingToken, intervalMs * 4 + 1000);
           });
       }
       throw err;

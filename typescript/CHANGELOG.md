@@ -9,8 +9,10 @@ All notable changes to the CellaFlow TypeScript SDK.
 - **A call's failure is recorded at its position.** When a caller catches a leased tool's error and
   carries on, the failure is recorded at the call's position as a step with status `FAILED`,
   carrying the error's name and message, and the next call takes the following position. It is
-  written when the next call claims a position, so a failure nothing follows, or one while another
-  call of the session is in flight, is not recorded. `durableTools` resumes by running tools
+  written when the next call claims a position, so a failure nothing follows, one while another
+  call of the session is in flight, or one in a session whose history the run did not read (a
+  resumed `durableTools` session), is not recorded. If the failed call's lease could not be
+  released, the record retries the release, or waits for the lease to lapse. `durableTools` resumes by running tools
   again rather than by replaying positions, so the record fills the position; it is not replayed.
   The Python SDK records failures the same way and, in a `@workflow`, also replays them. The
   message keeps its first 4 KB and the stack its last 16 KB, and recording never replaces the

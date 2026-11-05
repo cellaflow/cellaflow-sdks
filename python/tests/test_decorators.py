@@ -2087,3 +2087,54 @@ def test_a_recovered_workflow_whose_history_is_gone_fails(
     with pytest.raises(grpc.RpcError):
         wf(_session_id="sess-gone")  # type: ignore[call-arg]
     mock_stub.CheckIdempotencyCache.assert_not_called()
+
+
+def test_steps_waiting_on_a_record_claim_in_the_order_they_were_called(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The record is written off the event loop, and the steps waiting on it
+    resume in the order they arrived, so the positions match the order a resume
+    claims them in, however long the write takes."""
+    import asyncio
+    import time
+
+    mock_stub.StartSession.return_value = service_pb2.StartSessionResponse(
+        session_id="sess-order", version="1.0.0", is_recovered=False
+    )
+    mock_stub.CheckIdempotencyCache.side_effect = _with_record_leases(
+        [_hit(0), _acquired(), _acquired(), _acquired()]
+    )
+
+    def commit(req: Any, **_: Any) -> Any:
+        if req.step_result.name == "place_order":
+            time.sleep(0.05)  # a slow record write, on its worker thread
+        return service_pb2.CommitStepResponse(
+            session_id=req.session_id, next_sequence=req.step_result.sequence + 1
+        )
+
+    mock_stub.CommitStep.side_effect = commit
+
+    @step
+    async def place_order() -> str:
+        raise AssertionError("a cache hit must not execute")
+
+    @step
+    async def a() -> str:
+        return "a"
+
+    @step
+    async def b() -> str:
+        return "b"
+
+    @step
+    async def c() -> str:
+        return "c"
+
+    @workflow(version="1.0.0")
+    async def wf() -> List[str]:
+        await place_order()
+        return list(await asyncio.gather(a(), b(), c()))
+
+    assert asyncio.run(wf()) == ["a", "b", "c"]
+    positions = {name: seq for seq, name, _ in _sent(mock_stub)}
+    assert positions == {"place_order": 1, "a": 2, "b": 3, "c": 4}

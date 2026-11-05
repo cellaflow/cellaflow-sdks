@@ -120,6 +120,31 @@ export class WorkflowContext {
    */
   private inFlight = 0;
 
+  /**
+   * Leases of failed calls that could not be released, by position, with when
+   * each lapses on its own. A failure record at that position retries the
+   * release, or waits for the lapse. See {@link writeRecord}.
+   */
+  private unreleased = new Map<
+    number,
+    { agentId: string; key: string; token: number; lapsesAt: number }
+  >();
+
+  /**
+   * Remembers a failed call's lease that could not be released. It still claims
+   * the call's position until it lapses, so the engine would refuse the failure
+   * record there and the run would continue as though another agent owned it.
+   */
+  noteUnreleased(
+    sequence: number,
+    agentId: string,
+    key: string,
+    token: number,
+    lapsesInMs: number,
+  ): void {
+    this.unreleased.set(sequence, { agentId, key, token, lapsesAt: Date.now() + lapsesInMs });
+  }
+
   constructor(init: {
     client: CellaflowClient;
     sessionId: string;
@@ -195,7 +220,9 @@ export class WorkflowContext {
     agentId = "default",
     stepKey = "",
   ): void {
-    if (!(this.inFlight === 1 && this.sequence === sequence)) return;
+    // As for a hit: a run that does not know everything the session holds (a
+    // resumed `durableTools` session) would record at a position already filled.
+    if (!(this.historyKnown && this.inFlight === 1 && this.sequence === sequence)) return;
     this.pendingHit = {
       kind: "failure",
       status: StepStatus.FAILED,
@@ -368,16 +395,47 @@ export class WorkflowContext {
       pending.kind === "failure"
         ? failureIdempotencyKey(this.sessionId, pending.sequence, pending.name, pending.receivedKey)
         : recordIdempotencyKey(this.sessionId, pending.sequence, pending.receivedKey);
+    const unreleased = this.unreleased.get(pending.sequence);
+    if (unreleased) {
+      // The failed call's own lease still claims this position, so the engine
+      // would refuse the record. Try the release again first.
+      try {
+        await this.client.releaseLease(
+          unreleased.agentId,
+          unreleased.key,
+          unreleased.token,
+          "TOOL_ERROR",
+        );
+        this.unreleased.delete(pending.sequence);
+      } catch (err) {
+        // Already released or lapsed: nothing is left to free.
+        if (!isRetryable(err)) this.unreleased.delete(pending.sequence);
+      }
+    }
     let token = 0;
     for (;;) {
-      const resp = await this.client.checkIdempotencyCache(
-        pending.agentId,
-        key,
-        undefined,
-        undefined,
-        this.sessionId,
-        pending.sequence,
-      );
+      let resp;
+      try {
+        resp = await this.client.checkIdempotencyCache(
+          pending.agentId,
+          key,
+          undefined,
+          undefined,
+          this.sessionId,
+          pending.sequence,
+        );
+      } catch (err) {
+        const held = this.unreleased.get(pending.sequence);
+        const remaining = held ? held.lapsesAt - Date.now() : 0;
+        if (held && isFailedPrecondition(err) && remaining > 0) {
+          // Refused because of that lease, which lapses on its own: wait for it,
+          // as for any held record.
+          await sleep(Math.min(1000, remaining));
+          continue;
+        }
+        this.unreleased.delete(pending.sequence);
+        throw err;
+      }
       // Written by an earlier attempt whose answer was lost.
       if (resp.status === CacheStatus.HIT) return;
       if (resp.status === CacheStatus.IN_PROGRESS) {
