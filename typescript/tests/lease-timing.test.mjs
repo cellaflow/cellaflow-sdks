@@ -119,13 +119,14 @@ test("a refused renewal is a loss, with the engine's reason", async () => {
 test("a missed deadline is reported but renewing goes on until the engine refuses", async () => {
   let calls = 0;
   let refuse = false;
+  const events = [];
   const { hb, lost } = heartbeat({
     async renewLease() {
       calls += 1;
       if (calls === 1) await sleep(700); // answers after the deadline (~600)
       return refuse ? { renewed: false, failureReason: 2 } : { renewed: true };
     },
-  });
+  }, { onEvent: (e) => events.push(e) });
   hb.start();
   try {
     await sleep(1_100);
@@ -138,7 +139,11 @@ test("a missed deadline is reported but renewing goes on until the engine refuse
     const afterRefusal = calls;
     await sleep(500);
     assert.equal(calls, afterRefusal, "a refusal stops renewing");
-    assert.equal(lost.length, 1, "the loss is reported once");
+    assert.equal(lost.length, 1, "onLeaseLost is called once");
+    const lostEvents = events.filter((e) => e.type === "lost");
+    assert.equal(lostEvents.length, 2, "a 'lost' event on the deadline, and again on the refusal");
+    assert.match(lostEvents[1].detail, /another worker took the lease/);
+    assert.match(hb.lostDetail, /another worker took the lease/);
   } finally {
     await hb.stop();
   }
@@ -204,10 +209,10 @@ test("one or two failed renewals do not cost a lease the engine still holds", as
 
 test("a renewal the engine shortened near its maximum lifetime moves the deadline in", async () => {
   // The engine's clock is offset from the local one, and it will not extend the
-  // lease past t=1500 (its maximum lifetime).
+  // lease past t=2100 (its maximum lifetime).
   const offset = 3_000_000;
   const t0 = performance.now();
-  const hard = t0 + offset + 1_500;
+  const hard = t0 + offset + 2_100;
   const hb = new LeaseHeartbeat({
     client: {
       async renewLease(agentId, key, token, extendMs) {
@@ -223,17 +228,59 @@ test("a renewal the engine shortened near its maximum lifetime moves the deadlin
     extendMs: 1_200,
     leaseTtlMs: 1_200,
     acquiredSentAt: t0,
-    acquiredExpiresAtMs: t0 + offset + 1_200,
   });
   hb.start();
   try {
-    // Renewals at ~300 (full, to 1500) and ~600 (shortened: asked for 1800,
-    // got 1500). Counted from the send alone the deadline would be ~1650.
-    await sleep(1_250);
-    assert.equal(hb.lost, false, "held until the engine's expiry minus the margin (~1350)");
+    // Renewals at ~300 (to 1500), ~600 (to 1800, which shows the first was
+    // full), ~900 (to 2100) and ~1200 (asked for 2400, got 2100). Counted from
+    // the send alone the deadline would be ~2250.
+    await sleep(1_850);
+    assert.equal(hb.lost, false, "held until the engine's expiry minus the margin (~1950)");
     await sleep(200);
-    assert.equal(hb.lost, true, "lost by ~1450, before the engine's expiry at 1500");
+    assert.equal(hb.lost, true, "lost by ~2050, before the engine's expiry at 2100");
   } finally {
+    await hb.stop();
+  }
+});
+
+test("one slow renewal does not make later ones look shortened", async () => {
+  const offset = -5_000_000;
+  let calls = 0;
+  let lastSent = 0;
+  const { hb } = heartbeat({
+    async renewLease(agentId, key, token, extendMs) {
+      calls += 1;
+      lastSent = performance.now();
+      // The first renewal reaches the engine 90 ms late, just inside its 100 ms
+      // timeout; the rest at once.
+      if (calls === 1) await sleep(90);
+      return { renewed: true, newExpiresAtMs: BigInt(Math.round(performance.now() + offset + extendMs)) };
+    },
+  }, { marginMs: undefined });
+  hb.start();
+  try {
+    await sleep(1_500);
+    assert.equal(hb.lost, false);
+    assert.ok(calls >= 5);
+    // A full renewal's deadline is its send plus 800, minus the 100 ms margin.
+    // Measured against the slow renewal it would sit about 90 ms earlier.
+    const lead = hb.deadline - lastSent;
+    assert.ok(lead > 680, `deadline ${lead.toFixed(1)} ms after the last send`);
+  } finally {
+    await hb.stop();
+  }
+});
+
+test("a deadline also holds on the wall clock, for a host that was suspended", async () => {
+  const { hb } = heartbeat({ renewLease: never });
+  const realNow = Date.now;
+  try {
+    assert.equal(hb.pastDeadline(), false);
+    // While a host sleeps, performance.now() stands still and Date.now() does not.
+    Date.now = () => realNow() + 60_000;
+    assert.equal(hb.pastDeadline(), true);
+  } finally {
+    Date.now = realNow;
     await hb.stop();
   }
 });
@@ -356,15 +403,16 @@ test("the block does not run when the lease is lost before it starts", async () 
   assert.deepEqual(calls.release, ["BLOCK_EXIT"], "the lease is still released");
 });
 
-test("after the block exits, check() fails and the signal aborts", async () => {
+test("after the block exits, check() fails, but the signal does not abort", async () => {
   stubEngine();
   let kept;
   await executionLease("k", { workerId: "w", ttlMs: 200 }, async (lease) => {
     kept = lease;
   });
   assert.equal(kept.isLost, true);
-  assert.equal(kept.signal.aborted, true);
-  assert.throws(() => kept.check(), LeaseLostError);
+  assert.throws(() => kept.check(), /released when its block exited/);
+  // Releasing is not losing: a response fetched with the signal may still be read.
+  assert.equal(kept.signal.aborted, false);
 });
 
 test("reading signal after a stall shows it aborted, without calling check()", async () => {
@@ -394,4 +442,48 @@ test("inside the 'lost' event, the handle already reads as lost", async () => {
     },
   );
   assert.equal(lostSeenInEvent, true);
+});
+
+test("after a long wait, one failed renewal before the block does not lose the lease", async () => {
+  // The grant arrives after more than a TTL of waiting, so a deadline counted
+  // from the request has passed; the renewal after it is what counts.
+  const calls = stubEngine({
+    renew: (n) => {
+      if (n === 1) throw new Error("connection reset");
+      return { renewed: true, newExpiresAtMs: BigInt(Math.round(engineNow() + 200)) };
+    },
+  });
+  const slowAcquire = CellaflowClient.prototype.checkIdempotencyCache;
+  CellaflowClient.prototype.checkIdempotencyCache = async function (...args) {
+    await sleep(300);
+    return slowAcquire.apply(this, args);
+  };
+  let ran = false;
+  await executionLease("k", { workerId: "w", ttlMs: 200, waitMs: 1_000 }, async (lease) => {
+    lease.check();
+    ran = true;
+  });
+  assert.equal(ran, true);
+  assert.equal(calls.renew[0] !== undefined, true);
+});
+
+test("after a wait, if no renewal before the block is confirmed, the block does not run", async () => {
+  stubEngine({
+    renew: () => {
+      throw new Error("unavailable");
+    },
+  });
+  const slowAcquire = CellaflowClient.prototype.checkIdempotencyCache;
+  CellaflowClient.prototype.checkIdempotencyCache = async function (...args) {
+    await sleep(300);
+    return slowAcquire.apply(this, args);
+  };
+  let ran = false;
+  await assert.rejects(
+    executionLease("k", { workerId: "w", ttlMs: 200, waitMs: 1_000 }, async () => {
+      ran = true;
+    }),
+    LeaseLostError,
+  );
+  assert.equal(ran, false);
 });

@@ -37,6 +37,7 @@ export class LeaseHandle {
   readonly fencingToken: number;
   private readonly controller = new AbortController();
   private lostDetail?: string;
+  private released = false;
   private readonly probe?: () => void;
 
   /**
@@ -52,15 +53,25 @@ export class LeaseHandle {
    * Aborts when the lease is lost. Pass to `fetch`, streams, or your own loops.
    * Reading it checks the clock, like `isLost`, so a process resumed past its
    * deadline gets a signal that has already aborted.
+   *
+   * It does not abort when the block exits and the lease is released: that is
+   * not a loss, and a response or stream fetched with it may still be read.
    */
   get signal(): AbortSignal {
-    if (!this.controller.signal.aborted) this.probe?.();
+    if (!this.released && !this.controller.signal.aborted) this.probe?.();
     return this.controller.signal;
   }
 
+  /** True once the lease is lost, or released because its block exited. */
   get isLost(): boolean {
+    if (this.released) return true;
     if (!this.controller.signal.aborted) this.probe?.();
     return this.controller.signal.aborted;
+  }
+
+  /** @internal Called as the block exits, before the lease is let go. */
+  markReleased(): void {
+    this.released = true;
   }
 
   /** @internal */
@@ -83,8 +94,12 @@ export class LeaseHandle {
    * another worker took over. Hand `signal` to the request to shorten it.
    */
   check(): void {
-    if (this.isLost) {
-      throw new LeaseLostError(`Execution lease was lost: ${this.lostDetail}`);
+    if (this.controller.signal.aborted || this.isLost) {
+      throw new LeaseLostError(
+        this.controller.signal.aborted
+          ? `Execution lease was lost: ${this.lostDetail}`
+          : "Execution lease was released when its block exited",
+      );
     }
   }
 }
@@ -208,9 +223,8 @@ export async function executionLease<T>(
     }
 
     fencingToken = Number(resp.fencingToken ?? 0n);
-    const heartbeat = () => hb;
     handle = new LeaseHandle(fencingToken, () => {
-      heartbeat()?.pastDeadline();
+      hb?.pastDeadline();
     });
     const leaseHandle = handle;
     emit({
@@ -233,10 +247,6 @@ export async function executionLease<T>(
       extendMs: ttlMs,
       leaseTtlMs: ttlMs,
       acquiredSentAt,
-      // After a wait the grant time is unknown, so the acquisition's expiry
-      // cannot anchor anything; the renewal made below does instead.
-      acquiredExpiresAtMs:
-        waitMs === 0 && resp.leaseExpiresAtMs !== undefined ? Number(resp.leaseExpiresAtMs) : undefined,
       onEvent,
       onLeaseLost: (detail) => {
         leaseHandle.markLost(detail);
@@ -250,9 +260,16 @@ export async function executionLease<T>(
     if (waitMs > 0) {
       // The engine may have waited before granting, so the lease can be much
       // younger than the request that won it, and a deadline counted from that
-      // request would read a fresh lease as nearly expired. One renewal sent
-      // now gives a deadline counted from a known time.
-      await hb.renewNow();
+      // request would read a fresh lease as nearly expired. A renewal sent now
+      // gives a deadline counted from a known time. One failed attempt is not a
+      // loss, so try a few while the lease, counted from when the grant
+      // arrived, could still be live. If none is confirmed the lease cannot be
+      // shown to be held, and the block does not run.
+      const grantArrivedAt = performance.now();
+      for (let attempt = 0; attempt < 3 && !hb.lost; attempt++) {
+        if (await hb.renewNow()) break;
+        if (performance.now() >= grantArrivedAt + ttlMs - hb.marginMs) break;
+      }
     }
     // A lease already lost before the block starts must not run it: a block
     // that acts before its first check() would act on a lease this side has
@@ -266,10 +283,11 @@ export async function executionLease<T>(
 
     return await currentLeaseStore.run(leaseHandle, () => fn(leaseHandle));
   } finally {
+    // Before anything is awaited: work the block started and did not await can
+    // still reach the handle through currentLease(), and from here on the lease
+    // is not this worker's to act under.
+    handle?.markReleased();
     await hb?.stop();
-    // Work the block started and did not await can still reach the handle
-    // through currentLease(). Once released, the lease is not this worker's.
-    handle?.markLost("the lease was released when its block exited");
     if (fencingToken > 0) {
       await client
         .releaseLease(workerId, key, fencingToken, "BLOCK_EXIT")
