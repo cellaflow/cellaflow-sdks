@@ -186,13 +186,12 @@ export async function durableTools<T>(
     // this run never sees what the session already holds and must not record
     // cache hits into it.
     historyKnown: !resp.isRecovered,
+    // A resumed session's first call is often a tool that never ran (the node
+    // the thread had not reached), which claims a position rather than hitting
+    // the cache. Its position is read before that claim, not here, so a resume
+    // whose calls are all cache hits reads nothing. See `ensurePosition`.
+    positionKnown: !resp.isRecovered,
   });
-  // A resumed session continues where it is, not at 0. Its first call is often a
-  // tool that never ran (the node the thread had not reached), which claims a
-  // position rather than hitting the cache: counted from 0, it claimed position 1,
-  // which the session already holds, and the engine refused it as divergent
-  // before its body ran.
-  if (resp.isRecovered) await ctx.adoptEnginePosition();
 
   const session: DurableSession = {
     sessionId: ctx.sessionId,

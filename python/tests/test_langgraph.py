@@ -1441,12 +1441,7 @@ def test_sessions_are_deregistered_on_exit() -> None:
         _dispatch_bare_executor(lambda: get_context().session_id)
 
 
-def test_a_resumed_thread_runs_a_tool_it_never_reached_at_the_next_position() -> None:
-    """A resumed thread's first call is often a tool it had not reached, which
-    is not a cache hit, so it claims a position. Counted from 0, it claimed
-    position 1, which the session already holds, and the engine refused it as
-    divergent before its body ran. It continues after what the session holds."""
-
+def _resumable_tools() -> Tuple[Any, Any]:
     def _reserve_seat(flight: str) -> str:
         return f"seat on {flight}"
 
@@ -1455,39 +1450,106 @@ def test_a_resumed_thread_runs_a_tool_it_never_reached_at_the_next_position() ->
 
     reserve_seat = cast(Any, tool(tool_name="reserve_seat")(_reserve_seat))
     charge_card = cast(Any, tool(tool_name="charge_card")(_charge_card))
+    return reserve_seat, charge_card
 
+
+def _resume(client: "LeasingMockClient", thread: str) -> Any:
+    """`durable_tools` on `thread` as the engine answers a resume."""
+    session = tool_session_id(thread)
+    start = patch.object(
+        client,
+        "start_session",
+        return_value=MagicMock(
+            session_id=session, version="1.0.0", is_recovered=True,
+            coordination_id=None,
+        ),
+    )
+    cfg: RunnableConfig = {"configurable": {"thread_id": thread}}
+    return start, durable_tools(cfg)
+
+
+def test_a_resumed_thread_runs_a_tool_it_never_reached_at_the_next_position() -> None:
+    """A resumed thread's first call is often a tool it had not reached, which
+    is not a cache hit, so it claims a position. Counted from 0, it claimed
+    position 1, which the session already holds, and the engine refused it as
+    divergent before its body ran. It continues after what the session holds."""
+    reserve_seat, charge_card = _resumable_tools()
     client = LeasingMockClient()
     cfg: RunnableConfig = {"configurable": {"thread_id": "t-new-tool"}}
     with patch("cellaflow.durable.CellaflowClient", return_value=client):
         with durable_tools(cfg):
             assert reserve_seat("BA117") == "seat on BA117"
+        start, block = _resume(client, "t-new-tool")
+        with start, block:
+            assert charge_card(450) == "charged 450"
 
-        session = tool_session_id("t-new-tool")
-        with patch.object(client, "start_session") as start:
-            start.return_value = MagicMock(
-                session_id=session, version="1.0.0", is_recovered=True,
-                coordination_id=None,
-            )
-            with durable_tools(cfg) as ctx:
-                assert ctx.sequence == 1
-                assert charge_card(450) == "charged 450"
-
+    session = tool_session_id("t-new-tool")
     assert [(s["sequence"], s["name"]) for s in client.graphs[session]] == [
         (1, "reserve_seat"),
         (2, "charge_card"),
     ]
 
 
-def test_a_resumed_thread_with_no_history_starts_at_zero() -> None:
+def test_a_resumed_thread_reads_a_history_longer_than_a_page() -> None:
+    _, charge_card = _resumable_tools()
     client = LeasingMockClient()
-    session = tool_session_id("t-empty")
-    client.graphs[session] = []
+    session = tool_session_id("t-long")
+    client.graphs[session] = [
+        {"sequence": i, "name": "step", "output_payload": {"result": i}}
+        for i in range(1, 1501)
+    ]
     with patch("cellaflow.durable.CellaflowClient", return_value=client):
-        with patch.object(client, "start_session") as start:
-            start.return_value = MagicMock(
-                session_id=session, version="1.0.0", is_recovered=True,
-                coordination_id=None,
-            )
-            cfg: RunnableConfig = {"configurable": {"thread_id": "t-empty"}}
-            with durable_tools(cfg) as ctx:
-                assert ctx.sequence == 0
+        start, block = _resume(client, "t-long")
+        with start, block:
+            assert charge_card(450) == "charged 450"
+    assert client.graphs[session][-1]["sequence"] == 1501
+    assert [cursor for _, cursor in client.graph_calls] == [None, "1001"]
+
+
+def test_a_resumed_thread_the_engine_cannot_find_is_an_error_not_position_zero() -> (
+    None
+):
+    """The engine reported the session as recovered, so a history it cannot
+    find is not an empty one: starting at 0 would bring back the refusal."""
+    _, charge_card = _resumable_tools()
+    client = LeasingMockClient()
+    with patch("cellaflow.durable.CellaflowClient", return_value=client):
+        start, block = _resume(client, "t-gone")
+        with start, block:
+            with pytest.raises(grpc.RpcError) as gone:
+                charge_card(450)
+    assert gone.value.code() == grpc.StatusCode.NOT_FOUND
+    assert client.granted == []
+
+
+def test_a_resume_whose_history_cannot_be_read_right_now_still_answers_hits() -> None:
+    """A cache hit needs no position, so a read that fails with an error that
+    may pass does not stop the call."""
+    reserve_seat, _ = _resumable_tools()
+    client = LeasingMockClient()
+    cfg: RunnableConfig = {"configurable": {"thread_id": "t-flaky"}}
+    with patch("cellaflow.durable.CellaflowClient", return_value=client):
+        with durable_tools(cfg):
+            reserve_seat("BA117")
+        client.get_graph_fails_with = grpc.StatusCode.UNAVAILABLE
+        start, block = _resume(client, "t-flaky")
+        with start, block:
+            assert reserve_seat("BA117") == "seat on BA117"
+    assert len(client.granted) == 1  # the first run's lease, and no other
+
+
+def test_a_resumed_thread_reads_its_position_once() -> None:
+    reserve_seat, charge_card = _resumable_tools()
+    client = LeasingMockClient()
+    session = tool_session_id("t-once")
+    client.graphs[session] = [
+        {"sequence": i, "name": "step", "output_payload": {"result": i}}
+        for i in range(1, 5)
+    ]
+    with patch("cellaflow.durable.CellaflowClient", return_value=client):
+        start, block = _resume(client, "t-once")
+        with start, block:
+            reserve_seat("BA117")
+            charge_card(450)
+    assert len(client.graph_calls) == 1
+    assert [s["sequence"] for s in client.graphs[session]][-2:] == [5, 6]

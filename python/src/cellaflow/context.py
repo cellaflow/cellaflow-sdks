@@ -11,7 +11,7 @@ import time
 import grpc
 
 from cellaflow.client import CellaflowClient
-from cellaflow.history import latest_session_sequence
+from cellaflow.history import GRAPH_PAGE, latest_session_sequence
 from cellaflow.idempotency import record_idempotency_key
 from cellaflow.v1 import common_pb2, idempotency_pb2, service_pb2
 
@@ -71,6 +71,11 @@ class WorkflowContext:
     # False unless the caller says otherwise: a context built for a session whose
     # history it never read must not record into it.
     history_known: bool = False
+    # Whether `sequence` is where the session is. False for a resumed
+    # `durable_tools` session, which does not replay from the start: its first
+    # call reads the session's position, unless a cache hit has reported it by
+    # then. See `_ensure_position`.
+    position_known: bool = True
     # A cache hit's result, waiting to be recorded at its position in this
     # session. Written when the next step starts. See `defer_hit_record`.
     _pending_hit: Optional[Dict[str, Any]] = None
@@ -97,6 +102,8 @@ class WorkflowContext:
         call in the session finds the same record pending and waits too, so
         none claims a later position before it lands.
         """
+        if not self.position_known:
+            self._ensure_position()
         while True:
             position, wait = self._try_claim()
             if position is not None:
@@ -105,11 +112,51 @@ class WorkflowContext:
 
     async def begin_call_async(self) -> int:
         """`begin_call` for an async step: waits without blocking the event loop."""
+        if not self.position_known:
+            await asyncio.to_thread(self._ensure_position)
         while True:
             position, wait = self._try_claim()
             if position is not None:
                 return position
             await asyncio.sleep(wait)
+
+    def _ensure_position(self) -> None:
+        """Moves the counter to where the session is, before a resumed session's
+        first call claims a position.
+
+        Counted from 0, a call that is not a cache hit took position 1, which
+        the session already holds, and the engine refused it as divergent before
+        its body ran. Not needed once a cache hit has reported the session's
+        position, which the claim adopts.
+
+        A history the engine cannot find is an error, not a session at 0: the
+        engine reported this session as recovered. A read that fails with an
+        error that may pass is not: the call goes ahead as it did before, which
+        a cache hit needs no position for, and the next call reads again.
+        """
+        with self._lock:
+            if self.position_known or self._reported_sequence is not None:
+                self.position_known = True
+                return
+        try:
+            position = latest_session_sequence(
+                self.client, self.session_id, limit=GRAPH_PAGE, missing_ok=False
+            )
+        except grpc.RpcError as exc:
+            if exc.code() not in _RETRYABLE_CODES:
+                raise
+            logger.warning(
+                "Cellaflow: could not read where session %s is (%s); this call "
+                "goes ahead without it, and the next one reads it again.",
+                self.session_id,
+                exc.code().name,
+            )
+            return
+        with self._lock:
+            if not self.position_known:
+                if self._reported_sequence is None:
+                    self.sequence = max(self.sequence, position)
+                self.position_known = True
 
     def _try_claim(self) -> Tuple[Optional[int], float]:
         """One attempt to claim a position: the position, or how long to wait."""
@@ -254,7 +301,7 @@ class WorkflowContext:
                         self.client,
                         self.session_id,
                         from_sequence=pending["sequence"],
-                        limit=1000,
+                        limit=GRAPH_PAGE,
                     ),
                 )
                 # The run no longer knows what the session holds: it stops

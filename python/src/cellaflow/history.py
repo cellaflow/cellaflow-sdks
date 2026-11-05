@@ -8,6 +8,10 @@ import grpc
 from cellaflow.client import CellaflowClient
 
 
+#: How many steps to ask the engine for per page of a session's history.
+GRAPH_PAGE = 1000
+
+
 def iter_session_steps(
     client: CellaflowClient,
     session_id: str,
@@ -60,13 +64,17 @@ def latest_session_sequence(
     session_id: str,
     from_sequence: Optional[int] = None,
     limit: Optional[int] = None,
+    missing_ok: bool = True,
 ) -> int:
     """The session's highest committed sequence at or after `from_sequence`.
 
     0 if there is none. A caller that already knows a lower bound passes it as
-    `from_sequence`, so only the tail of the session is read.
+    `from_sequence`, so only the tail of the session is read. `missing_ok` is
+    as for `iter_session_steps`: False for a session the engine just reported
+    as recovered, which must not read as empty.
     """
     latest = 0
-    for step in iter_session_steps(client, session_id, from_sequence, limit):
+    steps = iter_session_steps(client, session_id, from_sequence, limit, missing_ok)
+    for step in steps:
         latest = max(latest, int(step.get("sequence") or 0))
     return latest

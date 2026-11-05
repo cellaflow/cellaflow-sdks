@@ -143,6 +143,7 @@ export function tool<A extends unknown[], R>(
     // order they arrived, so positions are still claimed in call order, and each
     // settles again in case anything changed while it waited. With nothing being
     // written there is no await, and the claim stays synchronous as before.
+    if (!ctx.positionKnown) await ctx.ensurePosition();
     for (;;) {
       ctx.reconcileSequence();
       if (!ctx.recordingInFlight) break;
