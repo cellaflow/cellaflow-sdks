@@ -285,6 +285,64 @@ test("a deadline also holds on the wall clock, for a host that was suspended", a
   }
 });
 
+test("a host suspended between sending a renewal and handling its answer loses the lease", async () => {
+  const realNow = Date.now;
+  let calls = 0;
+  const { hb } = heartbeat({
+    async renewLease() {
+      calls += 1;
+      if (calls === 1) {
+        // The lid closes while the answer is on its way: the wall clock moves
+        // on a minute, the monotonic clock does not.
+        Date.now = () => realNow() + 60_000;
+      }
+      return { renewed: true };
+    },
+  });
+  hb.start();
+  try {
+    await sleep(260); // the first renewal (at ~200) has been handled
+    assert.equal(hb.pastDeadline(), true, "counted from the wall-clock send, a minute has passed");
+  } finally {
+    Date.now = realNow;
+    await hb.stop();
+  }
+});
+
+test("after a wake, the lease is reported lost without a renewal or a check", async () => {
+  const realNow = Date.now;
+  const { hb, lost } = heartbeat({ renewLease: never }, { extendMs: 60_000, leaseTtlMs: 60_000 });
+  hb.start();
+  try {
+    await sleep(50);
+    Date.now = () => realNow() + 120_000; // woke two minutes later, on the wall clock
+    await sleep(200); // half an interval is 100 ms
+    assert.equal(lost.length, 1, "the deadline timer saw the wall deadline");
+  } finally {
+    Date.now = realNow;
+    await hb.stop();
+  }
+});
+
+test("renewals get a timeout of half an interval, and up to a second on short TTLs", async () => {
+  const timeouts = [];
+  const client = {
+    async renewLease(a, k, t, e, timeoutSecs) {
+      timeouts.push(timeoutSecs);
+      return { renewed: true };
+    },
+  };
+  for (const [interval, extend] of [[200, 800], [500, 2_000], [8_000, 32_000]]) {
+    const hb = new LeaseHeartbeat({
+      client, agentId: "a", idempotencyKey: "k", fencingToken: 1,
+      heartbeatIntervalMs: interval, extendMs: extend, leaseTtlMs: extend,
+    });
+    await hb.renewNow();
+    await hb.stop();
+  }
+  assert.deepEqual(timeouts, [0.4, 1, 4]);
+});
+
 test("stop() waits for a renewal made with renewNow()", async () => {
   let answered = false;
   const { hb } = heartbeat({
@@ -334,7 +392,7 @@ function stubEngine({ renew } = {}) {
     },
     async releaseLease(agentId, key, token, reason) {
       calls.release.push(reason);
-      return {};
+      return { released: true };
     },
   });
   return calls;
@@ -486,4 +544,26 @@ test("after a wait, if no renewal before the block is confirmed, the block does 
     LeaseLostError,
   );
   assert.equal(ran, false);
+});
+
+test("after a wait with no renewal confirmed, the block runs while the request's deadline holds", async () => {
+  stubEngine({
+    renew: () => {
+      throw new Error("unavailable");
+    },
+  });
+  let ran = false;
+  await executionLease("k", { workerId: "w", ttlMs: 2_000, waitMs: 1_000 }, async (lease) => {
+    lease.check();
+    ran = true;
+  });
+  assert.equal(ran, true, "granted at once, so the deadline from the request has not passed");
+});
+
+test("'released' is reported only when the engine confirms the release", async () => {
+  stubEngine();
+  CellaflowClient.prototype.releaseLease = async () => ({ released: false });
+  const events = [];
+  await executionLease("k", { workerId: "w", ttlMs: 200, onEvent: (e) => events.push(e.type) }, async () => {});
+  assert.equal(events.includes("released"), false);
 });

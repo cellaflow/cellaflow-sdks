@@ -43,6 +43,8 @@ export interface LeaseHeartbeatOptions {
    * safe: pass it when you have it.
    */
   acquiredSentAt?: number;
+  /** The same moment on the wall clock (`Date.now()`). */
+  acquiredSentWallAt?: number;
   /**
    * How long before the computed expiry the lease stops being treated as held.
    * Defaults to half a heartbeat interval, capped at half of `extendMs`.
@@ -104,7 +106,7 @@ export interface LeaseEvent {
  */
 export class LeaseHeartbeat {
   private readonly opts: Required<
-    Omit<LeaseHeartbeatOptions, "onLeaseLost" | "onEvent" | "acquiredSentAt" | "marginMs">
+    Omit<LeaseHeartbeatOptions, "onLeaseLost" | "onEvent" | "acquiredSentAt" | "acquiredSentWallAt" | "marginMs">
   > &
     Pick<LeaseHeartbeatOptions, "onLeaseLost" | "onEvent">;
   /** How long before the computed expiry the lease stops being treated as held. */
@@ -122,12 +124,15 @@ export class LeaseHeartbeat {
   private wallDeadline: number;
   private inFlight?: Promise<unknown>;
   /**
-   * Local time minus engine time, from the renewal with the least latency among
-   * those known to have been full extensions. Engine expiries plus this give a
-   * local deadline. The absolute offset includes clock skew between hosts; it
-   * cancels, because only differences between the engine's own expiries matter.
+   * Wall time minus engine time, for recent renewals known to have been full
+   * extensions. The largest (least latency) maps an engine expiry onto the
+   * wall clock. The wall clock, because it keeps running through a host
+   * suspend as the engine's does, where the monotonic clock stands still.
+   * Only recent ones, so a reference from before a clock step cannot linger.
+   * The absolute offset includes skew between hosts; it cancels, because only
+   * differences between the engine's own expiries matter.
    */
-  private engineToLocal?: number;
+  private readonly fullOffsets: number[] = [];
   /** The latest renewal, not yet known to have been a full extension. */
   private pending?: { offset: number; expiresAtMs: number };
 
@@ -148,38 +153,47 @@ export class LeaseHeartbeat {
     // the engine is still holding.
     this.marginMs = options.marginMs ?? Math.min(intervalMs / 2, this.opts.extendMs / 2);
     const sentAt = options.acquiredSentAt ?? performance.now();
+    const sentWallAt = options.acquiredSentWallAt ?? Date.now() - (performance.now() - sentAt);
     this.deadline = 0;
     this.wallDeadline = 0;
-    this.setDeadline(sentAt + this.opts.leaseTtlMs - this.marginMs);
-  }
-
-  private setDeadline(monotonic: number): void {
-    this.deadline = monotonic;
-    this.wallDeadline = Date.now() + (monotonic - performance.now());
+    this.setDeadline({ mono: sentAt, wall: sentWallAt }, this.opts.leaseTtlMs - this.marginMs);
   }
 
   /**
-   * The local deadline after a confirmed renewal sent at `sentAt`.
+   * Both deadlines are counted from the same send, each on its own clock, so a
+   * suspend between the send and handling the answer delays neither.
+   */
+  private setDeadline(sent: { mono: number; wall: number }, durationMs: number): void {
+    this.deadline = sent.mono + durationMs;
+    this.wallDeadline = sent.wall + durationMs;
+  }
+
+  /**
+   * How long, from its send, a confirmed renewal sent at wall time `sentWallAt`
+   * keeps the lease held.
    *
    * Counted from the send, a full extension cannot outlive the engine's. But
    * near the maximum lease lifetime the engine grants less than it was asked,
-   * and only its expiry says so. That expiry is mapped onto the local clock
-   * through a renewal known to have been full, and the earlier time counts.
+   * and only its expiry says so. That expiry is mapped onto the wall clock
+   * through a renewal known to have been full, and the shorter time counts.
    *
    * A renewal is known to have been full once a later one expires strictly
    * later: a shortened renewal ends at the lease's fixed ceiling, which no
-   * later renewal can pass. Among those, the one with the least latency is the
-   * reference, so a single slow renewal cannot make later ones look shortened.
-   * Until a reference exists (the first renewal), the full extension counts.
+   * later renewal can pass. Among the last few of those, the one with the least
+   * latency is the reference, so a single slow renewal cannot make later ones
+   * look shortened. Until a reference exists (the first renewal), the full
+   * extension counts.
    */
-  private deadlineAfterRenewal(sentAt: number, engineExpiresAtMs: number | undefined): number {
-    const full = sentAt + this.opts.extendMs;
+  private renewalDuration(sentWallAt: number, engineExpiresAtMs: number | undefined): number {
+    const full = this.opts.extendMs;
     if (engineExpiresAtMs === undefined) return full - this.marginMs;
     if (this.pending && engineExpiresAtMs > this.pending.expiresAtMs) {
-      this.engineToLocal = Math.max(this.engineToLocal ?? -Infinity, this.pending.offset);
+      this.fullOffsets.push(this.pending.offset);
+      if (this.fullOffsets.length > 4) this.fullOffsets.shift();
     }
-    this.pending = { offset: full - engineExpiresAtMs, expiresAtMs: engineExpiresAtMs };
-    const mapped = this.engineToLocal === undefined ? full : engineExpiresAtMs + this.engineToLocal;
+    this.pending = { offset: sentWallAt + full - engineExpiresAtMs, expiresAtMs: engineExpiresAtMs };
+    if (this.fullOffsets.length === 0) return full - this.marginMs;
+    const mapped = engineExpiresAtMs + Math.max(...this.fullOffsets) - sentWallAt;
     return Math.min(full, mapped) - this.marginMs;
   }
 
@@ -211,9 +225,13 @@ export class LeaseHeartbeat {
   private armDeadline(): void {
     if (this.deadlineTimer) clearTimeout(this.deadlineTimer);
     if (this.stopped || this.lost) return;
-    // setTimeout clamps anything above 2^31-1 ms to 1 ms, which would spin; a
-    // capped wait just arms again when it fires short of the deadline.
-    const wait = Math.min(2 ** 31 - 1, Math.max(0, this.deadline - performance.now()));
+    // Timers run on the monotonic clock, which stands still while the host is
+    // suspended, so a woken host would not see its wall deadline until the
+    // monotonic one came due. Waking at least every half interval bounds that,
+    // so a signal handed to a request aborts soon after a wake. The cap also
+    // keeps the wait under setTimeout's 2^31-1 ms limit.
+    const cap = Math.max(1, Math.floor(this.opts.heartbeatIntervalMs / 2));
+    const wait = Math.min(cap, Math.max(0, this.deadline - performance.now()));
     this.deadlineTimer = setTimeout(() => {
       this.deadlineTimer = undefined;
       // Timers run on a millisecond clock and can fire a fraction early against
@@ -309,7 +327,7 @@ export class LeaseHeartbeat {
     // A renewal confirmed after the deadline does not clear the report: the
     // holder was told to stop acting, and another worker may have acted.
     if (!force) this.pastDeadline();
-    const sentAt = performance.now();
+    const sent = { mono: performance.now(), wall: Date.now() };
     try {
       const resp = await this.opts.client.renewLease(
         this.opts.agentId,
@@ -317,8 +335,13 @@ export class LeaseHeartbeat {
         this.opts.fencingToken,
         this.opts.extendMs,
         // Bound the RPC to half an interval, so a renewal that hangs gives up
-        // before the next tick is due rather than making that tick skip.
-        Math.max(1, Math.floor(this.opts.heartbeatIntervalMs / 2)) / 1000,
+        // before the next tick is due. Short TTLs get up to a second, never
+        // more than half the TTL: a renewal is a synced write, and one that
+        // takes longer than a short interval still keeps the lease.
+        Math.max(
+          Math.floor(this.opts.heartbeatIntervalMs / 2),
+          Math.min(1000, Math.floor(this.opts.extendMs / 2)),
+        ) / 1000,
       );
       if (this.stopped) return false;
       if (!resp.renewed) {
@@ -328,7 +351,7 @@ export class LeaseHeartbeat {
       // A failed renewal is not itself proof of loss, so only a confirmed one
       // moves the deadline, and only from when it was sent.
       const expiresAtMs = resp.newExpiresAtMs !== undefined ? Number(resp.newExpiresAtMs) : undefined;
-      this.setDeadline(this.deadlineAfterRenewal(sentAt, expiresAtMs));
+      this.setDeadline(sent, this.renewalDuration(sent.wall, expiresAtMs));
       this.armDeadline();
       this.emit({ type: "renewed", expiresAtMs });
       return true;

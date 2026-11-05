@@ -94,13 +94,12 @@ export class LeaseHandle {
    * another worker took over. Hand `signal` to the request to shorten it.
    */
   check(): void {
-    if (this.controller.signal.aborted || this.isLost) {
-      throw new LeaseLostError(
-        this.controller.signal.aborted
-          ? `Execution lease was lost: ${this.lostDetail}`
-          : "Execution lease was released when its block exited",
-      );
-    }
+    if (!this.isLost) return;
+    throw new LeaseLostError(
+      this.controller.signal.aborted
+        ? `Execution lease was lost: ${this.lostDetail}`
+        : "Execution lease was released when its block exited",
+    );
   }
 }
 
@@ -204,6 +203,7 @@ export async function executionLease<T>(
 
   try {
     const acquiredSentAt = performance.now();
+    const acquiredSentWallAt = Date.now();
     const resp = await client.checkIdempotencyCache(workerId, key, waitMs, ttlMs);
 
     if (resp.status === CacheStatus.HIT) {
@@ -247,6 +247,7 @@ export async function executionLease<T>(
       extendMs: ttlMs,
       leaseTtlMs: ttlMs,
       acquiredSentAt,
+      acquiredSentWallAt,
       onEvent,
       onLeaseLost: (detail) => {
         leaseHandle.markLost(detail);
@@ -262,13 +263,16 @@ export async function executionLease<T>(
       // younger than the request that won it, and a deadline counted from that
       // request would read a fresh lease as nearly expired. A renewal sent now
       // gives a deadline counted from a known time. One failed attempt is not a
-      // loss, so try a few while the lease, counted from when the grant
-      // arrived, could still be live. If none is confirmed the lease cannot be
-      // shown to be held, and the block does not run.
-      const grantArrivedAt = performance.now();
+      // loss, so try a few, backing off, while the lease, counted from when the
+      // grant arrived, could still be live. If none is confirmed, the deadline
+      // counted from the request still bounds the lease from below (the grant
+      // came after it), so the block runs only if that has not passed.
+      const windowEnd = performance.now() + ttlMs - hb.marginMs;
       for (let attempt = 0; attempt < 3 && !hb.lost; attempt++) {
         if (await hb.renewNow()) break;
-        if (performance.now() >= grantArrivedAt + ttlMs - hb.marginMs) break;
+        const pause = Math.min(100 * 2 ** attempt, windowEnd - performance.now());
+        if (pause <= 0) break;
+        await new Promise((resolve) => setTimeout(resolve, pause));
       }
     }
     // A lease already lost before the block starts must not run it: a block
@@ -291,7 +295,11 @@ export async function executionLease<T>(
     if (fencingToken > 0) {
       await client
         .releaseLease(workerId, key, fencingToken, "BLOCK_EXIT")
-        .then(() => emit({ type: "released" }))
+        .then((released) => {
+          // Only a release the engine confirms: if another worker holds the
+          // lease by now, there was nothing of this worker's to release.
+          if (released.released) emit({ type: "released" });
+        })
         .catch(() => {
           // The lease expires on its own; a failed release is not worth masking
           // whatever the block was doing.

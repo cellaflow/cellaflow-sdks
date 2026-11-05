@@ -199,6 +199,8 @@ export function tool<A extends unknown[], R>(
     // right move is to wait for their result rather than to act.
     for (;;) {
       let resp;
+      const acquiredSentAt = performance.now();
+      const acquiredSentWallAt = Date.now();
       try {
         resp = await ctx.client.checkIdempotencyCache(
           agentId,
@@ -258,6 +260,8 @@ export function tool<A extends unknown[], R>(
           idempotencyKey: ikey,
           fencingToken,
           heartbeatIntervalMs: intervalMs,
+          acquiredSentAt,
+          acquiredSentWallAt,
         });
         hb.start();
       }

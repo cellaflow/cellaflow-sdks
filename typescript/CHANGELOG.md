@@ -23,8 +23,12 @@ All notable changes to the CellaFlow TypeScript SDK.
   monotonic clock stands still while a host is suspended), and `signal` aborts when it passes. A
   holder stopped past its deadline fails `check()` the moment it resumes, before any renewal
   answers. After waiting for a lease (`waitMs` above 0), a renewal is made before the block runs,
-  since the engine may have granted the lease well after the request was sent; one failed attempt
-  is retried, and if none is confirmed the block does not run.
+  since the engine may have granted the lease well after the request was sent. A failed attempt is
+  retried with a short backoff; if none is confirmed, the deadline counted from the request still
+  bounds the lease from below, so the block runs only while that has not passed. Both deadlines are
+  counted from the send, each on its own clock, so a suspend while a renewal is answered delays
+  neither, and the deadline timer wakes at least every half interval, so a woken host's `signal`
+  aborts soon after it wakes.
 
   A passed deadline is reported but does not stop renewing: the engine may still hold the lease,
   and renewing keeps it until the engine refuses a renewal. `tool()`, which cannot act on a loss,
@@ -33,14 +37,15 @@ All notable changes to the CellaFlow TypeScript SDK.
   receives a second `lost` event carrying the engine's reason.
 
   Near the engine's maximum lease lifetime a renewal is granted less than it asked for. The
-  engine's expiry on each renewal is mapped onto the local clock through a renewal known to have
-  been full (a later one expired strictly later) and with the least latency, so a shortened one
+  engine's expiry on each renewal is mapped onto the wall clock through a recent renewal known to
+  have been full (a later one expired strictly later) and with the least latency, so a shortened one
   moves the deadline in by the shortfall and one slow renewal does not distort the rest. Only
   differences between the engine's own timestamps are used, so clock skew between hosts does not
   matter. A first renewal that is already shortened, or a TTL above the engine's maximum lifetime,
   is not detected.
 
-  Renewals time out after half an interval, so one that hangs gives up before the next is due, and
+  Renewals time out after half an interval (short TTLs get up to a second, since a renewal is a
+  synced write), so one that hangs gives up before the next is due, and
   the half-interval margin leaves a renewal sent one interval before expiry time to answer: one or
   two failed renewals in a row no longer lose a lease the engine still holds. Reading `signal`
   checks the clock, as `isLost` and `check()` do. In an `onEvent` callback for `lost`, the handle
@@ -50,7 +55,8 @@ All notable changes to the CellaFlow TypeScript SDK.
   renewal after a wait is refused. It throws `LeaseLostError` instead.
 - **`check()` fails once the block has exited**, so work the block started without awaiting cannot
   act under a lease that has been released. `signal` does not abort on release, only on loss: a
-  response fetched with it can still be read after the block returns.
+  response fetched with it can still be read after the block returns. `released` is reported only
+  when the engine confirms the release.
 
   `check()` still cannot close the gap between the check and the write landing at the other end:
   hand `signal` to the request to narrow it.
