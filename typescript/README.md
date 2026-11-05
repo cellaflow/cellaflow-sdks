@@ -79,6 +79,28 @@ await durableTools("ticket-4417", { coordinationId: "ticket-4417" }, async () =>
 
 **Rules.** A coordination id may not contain colons, may not have leading or trailing whitespace, and may not exceed 256 bytes; an empty string means none. Invalid values throw before anything runs, and are never trimmed. `normalizeCoordinationId` applies the same check.
 
+## Execution leases
+
+`executionLease` runs a block while holding a lock on a key, renewed by a heartbeat. One worker holds it at a time; if that worker dies, the lease stops being renewed and the next worker gets it once the TTL runs out, with a higher fencing token.
+
+```typescript
+import { executionLease, LeaseNotAcquired } from "@cellaflow/sdk";
+
+await executionLease("task:repo#42", { workerId: "worker-1", ttlMs: 30_000 }, async (lease) => {
+  const result = await doTheWork();
+  lease.check(); // throws LeaseLostError if the lease is gone
+  await postResult(result, { signal: lease.signal });
+});
+```
+
+**Options.** `workerId` (required), `target` (default `localhost:50051`), `secure`, `ttlMs` (default 30 000; each renewal extends by the same amount), `waitMs` (how long to wait for a lease another worker holds; default 0, which throws `LeaseNotAcquired` straight away), `onLeaseLost`, and `onEvent`. The engine answers acquisition with its own renewal interval, a quarter of the TTL; `heartbeatIntervalMs` is used only when it does not.
+
+**Losing the lease.** Node cannot preempt a running function, so loss is cooperative. `check()` throws `LeaseLostError` and `signal` aborts once the lease can no longer be assumed held. That is judged on the clock: each confirmed renewal sets a deadline counted from when it was sent, minus one renewal interval, so the holder gives up no later than the engine would hand the lease on. A process stopped past its deadline fails `check()` as soon as it resumes. Neither can recall a write that already left: a request sent just before the deadline can still land after another worker took over, which is why `signal` is worth passing to it.
+
+**Tracing.** `onEvent` receives `{ type, at, fencingToken, expiresAtMs?, detail? }` for `acquired`, `renewed`, `renew_failed`, `lost` and `released`. `at` is wall-clock epoch milliseconds; `expiresAtMs` is on the engine's clock.
+
+**A lock, not a record.** `executionLease` records no result, so the lease alone does not tell the next worker whether the work already happened; check the destination first, or use `tool()`, which leases and records the result. A key that is already committed throws `LeaseNotAcquired`.
+
 ## Features
 
 - **Built on Connect-ES**: Uses HTTP/2 for high performance and strict gRPC semantics.

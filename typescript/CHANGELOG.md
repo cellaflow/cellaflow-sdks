@@ -4,7 +4,28 @@ All notable changes to the CellaFlow TypeScript SDK.
 
 ## Unreleased
 
+### Added
+
+- **`onEvent` on `executionLease`**, called on acquisition, every renewal outcome, loss and
+  release, with a wall-clock time, the fencing token and, where the engine sent one, its expiry.
+  For tracing; it cannot change what the lease does.
+
 ### Fixed
+
+- **An execution lease is treated as lost no later than the engine treats it as expired.** Two
+  things let a holder keep going after another worker had taken its lease. Renewals asked the
+  engine for three heartbeat intervals (22.5 s at the default 30 s TTL) while loss was only declared
+  after the full TTL, and only when a heartbeat tick came round. And `check()` and `signal` reflected
+  the last renewal's answer, so a process resumed after a stop passed `check()` until its next
+  renewal came back refused. Renewals now ask for the full TTL. Each confirmed renewal sets a
+  deadline counted from when the renewal was sent, minus one heartbeat interval; `check()` and
+  `isLost` compare against it on every call, on the monotonic clock, and `signal` aborts when it
+  passes. A holder stopped past its deadline fails `check()` the moment it resumes, before any
+  renewal answers. After waiting for a lease (`waitMs` above 0), one renewal is made before the
+  block runs, since the engine may have granted the lease well after the request was sent.
+
+  `check()` still cannot close the gap between the check and the write landing at the other end:
+  hand `signal` to the request to narrow it.
 
 - **A session's history includes shared results it received.** When a `SHARED` tool was answered
   from another session's result, nothing was recorded at its position in the receiving session, so
