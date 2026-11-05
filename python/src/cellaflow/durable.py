@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator, Optional, cast
 
 from cellaflow.client import CellaflowClient
+from cellaflow.history import latest_session_sequence
 from cellaflow.idempotency import normalize_coordination_id
 
 logger = logging.getLogger(__name__)
@@ -189,11 +190,22 @@ def durable_tools(
     # claiming one) and reports `current_sequence`, which
     # `reconcile_sequence` adopts before the next step -- so the counter
     # re-converges on the engine's view rather than drifting.
+    #
+    # The counter starts where the session is, not at 0. A resumed thread's
+    # first call is often a tool that never ran (the node the thread had not
+    # reached), which is not a hit: counted from 0, it claimed position 1, which
+    # the session already holds, and the engine refused it as divergent before
+    # its body ran. Read once, here; a session that holds nothing reads as 0.
+    position = (
+        latest_session_sequence(client, resp.session_id, limit=1000)
+        if resp.is_recovered
+        else 0
+    )
     ctx = WorkflowContext(
         client=client,
         session_id=resp.session_id,
         workflow_version=resp.version,
-        sequence=0,
+        sequence=position,
         coordination_id=session_coordination_id(resp, coordination_id),
         # A resumed thread re-runs only its pending node, so this run never sees
         # what the session already holds, and must not record cache hits into it.

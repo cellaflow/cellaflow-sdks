@@ -323,6 +323,15 @@ export class WorkflowContext {
   }
 
   /**
+   * Moves this context's position to where the session is: its highest committed
+   * position. For a resumed `durableTools` session, whose first call is often a
+   * tool that never ran and so claims a position rather than hitting the cache.
+   */
+  async adoptEnginePosition(): Promise<void> {
+    this.sequence = await this.enginePosition(1);
+  }
+
+  /**
    * The session's highest committed position at or after `fromSequence`, or 0 if
    * there is none. The engine's page cursor is the first sequence to read and is
    * inclusive, so only the tail of the session is read.

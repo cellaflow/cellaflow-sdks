@@ -1439,3 +1439,55 @@ def test_sessions_are_deregistered_on_exit() -> None:
 
     with pytest.raises(RuntimeError, match="No active workflow context"):
         _dispatch_bare_executor(lambda: get_context().session_id)
+
+
+def test_a_resumed_thread_runs_a_tool_it_never_reached_at_the_next_position() -> None:
+    """A resumed thread's first call is often a tool it had not reached, which
+    is not a cache hit, so it claims a position. Counted from 0, it claimed
+    position 1, which the session already holds, and the engine refused it as
+    divergent before its body ran. It continues after what the session holds."""
+
+    def _reserve_seat(flight: str) -> str:
+        return f"seat on {flight}"
+
+    def _charge_card(amount: int) -> str:
+        return f"charged {amount}"
+
+    reserve_seat = cast(Any, tool(tool_name="reserve_seat")(_reserve_seat))
+    charge_card = cast(Any, tool(tool_name="charge_card")(_charge_card))
+
+    client = LeasingMockClient()
+    cfg: RunnableConfig = {"configurable": {"thread_id": "t-new-tool"}}
+    with patch("cellaflow.durable.CellaflowClient", return_value=client):
+        with durable_tools(cfg):
+            assert reserve_seat("BA117") == "seat on BA117"
+
+        session = tool_session_id("t-new-tool")
+        with patch.object(client, "start_session") as start:
+            start.return_value = MagicMock(
+                session_id=session, version="1.0.0", is_recovered=True,
+                coordination_id=None,
+            )
+            with durable_tools(cfg) as ctx:
+                assert ctx.sequence == 1
+                assert charge_card(450) == "charged 450"
+
+    assert [(s["sequence"], s["name"]) for s in client.graphs[session]] == [
+        (1, "reserve_seat"),
+        (2, "charge_card"),
+    ]
+
+
+def test_a_resumed_thread_with_no_history_starts_at_zero() -> None:
+    client = LeasingMockClient()
+    session = tool_session_id("t-empty")
+    client.graphs[session] = []
+    with patch("cellaflow.durable.CellaflowClient", return_value=client):
+        with patch.object(client, "start_session") as start:
+            start.return_value = MagicMock(
+                session_id=session, version="1.0.0", is_recovered=True,
+                coordination_id=None,
+            )
+            cfg: RunnableConfig = {"configurable": {"thread_id": "t-empty"}}
+            with durable_tools(cfg) as ctx:
+                assert ctx.sequence == 0

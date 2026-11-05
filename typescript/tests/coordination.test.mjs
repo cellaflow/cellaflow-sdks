@@ -274,3 +274,30 @@ test("an invalid durableTools coordination id fails before the session starts", 
     engine.restore();
   }
 });
+
+test("a resumed durableTools session runs a tool it never reached at the next position", async () => {
+  // A resumed thread's first call is often a tool it had not reached, which is
+  // not a cache hit, so it claims a position. Counted from 0, it claimed position
+  // 1, which the session already holds, and the engine refused it as divergent.
+  const engine = fakeEngine({ isRecovered: true, coordinationId: "ticket-4417" });
+  const proto = CellaflowClient.prototype;
+  const savedGraph = proto.getGraph;
+  const sequences = [];
+  proto.getGraph = async () => [[{ sequence: 1n }, { sequence: 2n }], undefined];
+  const savedCheck = proto.checkIdempotencyCache;
+  proto.checkIdempotencyCache = async function (...args) {
+    sequences.push(args[5]);
+    return savedCheck.apply(this, args);
+  };
+  try {
+    await durableTools("thread-1", { coordinationId: "ticket-4417" }, async (session) => {
+      assert.equal(session.context.sequence, 2);
+      await refund({ customer: "customer-88", cents: 10 });
+    });
+    assert.deepEqual(sequences, [3]);
+  } finally {
+    proto.getGraph = savedGraph;
+    proto.checkIdempotencyCache = savedCheck;
+    engine.restore();
+  }
+});

@@ -2,6 +2,16 @@
 
 All notable changes to the CellaFlow TypeScript SDK.
 
+## Unreleased
+
+### Fixed
+
+- **A resumed `durableTools` session can run a tool it had not reached.** A resumed session counted
+  positions from 0, so its first call that was not answered from the cache (the node the thread
+  had not reached yet, typically) claimed position 1, which the session already held, and the
+  engine refused it with `DivergentStepError` before its body ran. A resumed session now starts
+  after the last position it holds, read once from its history when it opens.
+
 ## 0.8.1
 
 ### Added
