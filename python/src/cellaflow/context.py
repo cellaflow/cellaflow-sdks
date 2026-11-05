@@ -29,10 +29,12 @@ from cellaflow.v1 import common_pb2, idempotency_pb2, service_pb2
 logger = logging.getLogger(__name__)
 
 
-def _held_payload(pending: Dict[str, Any]) -> Dict[str, Any]:
-    """A held failure's payload, if it was not prepared before the write."""
-    exc = pending.get("exc")
-    return {"error": capture(exc)} if exc is not None else {}
+def _identity(exc: Optional[BaseException]) -> Optional[Tuple[int, type]]:
+    """An exception's identity without a reference to it, which would keep its
+    traceback, and every frame in it, alive. Exceptions cannot be weakly
+    referenced; the class is kept with the id so a reused id is not mistaken
+    for the same exception."""
+    return None if exc is None else (id(exc), type(exc))
 
 
 class _RecordHeld(Exception):
@@ -117,6 +119,11 @@ class WorkflowContext:
     # See `_write_record`.
     _unreleased: Dict[int, Dict[str, Any]] = field(
         default_factory=dict, repr=False, compare=False
+    )
+    # The failures this run recorded, by the identity of their exception, with
+    # the step's name and position. See `note_run_ended`.
+    _recorded_failures: List[Tuple[Tuple[int, type], str, int]] = field(
+        default_factory=list, repr=False, compare=False
     )
     # The write of a pending record that async steps are waiting on. See
     # `begin_call_async`.
@@ -322,12 +329,24 @@ class WorkflowContext:
         position was claimed meanwhile, as for a hit. Otherwise nothing is
         recorded, as before.
         """
-        # The exception is held, not captured: most failures propagate and end the
-        # run, and then nothing is recorded. It is captured, and any warning
-        # about replaying it given, only when the record is written. See
-        # `_prepare_pending`.
+        # Captured now, before the workflow's handler runs: a handler that
+        # changes the exception (`e.attempts += 1`) must find on replay what it
+        # found the first time. Capturing also lets go of the exception, whose
+        # traceback keeps every frame of the failed step alive. Skipped when the
+        # failure could not be held anyway. The warnings about replaying it wait
+        # until it is recorded; see `_prepare_pending`.
+        with self._lock:
+            if not self._can_hold(sequence):
+                return
+        recorded = capture(exc)  # never raises
         self._hold_failure(
-            sequence, name, None, coordination_id, agent_id, step_key, exc=exc
+            sequence,
+            name,
+            {"error": recorded},
+            coordination_id,
+            agent_id,
+            step_key,
+            source=exc,
         )
 
     def defer_cancellation_record(
@@ -339,6 +358,7 @@ class WorkflowContext:
         agent_id: str = "default",
         step_key: str = "",
         since_run_start_s: Optional[float] = None,
+        source: Optional[BaseException] = None,
     ) -> None:
         """Holds a step's cancellation to be recorded at `sequence`.
 
@@ -358,32 +378,27 @@ class WorkflowContext:
             coordination_id,
             agent_id,
             step_key,
+            source=source,
         )
 
     def _hold_failure(
         self,
         sequence: int,
         name: str,
-        payload: Optional[Dict[str, Any]],
+        payload: Dict[str, Any],
         coordination_id: Optional[str],
         agent_id: str,
         step_key: str,
-        exc: Optional[BaseException] = None,
+        source: Optional[BaseException] = None,
     ) -> None:
         """Holds a failure-kind record, if nothing claimed a later position.
 
-        Either `payload` is given, or `exc` is, and the payload is captured from
-        it when the record is about to be written.
+        `source` is the exception, kept only as its identity and class: to warn
+        about replaying it when it is recorded, and to recognise it if the
+        workflow later ends by raising it. See `note_run_ended`.
         """
         with self._lock:
-            # As for a hit: a run that does not know everything the session
-            # holds (a resumed `durable_tools` thread) would record at a position
-            # the session already filled.
-            if not (
-                self.history_known
-                and self._in_flight == 1
-                and self.sequence == sequence
-            ):
+            if not self._can_hold(sequence):
                 return
             self._pending_hit = {
                 "kind": "failure",
@@ -391,46 +406,57 @@ class WorkflowContext:
                 "sequence": sequence,
                 "name": name,
                 "payload": payload,
-                "exc": exc,
+                "source": _identity(source),
+                "warn": source is not None and "error" in payload,
                 "coordination_id": coordination_id,
                 "agent_id": agent_id,
                 "received_key": step_key,
             }
 
-    def _prepare_pending(self) -> None:
-        """Captures a held failure before its record is written.
+    def _can_hold(self, sequence: int) -> bool:
+        """Whether a failure at `sequence` can be held for recording. Under the
+        lock.
 
-        Outside the lock, because formatting a traceback and encoding values is
-        work no other call in the session should wait on; the result is attached
-        only if the same record is still pending. The warnings about what a
-        resume could not reproduce are given here, once, because only now is the
-        failure certain to be recorded.
+        As for a hit: only while the step is the session's only call in flight
+        and no later position was claimed meanwhile, and only in a run that knows
+        everything the session holds (not a resumed `durable_tools` thread, which
+        would record at a position the session already filled).
+        """
+        return (
+            self.history_known
+            and self._in_flight == 1
+            and self.sequence == sequence
+        )
+
+    def _prepare_pending(self) -> None:
+        """Warns about what a resume could not reproduce of a held failure.
+
+        Here, once, just before its record is written, because only now is the
+        failure certain to be recorded: one the workflow lets propagate says
+        nothing. Outside the lock, because the check rebuilds the exception.
         """
         pending = self._pending_hit
-        if pending is None or pending.get("payload") is not None:
+        if pending is None or not pending.get("warn"):
             return
-        exc = pending.get("exc")
-        if exc is None:
-            return
-        recorded = capture(exc)  # never raises
         with self._lock:
-            first = self._pending_hit is pending and pending.get("payload") is None
+            first = self._pending_hit is pending and pending.get("warn")
             if first:
-                pending["payload"] = {"error": recorded}
-                pending["exc"] = None
+                pending["warn"] = False
         if first:
             try:
                 self._warn_if_not_replayable(
-                    exc, pending["name"], pending["sequence"], recorded
+                    pending["source"][1],
+                    pending["name"],
+                    pending["sequence"],
+                    pending["payload"]["error"],
                 )
             except Exception:
                 pass  # a warning is never worth failing a step over
 
     def _warn_if_not_replayable(
-        self, exc: BaseException, name: str, sequence: int, recorded: Dict[str, Any]
+        self, cls: type, name: str, sequence: int, recorded: Dict[str, Any]
     ) -> None:
         """Says now, while the failure happens, what a resume could not reproduce."""
-        cls = type(exc)
         if "grpc" in recorded:
             return
         if not findable(cls):
@@ -508,6 +534,36 @@ class WorkflowContext:
                 sequence,
                 ", ".join(missing),
             )
+
+    def note_run_ended(self, exc: BaseException) -> None:
+        """Warns when the workflow ends by raising a failure that was recorded.
+
+        A failure the workflow lets propagate is not recorded, so a resume runs
+        the step again. But a step that runs while it propagates (a cleanup in a
+        `finally`, or in an `except` that re-raises) needs the next position, so
+        the failure is recorded to fill it, and the history then holds both. A
+        resume replays them and ends with the same exception: it cannot run the
+        failed step again, because a later position is already filled.
+        """
+        chain: List[Optional[Tuple[int, type]]] = []
+        link: Optional[BaseException] = exc
+        while link is not None and len(chain) < 20:
+            chain.append(_identity(link))
+            link = link.__cause__ or link.__context__
+        for source, name, sequence in self._recorded_failures:
+            if source in chain:
+                logger.warning(
+                    "Cellaflow: the workflow ended with %s from %r at position %d "
+                    "of session %s. A step ran after that failure, so it was "
+                    "recorded, and resuming this session raises it again rather "
+                    "than running %r again. To run it again, start a new session.",
+                    source[1].__name__,
+                    name,
+                    sequence,
+                    self.session_id,
+                    name,
+                )
+                return
 
     def note_unreleased(
         self, sequence: int, agent_id: str, key: str, token: int, lapses_in_s: float
@@ -674,6 +730,10 @@ class WorkflowContext:
                     self.sequence,
                 )
                 return
+            if pending.get("kind") == "failure" and pending.get("source"):
+                self._recorded_failures.append(
+                    (pending["source"], pending["name"], pending["sequence"])
+                )
             self._pending_hit = None
             return
         if self._reported_sequence is not None:
@@ -758,7 +818,7 @@ class WorkflowContext:
                 sequence=pending["sequence"],
                 name=pending["name"],
                 status=pending["status"],
-                output_payload=pending["payload"] or _held_payload(pending),
+                output_payload=pending["payload"],
                 idempotency_key=key,
                 idempotency_fencing_token=token,
                 coordination_id=pending["coordination_id"],

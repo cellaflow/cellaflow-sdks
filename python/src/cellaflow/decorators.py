@@ -91,7 +91,11 @@ def workflow(
             )
             token = set_context(ctx)
             try:
-                result = await func(*args, **kwargs)
+                try:
+                    result = await func(*args, **kwargs)
+                except BaseException as exc:
+                    ctx.note_run_ended(exc)
+                    raise
                 # A failure the workflow caught, with no step after it to record
                 # it. Only on a normal return: a failure the workflow lets
                 # propagate stays unrecorded, so resuming retries the step.
@@ -149,7 +153,11 @@ def workflow(
             )
             token = set_context(ctx)
             try:
-                result = func(*args, **kwargs)
+                try:
+                    result = func(*args, **kwargs)
+                except BaseException as exc:
+                    ctx.note_run_ended(exc)
+                    raise
                 # See the async wrapper.
                 ctx.record_pending_failure()
                 return result
@@ -215,19 +223,14 @@ class FailureNotReplayableError(NondeterministicWorkflowError):
     """
 
 
-#: How long a replayed cancellation waits, as a multiple of the time the step ran
-#: before it was cancelled the first time, plus a fixed allowance. Long enough
-#: that whatever cancelled it then (a `wait_for` timer) does so again first.
-_CANCEL_WAIT_FACTOR = 2.0
+#: How long a replayed cancellation waits, as a multiple of how long the first
+#: run had taken to reach it, plus a fixed allowance: the margin for a resumed
+#: run going slower than the first. See `_replay_cancellation`.
+_CANCEL_WAIT_FACTOR = 1.25
 _CANCEL_WAIT_EXTRA_S = 0.25
 #: How long a lease lasts when there is no heartbeat to say: four of the
 #: engine's default 5-second heartbeat intervals.
 _DEFAULT_LEASE_TTL_MS = 20_000
-#: The most a replay waits, for a timeout around several steps, beyond what the
-#: step's own run time calls for. Earlier steps replay instantly, so that timeout
-#: fires later than it did; a wait without a bound would hold a resumed run for
-#: as long as the original run had been going.
-_CANCEL_WAIT_RUN_CAP_S = 120.0
 
 
 def _cancellation(recorded: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -305,25 +308,29 @@ async def _replay_cancellation(ctx: WorkflowContext, cancelled: Dict[str, Any]) 
     `asyncio.wait_for` turns its own cancellation into `TimeoutError`, while a
     `task.cancel()` arrives as `CancelledError`. So the replay does not raise
     anything at once. It waits, and whatever cancelled the step the first time
-    cancels it again, producing the same exception. If nothing does within twice
-    the time the step ran then (and no sooner than the run is as far in as it was
-    when the cancellation came, waiting at most two minutes for that), the
-    cancellation came from outside the code (a person pressing Cancel), and the
-    replay delivers it itself.
+    cancels it again, producing the same exception.
+
+    How long is bounded by how long the first run took to get here. Any timeout
+    in the code was set at a point this run reaches no later than the first run
+    did, since the steps before it replay instantly, so it fires no later than
+    it did then: by the time this run is as far in as the first was when the
+    cancellation came, and no later than the step's own run time after the step
+    started. Waiting until then (with a margin for a slower process) never
+    guesses. If nothing has cancelled the step by then, nothing in the code did,
+    so the cancellation came from outside (a person pressing Cancel), and the
+    replay delivers it itself. It is never capped below that: a shorter wait
+    would raise `CancelledError` where the first run saw `TimeoutError`.
     """
     elapsed = float(cancelled.get("elapsed_s") or 0.0)
     wait = elapsed * _CANCEL_WAIT_FACTOR + _CANCEL_WAIT_EXTRA_S
     since_start = cancelled.get("since_run_start_s")
     if since_start is not None:
-        # A timeout set around several steps started before this one, and earlier
-        # steps replay instantly, so it fires later relative to this step than it
-        # did the first time. It started no earlier than the run did, so by the
-        # time this replayed run is as far in as the first one was when the
-        # cancellation came, it has fired.
-        # Only this wait is capped; the step's own is not, so a single step
-        # under a long `wait_for` still replays its timeout.
-        deadline = ctx.run_started + float(since_start) * 1.25 + _CANCEL_WAIT_EXTRA_S
-        wait = max(wait, min(deadline - time.monotonic(), _CANCEL_WAIT_RUN_CAP_S))
+        deadline = (
+            ctx.run_started
+            + float(since_start) * _CANCEL_WAIT_FACTOR
+            + _CANCEL_WAIT_EXTRA_S
+        )
+        wait = max(wait, deadline - time.monotonic())
     await asyncio.sleep(wait)
     raise asyncio.CancelledError()
 
@@ -435,6 +442,7 @@ def _note_failure(
                 agent_id=agent_id,
                 step_key=ikey or "",
                 since_run_start_s=time.monotonic() - ctx.run_started,
+                source=exc,
             )
             return
         if not isinstance(exc, Exception):

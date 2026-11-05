@@ -40,7 +40,14 @@ All notable changes to the CellaFlow Python SDK.
   failure never replaces the step's own exception, and neither does a lease that cannot be
   released after it.
 
-  A failure the workflow lets propagate is not recorded, so resuming retries the step. A failure
+  The exception is recorded as the step raised it, before the workflow's handler runs, so a
+  handler that changes it finds the original values on replay too; the record keeps what was
+  captured, not the exception, so the failed step's frames are released.
+
+  A failure the workflow lets propagate is not recorded, so resuming retries the step, unless a
+  step runs while it propagates (a cleanup in a `finally`): that step needs the next position, so
+  the failure is recorded to fill it, and a resume ends with the same exception. The run warns when
+  it ends that way, and says to start a new session to run the step again. A failure
   while another step of the session is in flight is not recorded either, nor one in a run that has
   not read the session's history (a resumed `durable_tools` thread). A record still unwritten when
   the workflow returns is written then; if that fails after a few retries, the workflow's result
@@ -52,11 +59,12 @@ All notable changes to the CellaFlow Python SDK.
   A cancelled async step (`asyncio.CancelledError`) is recorded the same way, with how long it ran
   before the cancellation, and its lease is released. On replay it does not raise at once: it waits,
   so whatever cancelled it the first time cancels it again and the code sees the same exception
-  (`asyncio.wait_for` turns its own cancellation into `TimeoutError`). If nothing has cancelled it
-  after twice the time it ran, and no sooner than the resumed run is as far in as the first run was
-  when the cancellation came (so a timeout set around several steps fires first, waiting at most
-  two minutes for that), the cancellation came from outside the code, and the replay delivers it
-  itself. A replayed timeout therefore takes as long as the original wait; putting the timeout
+  (`asyncio.wait_for` turns its own cancellation into `TimeoutError`). Any timeout in the code
+  fires again no later than it did, so the replay waits until the resumed run is as far in as the
+  first run was when the cancellation came, with a 25% margin; if nothing has cancelled the step by
+  then, the cancellation came from outside the code, and the replay delivers it itself. The wait is
+  never capped below that, which would raise `CancelledError` where the first run saw
+  `TimeoutError`. A replayed timeout therefore takes about as long as the original wait; putting the timeout
   inside the step (`return await asyncio.wait_for(call(), 5)` in its body) records a plain
   `TimeoutError` instead, which replays at once.
 

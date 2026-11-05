@@ -1059,20 +1059,11 @@ def test_a_missing_field_keeps_the_exact_class_and_runs_none_of_its_code() -> No
     assert isinstance(vars(exc)["response"], UnavailableOnReplay)
 
 
-def test_a_failure_that_propagates_is_never_captured(
-    mock_stub: MagicMock, mock_client: None, caplog: Any, monkeypatch: Any
+def test_a_failure_that_propagates_is_neither_recorded_nor_warned_about(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
 ) -> None:
-    """Nothing is recorded for it, so nothing is captured and nothing is said
-    about how it would replay."""
-    from cellaflow.failures import capture as real_capture
-
-    captured: List[Any] = []
-
-    def counting_capture(exc: BaseException) -> Any:
-        captured.append(exc)
-        return real_capture(exc)
-
-    monkeypatch.setattr("cellaflow.context.capture", counting_capture)
+    """Nothing is recorded for it, so nothing is said about how it would replay,
+    and a resume runs the step again."""
     _fresh(mock_stub, "sess-propagate-quiet")
 
     class Local(Exception):
@@ -1089,8 +1080,9 @@ def test_a_failure_that_propagates_is_never_captured(
     with caplog.at_level("WARNING", logger="cellaflow.context"):
         with pytest.raises(Local):
             wf()
-    assert captured == []
+    mock_stub.CommitStep.assert_not_called()
     assert "not defined at module level" not in caplog.text
+    assert "resuming this session raises it again" not in caplog.text
 
 
 # --- Review fixes, round three --------------------------------------------------
@@ -1228,15 +1220,25 @@ def _cancelled_at(seq: int, elapsed_s: float, since_run_start_s: float) -> Any:
     )
 
 
-def test_the_wait_for_a_timeout_around_earlier_steps_is_capped(
+def test_a_long_timeout_around_earlier_steps_still_replays_as_a_timeout(
     mock_stub: MagicMock, mock_client: None, monkeypatch: Any
 ) -> None:
-    """A cancellation that came three hours into the original run does not hold
-    the resumed run for three hours."""
-    import time
+    """The replay waits until the run is as far in as the first was, however
+    long that is. A cap below it raised `CancelledError` where the first run saw
+    `TimeoutError`, so the run took a different branch."""
+    # The previous code capped this wait; at 0.2 s it would give up first.
+    monkeypatch.setattr(
+        "cellaflow.decorators._CANCEL_WAIT_RUN_CAP_S", 0.2, raising=False
+    )
+    _history(
+        mock_stub,
+        "sess-long-scope",
+        [_succeeded(1, "prepare", "ready"), _cancelled_at(2, 0.01, 0.6)],
+    )
 
-    monkeypatch.setattr("cellaflow.decorators._CANCEL_WAIT_RUN_CAP_S", 0.2)
-    _history(mock_stub, "sess-cap", [_cancelled_at(1, 0.01, 3 * 3600.0)])
+    @step
+    async def prepare() -> str:
+        return "ready"
 
     @step
     async def charge() -> str:
@@ -1244,25 +1246,27 @@ def test_the_wait_for_a_timeout_around_earlier_steps_is_capped(
 
     @workflow(version="1.0.0")
     async def wf() -> str:
-        return await charge()  # type: ignore[no-any-return]
+        async def both() -> str:
+            await prepare()
+            return await charge()  # type: ignore[no-any-return]
 
-    async def run() -> None:
-        run_wf: Any = wf
-        await asyncio.wait_for(run_wf(_session_id="sess-cap"), 5.0)
+        try:
+            return await asyncio.wait_for(both(), 0.6)
+        except asyncio.TimeoutError:
+            return "timed out"
 
-    started = time.monotonic()
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(run())
-    assert time.monotonic() - started < 2.0
+    run_wf: Any = wf
+    assert asyncio.run(run_wf(_session_id="sess-long-scope")) == "timed out"
 
 
-def test_the_steps_own_wait_is_not_capped(
-    mock_stub: MagicMock, mock_client: None, monkeypatch: Any
+def test_a_cancellation_from_outside_is_delivered_after_the_bounded_wait(
+    mock_stub: MagicMock, mock_client: None
 ) -> None:
-    """A single step under a long `wait_for` still waits for that timeout."""
+    """Nothing in the code cancels the step on replay, so once the run is as far
+    in as the first was (with the margin), the replay delivers the cancellation
+    itself, and not much later."""
     import time
 
-    monkeypatch.setattr("cellaflow.decorators._CANCEL_WAIT_RUN_CAP_S", 0.0)
     _history(mock_stub, "sess-own", [_cancelled_at(1, 0.3, 0.3)])
 
     @step
@@ -1276,7 +1280,8 @@ def test_the_steps_own_wait_is_not_capped(
     started = time.monotonic()
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(wf(_session_id="sess-own"))  # type: ignore[call-arg]
-    assert time.monotonic() - started >= 0.8  # 0.3 * 2 + 0.25
+    waited = time.monotonic() - started
+    assert 0.6 <= waited < 1.5  # 0.3 * 1.25 + 0.25, from the start of the run
 
 
 def test_a_timeout_that_expires_during_the_commit_does_not_cancel_a_committed_step(
@@ -1774,3 +1779,149 @@ def test_a_resume_names_the_import_a_missing_module_needs() -> None:
         assert str(rebuild(recorded, "charge", 1)) == "card declined"
     finally:
         sys.modules.pop("unloaded_payments", None)
+
+
+# --- Review fixes, round five ---------------------------------------------------
+
+
+class RateLimited(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.attempts = 0
+
+
+def test_a_failure_is_recorded_as_the_step_raised_it_not_as_the_handler_left_it(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """A handler that changes the exception must find on replay what it found
+    the first time, or it can take a different branch."""
+    _fresh(mock_stub, "sess-mutated")
+
+    @step
+    def fetch() -> str:
+        raise RateLimited("slow down")
+
+    @step
+    def backoff(attempts: int) -> int:
+        return attempts
+
+    @workflow(version="1.0.0")
+    def wf() -> int:
+        try:
+            fetch()
+        except RateLimited as e:
+            e.attempts += 1
+            return backoff(e.attempts)  # type: ignore[no-any-return]
+        return 0
+
+    assert wf() == 1
+    first = mock_stub.CommitStep.call_args_list[0][0][0]
+    record = deserialize(first.step_result.output_payload)["error"]
+    assert record["attrs"]["attempts"] == 0
+
+
+def test_a_held_failure_does_not_keep_the_failed_steps_frames_alive(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The record holds what was captured, not the exception, whose traceback
+    would keep every local of the failed step alive until the next step."""
+    import gc
+    import weakref
+
+    _fresh(mock_stub, "sess-frames")
+
+    class Buffer:
+        pass
+
+    refs: List[Any] = []
+    alive_while_held: List[bool] = []
+
+    @step
+    def download() -> str:
+        buffer = Buffer()  # a large response, say
+        refs.append(weakref.ref(buffer))
+        raise PaymentDeclined("bad response")
+
+    @step
+    def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            download()
+        except PaymentDeclined:
+            pass
+        gc.collect()
+        alive_while_held.append(refs[0]() is not None)
+        return notify()  # type: ignore[no-any-return]
+
+    assert wf() == "notified"
+    assert alive_while_held == [False]
+    assert _commits(mock_stub) == [(1, "download", FAILED), (2, "notify", SUCCESS)]
+
+
+def test_a_failure_a_cleanup_step_followed_says_a_resume_will_raise_it_again(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
+) -> None:
+    """The cleanup needs the next position, so the failure is recorded to fill
+    the one before it, and a resume replays both and ends the same way. The run
+    says so, and what to do instead."""
+    _fresh(mock_stub, "sess-finally")
+
+    @step
+    def charge() -> str:
+        raise PaymentDeclined("no funds")
+
+    @step
+    def release_hold() -> str:
+        return "released"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            return charge()  # type: ignore[no-any-return]
+        finally:
+            release_hold()
+
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        with pytest.raises(PaymentDeclined):
+            wf()
+    assert _commits(mock_stub) == [(1, "charge", FAILED), (2, "release_hold", SUCCESS)]
+    assert "the workflow ended with PaymentDeclined from 'charge'" in caplog.text
+    assert "To run it again, start a new session" in caplog.text
+
+
+def test_an_interrupted_run_with_a_cleanup_step_says_the_same(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
+) -> None:
+    """Ctrl-C reaches an async step as a cancellation. With a cleanup step after
+    it, the cancellation is recorded, and the run says what a resume will do."""
+    _fresh(mock_stub, "sess-interrupted")
+
+    @step
+    async def long_task() -> str:
+        await asyncio.sleep(5)
+        return "done"
+
+    @step
+    async def release_hold() -> str:
+        return "released"
+
+    @workflow(version="1.0.0")
+    async def wf() -> str:
+        try:
+            return await long_task()  # type: ignore[no-any-return]
+        finally:
+            await release_hold()
+
+    async def interrupt() -> None:
+        task = asyncio.ensure_future(wf())
+        await asyncio.sleep(0.1)
+        task.cancel()  # what asyncio.run does on Ctrl-C
+        await task
+
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(interrupt())
+    assert "the workflow ended with CancelledError from 'long_task'" in caplog.text
