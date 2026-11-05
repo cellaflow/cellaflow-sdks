@@ -16,7 +16,7 @@ from cellaflow.context import (
     get_context,
     session_coordination_id,
 )
-from cellaflow.history import iter_session_steps
+from cellaflow.history import GRAPH_PAGE, iter_session_steps
 from cellaflow.idempotency import (
     derive_idempotency_key,
     normalize_coordination_id,
@@ -64,7 +64,7 @@ def workflow(
                 # replaying. The engine just reported the session as recovered, so
                 # NOT_FOUND here is a failure, not an empty history.
                 steps = iter_session_steps(
-                    client, resp.session_id, limit=1000, missing_ok=False
+                    client, resp.session_id, limit=GRAPH_PAGE, missing_ok=False
                 )
                 for step_info in steps:
                     # Keep the name, not just the payload. Replay is
@@ -116,7 +116,7 @@ def workflow(
                 # replaying. The engine just reported the session as recovered, so
                 # NOT_FOUND here is a failure, not an empty history.
                 steps = iter_session_steps(
-                    client, resp.session_id, limit=1000, missing_ok=False
+                    client, resp.session_id, limit=GRAPH_PAGE, missing_ok=False
                 )
                 for step_info in steps:
                     # Keep the name, not just the payload. Replay is

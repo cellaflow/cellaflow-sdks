@@ -189,11 +189,19 @@ def durable_tools(
     # claiming one) and reports `current_sequence`, which
     # `reconcile_sequence` adopts before the next step -- so the counter
     # re-converges on the engine's view rather than drifting.
+    #
+    # But a resumed thread's first call is often a tool that never ran (the
+    # node the thread had not reached), which is not a hit and claims a
+    # position: counted from 0, it claimed position 1, which the session
+    # already holds, and the engine refused it as divergent before its body
+    # ran. So a resumed session's position is marked unknown, and its first
+    # claim reads it, unless a hit has reported it by then.
     ctx = WorkflowContext(
         client=client,
         session_id=resp.session_id,
         workflow_version=resp.version,
         sequence=0,
+        position_known=not resp.is_recovered,
         coordination_id=session_coordination_id(resp, coordination_id),
         # A resumed thread re-runs only its pending node, so this run never sees
         # what the session already holds, and must not record cache hits into it.

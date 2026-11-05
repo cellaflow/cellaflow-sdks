@@ -6,6 +6,15 @@ All notable changes to the CellaFlow Python SDK.
 
 ### Fixed
 
+- **A resumed `durable_tools` thread can run a tool it had not reached.** A resumed session counted
+  positions from 0, so its first call that was not answered from the cache (the node the thread
+  had not reached yet, typically) claimed position 1, which the session already held, and the
+  engine refused it with `DivergentStepError` before its body ran. A resumed session now continues
+  after the last position it holds, read from its history at its first call, or taken from a
+  cache hit that reports it. A session the engine reports as recovered but whose history it cannot
+  find is an error, not a session at position 0; a read that fails with an error that may pass
+  lets the call go ahead as before, and the next call reads again.
+
 - **A session that received a shared result can be resumed.** When a `SCOPE_SHARED` step was
   answered from another session's result, nothing was recorded at its position in the receiving
   session, so the next step took that position. Resuming the session then found the next step where
