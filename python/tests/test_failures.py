@@ -1326,31 +1326,6 @@ def test_a_record_that_cannot_be_written_after_the_workflow_returns_keeps_its_re
     assert "The workflow's result stands" in caplog.text
 
 
-def test_a_record_held_by_a_lease_is_not_waited_for_after_the_workflow_returns(
-    mock_stub: MagicMock, mock_client: None, caplog: Any
-) -> None:
-    """A caller with a timeout would otherwise lose a finished run to a record
-    waiting for a lease to lapse."""
-    import time
-
-    _fresh(mock_stub, "sess-end-held")
-    acquired = mock_stub.CheckIdempotencyCache.return_value
-
-    def check(req: Any, **kwargs: Any) -> Any:
-        if ":failure:" in req.idempotency_key:
-            return idempotency_pb2.CheckCacheResponse(
-                status=idempotency_pb2.CACHE_STATUS_IN_PROGRESS, retry_after_ms=5000
-            )
-        return acquired
-
-    mock_stub.CheckIdempotencyCache.side_effect = check
-    started = time.monotonic()
-    with caplog.at_level("WARNING", logger="cellaflow.context"):
-        assert _caught_then_returns(PaymentDeclined("no funds"))() == "done"
-    assert time.monotonic() - started < 1.0
-    assert "a lease still holds its position" in caplog.text
-
-
 def test_a_failure_is_not_recorded_by_a_run_that_does_not_know_the_history() -> None:
     """As for a hit: a resumed `durable_tools` thread counts positions from 0, so
     it would record at a position the session already filled."""
@@ -1824,57 +1799,6 @@ def test_a_release_retried_by_the_record_is_timed_from_the_heartbeat_stopping(
     assert "lapses_at" not in lease  # the caller's copy is left alone
 
 
-@pytest.mark.background_records
-def test_a_workflows_result_does_not_wait_for_its_last_record(
-    mock_stub: MagicMock, mock_client: None
-) -> None:
-    """The record is written on its own thread, after the result is returned,
-    and `wait_for_record_writes` waits for it."""
-    import threading
-    import time
-
-    from cellaflow.context import wait_for_record_writes
-
-    _fresh(mock_stub, "sess-background")
-    answer = mock_stub.CommitStep.side_effect
-    writing = threading.Event()
-
-    def slow_commit(req: Any, **kwargs: Any) -> Any:
-        if req.step_result.status == FAILED:
-            writing.set()
-            time.sleep(0.5)
-        return answer(req, **kwargs)
-
-    mock_stub.CommitStep.side_effect = slow_commit
-    started = time.monotonic()
-    assert _caught_then_returns(PaymentDeclined("no funds"))() == "done"
-    assert time.monotonic() - started < 0.4
-    assert writing.wait(timeout=2)
-    wait_for_record_writes()
-    assert _commits(mock_stub) == [(1, "charge", FAILED)]
-
-
-@pytest.mark.background_records
-def test_a_workflow_with_nothing_to_record_starts_no_writer(
-    mock_stub: MagicMock, mock_client: None
-) -> None:
-    import threading
-
-    _fresh(mock_stub, "sess-nothing")
-
-    @step
-    def charge() -> str:
-        return "charged"
-
-    @workflow(version="1.0.0")
-    def wf() -> str:
-        return charge()  # type: ignore[no-any-return]
-
-    before = {t.name for t in threading.enumerate()}
-    assert wf() == "charged"
-    assert "cellaflow-record" not in {t.name for t in threading.enumerate()} - before
-
-
 def test_steps_failing_together_stop_recording_rather_than_skip_a_position(
     mock_stub: MagicMock, mock_client: None
 ) -> None:
@@ -2104,41 +2028,6 @@ def test_fields_kept_in_slots_are_recorded_and_replayed() -> None:
     assert not isinstance(getattr(rebuilt, "retry_after"), UnavailableOnReplay)
 
 
-@pytest.mark.background_records
-def test_a_new_run_of_a_session_waits_for_its_last_record(
-    mock_stub: MagicMock, mock_client: None
-) -> None:
-    """Otherwise it could read the history before the record lands, and put its
-    own next step on that position."""
-    import threading
-    import time
-
-    _fresh(mock_stub, "sess-rerun")
-    order: List[str] = []
-    answer = mock_stub.CommitStep.side_effect
-
-    def slow_commit(req: Any, **kwargs: Any) -> Any:
-        if req.step_result.status == FAILED:
-            time.sleep(0.3)
-            order.append("record written")
-        return answer(req, **kwargs)
-
-    def start(req: Any, **kwargs: Any) -> Any:
-        order.append("session started")
-        return service_pb2.StartSessionResponse(
-            session_id="sess-rerun", version="1.0.0", is_recovered=False
-        )
-
-    mock_stub.CommitStep.side_effect = slow_commit
-    mock_stub.StartSession.side_effect = start
-    wf = _caught_then_returns(PaymentDeclined("no funds"))
-    wf(_session_id="sess-rerun")
-    writers = [t for t in threading.enumerate() if t.name == "cellaflow-record"]
-    assert writers and all(t.daemon for t in writers)
-    wf(_session_id="sess-rerun")
-    assert order[:3] == ["session started", "record written", "session started"]
-
-
 # --- Review fixes, round eight --------------------------------------------------
 
 
@@ -2147,8 +2036,8 @@ def test_a_cancellation_nothing_follows_is_recorded_and_a_rerun_refuses(
 ) -> None:
     """Left unrecorded, a re-run of the finished session would run the
     cancelled step's body again: its side effect could repeat, and if it now
-    succeeds, the run takes a different branch (rules 1 and 2). Recorded, a
-    re-run refuses there (rule 3 gives way)."""
+    succeeds, the run takes a different branch. Recorded, a re-run refuses
+    there instead, and the result is read from the session's history."""
     from cellaflow import FailureNotReplayableError
 
     _fresh(mock_stub, "sess-cancel-last")
@@ -2176,49 +2065,6 @@ def test_a_cancellation_nothing_follows_is_recorded_and_a_rerun_refuses(
     with pytest.raises(FailureNotReplayableError):
         asyncio.run(run_wf(_session_id="sess-cancel-last"))
     assert ran == ["charge"]
-
-
-def test_waiting_for_record_writes_has_one_deadline_for_all() -> None:
-    import threading
-    import time
-
-    from cellaflow import context
-
-    stalled = [
-        threading.Thread(target=time.sleep, args=(1.0,), daemon=True) for _ in range(3)
-    ]
-    for writer in stalled:
-        writer.start()
-    context._writers["sess-stalled"] = set(stalled)
-    try:
-        started = time.monotonic()
-        context.wait_for_record_writes(0.3, session_id="sess-stalled")
-        assert time.monotonic() - started < 0.6
-    finally:
-        del context._writers["sess-stalled"]
-
-
-@pytest.mark.background_records
-def test_a_writer_that_cannot_start_never_costs_the_workflows_result(
-    mock_stub: MagicMock, mock_client: None, monkeypatch: Any, caplog: Any
-) -> None:
-    import threading
-
-    from cellaflow import context
-
-    original = threading.Thread.start
-
-    def refuse(self: threading.Thread) -> None:
-        if self.name == "cellaflow-record":
-            raise RuntimeError("can't start new thread")
-        original(self)
-
-    monkeypatch.setattr(threading.Thread, "start", refuse)
-    _fresh(mock_stub, "sess-no-thread")
-    with caplog.at_level("WARNING", logger="cellaflow.context"):
-        assert _caught_then_returns(PaymentDeclined("no funds"))() == "done"
-    assert "could not start writing the failure" in caplog.text
-    assert "sess-no-thread" not in context._writers
 
 
 def test_a_steps_own_nondeterministic_error_replays_without_stopping_the_run(
@@ -2314,31 +2160,6 @@ def test_an_unreleased_lease_allows_for_a_renewal_still_on_its_way() -> None:
     assert lease is not None and lease["lapses_in_s"] == 26.0
 
 
-@pytest.mark.background_records
-def test_a_run_refuses_to_start_while_a_previous_run_is_still_writing(
-    mock_stub: MagicMock, mock_client: None, monkeypatch: Any
-) -> None:
-    """Rather than read a history missing that position and run the step
-    there again."""
-    import threading
-    import time
-
-    from cellaflow import RecordStillBeingWritten, context
-
-    monkeypatch.setattr("cellaflow.context._EXIT_WAIT_S", 0.1)
-    stalled = threading.Thread(target=time.sleep, args=(1.0,), daemon=True)
-    stalled.start()
-    context._writers["sess-busy"] = {stalled}
-    try:
-        with pytest.raises(RecordStillBeingWritten, match="try again shortly"):
-            _caught_then_returns(PaymentDeclined("no funds"))(
-                _session_id="sess-busy"
-            )
-        mock_stub.StartSession.assert_not_called()
-    finally:
-        del context._writers["sess-busy"]
-
-
 def _refused_then(then: Callable[[], Any]) -> Callable[..., Any]:
     """A workflow whose replay refuses at its first step, which it catches."""
 
@@ -2370,7 +2191,7 @@ def test_a_refusal_does_not_replace_an_interrupt_the_run_ends_with(
         _refused_then(interrupted)(_session_id="sess-interrupt")
 
 
-def test_a_refusal_raised_again_is_the_original_with_its_traceback(
+def test_a_refusal_raised_again_is_caused_by_the_original(
     mock_stub: MagicMock, mock_client: None
 ) -> None:
     from cellaflow import ReplayDivergedError
@@ -2396,4 +2217,126 @@ def test_a_refusal_raised_again_is_the_original_with_its_traceback(
 
     with pytest.raises(ReplayDivergedError) as again:
         wf(_session_id="sess-original")  # type: ignore[call-arg]
-    assert again.value is caught[0]
+    # A copy, caused by the original, which keeps the original's traceback.
+    assert again.value is not caught[0] and again.value.__cause__ is caught[0]
+
+
+# --- Review fixes, round ten ----------------------------------------------------
+
+
+def test_the_last_failure_record_is_written_before_the_workflow_returns(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """Written in the background, it could be lost after the run reported its
+    result, and a re-run would run the step again."""
+    order: List[str] = []
+    _fresh(mock_stub, "sess-final")
+    answer = mock_stub.CommitStep.side_effect
+
+    def commit(req: Any, **kwargs: Any) -> Any:
+        order.append(f"commit {req.step_result.name}")
+        return answer(req, **kwargs)
+
+    mock_stub.CommitStep.side_effect = commit
+    result = _caught_then_returns(PaymentDeclined("no funds"))()
+    order.append(f"returned {result}")
+    assert order == ["commit charge", "returned done"]
+    _, kwargs = mock_stub.CommitStep.call_args
+    assert kwargs.get("timeout") == 10.0  # every record call is bounded
+
+
+def test_the_last_record_waits_out_the_failed_steps_unreleased_lease(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """Off the result's critical path no longer, but still the only way to
+    record it: a single attempt would always be refused by that lease."""
+    mock_stub.ReleaseLease.side_effect = Unavailable()
+    acquired = mock_stub.CheckIdempotencyCache.return_value
+    refusals = [Claimed()]
+
+    def check(req: Any, **kwargs: Any) -> Any:
+        if ":failure:" in req.idempotency_key and refusals:
+            raise refusals.pop()
+        return acquired
+
+    mock_stub.CheckIdempotencyCache.side_effect = check
+    _fresh(mock_stub, "sess-final-held")
+    assert _caught_then_returns(PaymentDeclined("no funds"))() == "done"
+    assert _commits(mock_stub) == [(1, "charge", FAILED)]
+
+
+def test_the_last_record_held_by_someone_elses_lease_is_waited_for_a_bounded_time(
+    mock_stub: MagicMock, mock_client: None, caplog: Any, monkeypatch: Any
+) -> None:
+    import time
+
+    monkeypatch.setattr("cellaflow.context._FINAL_HELD_WAIT_S", 0.3)
+    _fresh(mock_stub, "sess-final-busy")
+    acquired = mock_stub.CheckIdempotencyCache.return_value
+
+    def check(req: Any, **kwargs: Any) -> Any:
+        if ":failure:" in req.idempotency_key:
+            return idempotency_pb2.CheckCacheResponse(
+                status=idempotency_pb2.CACHE_STATUS_IN_PROGRESS, retry_after_ms=100
+            )
+        return acquired
+
+    mock_stub.CheckIdempotencyCache.side_effect = check
+    started = time.monotonic()
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert _caught_then_returns(PaymentDeclined("no funds"))() == "done"
+    assert time.monotonic() - started < 1.0
+    assert "a lease still holds its position" in caplog.text
+
+
+class PaymentFailed(Exception):
+    pass
+
+
+def test_a_refusal_replaces_an_exception_the_workflow_raises_from_it(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """`except Exception: raise PaymentFailed(...)` would otherwise end the
+    resumed run with an outcome the first run never produced."""
+    from cellaflow import ReplayDivergedError
+
+    _history(mock_stub, "sess-wrapped", [_succeeded(1, "warmup", "ok")])
+
+    @step
+    def charge() -> str:
+        return "charged"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            return charge()  # type: ignore[no-any-return]
+        except Exception:
+            raise PaymentFailed("declined")
+
+    with pytest.raises(ReplayDivergedError):
+        wf(_session_id="sess-wrapped")  # type: ignore[call-arg]
+
+
+def test_a_failed_steps_heartbeat_is_stopped_before_its_lease_is_released(
+    mock_stub: MagicMock, mock_client: None, monkeypatch: Any
+) -> None:
+    """Otherwise it can renew the lease after the release."""
+    order: List[str] = []
+    from cellaflow.lease import LeaseHeartbeat
+
+    original = LeaseHeartbeat.stop_sync
+
+    def stopping(self: Any) -> None:
+        order.append("heartbeat stopped")
+        original(self)
+
+    monkeypatch.setattr(LeaseHeartbeat, "stop_sync", stopping)
+
+    def release(req: Any, **kwargs: Any) -> Any:
+        order.append("lease released")
+        return idempotency_pb2.ReleaseLeaseResponse()
+
+    mock_stub.ReleaseLease.side_effect = release
+    _fresh(mock_stub, "sess-order")
+    _caught_then_returns(PaymentDeclined("no funds"))()
+    assert order.index("heartbeat stopped") < order.index("lease released")

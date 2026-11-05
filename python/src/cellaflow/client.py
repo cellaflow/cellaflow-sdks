@@ -56,11 +56,13 @@ class CellaflowClient:
         idempotency_key: Optional[str] = None,
         idempotency_fencing_token: Optional[int] = None,
         coordination_id: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> service_pb2.CommitStepResponse:
         """Commits a step.
 
         `coordination_id` records the step under its own coordination domain.
         When omitted, the engine records it under the session's default.
+        `timeout` bounds the RPC in seconds.
         """
         # Strictly serialize dict to MessagePack
         serialized_state = serialize(output_payload)
@@ -86,7 +88,11 @@ class CellaflowClient:
                 )
             req.idempotency_fencing_token = idempotency_fencing_token
 
-        return cast(service_pb2.CommitStepResponse, self.stub.CommitStep(req))
+        if timeout is None:
+            return cast(service_pb2.CommitStepResponse, self.stub.CommitStep(req))
+        return cast(
+            service_pb2.CommitStepResponse, self.stub.CommitStep(req, timeout=timeout)
+        )
 
     def get_graph(
         self, session_id: str, limit: Optional[int] = None, cursor: Optional[str] = None
@@ -136,6 +142,7 @@ class CellaflowClient:
         lease_ttl_ms: Optional[int] = None,
         session_id: Optional[str] = None,
         sequence: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> idempotency_pb2.CheckCacheResponse:
         """Arbitrates the lease for `idempotency_key`.
 
@@ -166,7 +173,9 @@ class CellaflowClient:
 
         return cast(
             idempotency_pb2.CheckCacheResponse,
-            self.stub.CheckIdempotencyCache(req),
+            self.stub.CheckIdempotencyCache(req)
+            if timeout is None
+            else self.stub.CheckIdempotencyCache(req, timeout=timeout),
         )
 
     def renew_lease(

@@ -53,15 +53,14 @@ All notable changes to the CellaFlow Python SDK.
   while another step of the session is in flight is not recorded either, and the run then stops
   recording, so no later failure is recorded above the position it left empty; nor is one in a run that has
   not read the session's history (a resumed `durable_tools` thread). A record still unwritten when
-  the workflow returns is written in the background, in one attempt, after the result has been
-  returned, so the result never waits on it; a new run of the same session waits up to 10 seconds
-  for the write before starting, and raises `RecordStillBeingWritten` rather than start without it,
-  the process waits up to 10 seconds for it before exiting, and
-  `cellaflow.context.wait_for_record_writes()` waits for it sooner. If it cannot be written at once,
-  it is dropped with a warning, and a resume runs the step again. If the failed step's lease could not be released, the record
-  retries the release, or waits for the lease to lapse (counted from when the step's heartbeat
-  stopped), rather than be refused at a position that lease still claims. In an async workflow, records are written on a worker
-  thread, so the event loop is not held up.
+  the workflow returns is written before the workflow returns its result, because a record lost
+  after the run reported its result would let a re-run run the step again. That costs one write's
+  round trip at the end of such a run. Every engine call writing a record has a 10-second deadline.
+  If the failed step's lease could not be released, the record retries the release, or waits for
+  the lease to lapse (allowing for a renewal still on its way), rather than be refused at a
+  position that lease still claims. A record that cannot be written in that time, or that the
+  engine refuses, is dropped with a warning, and a re-run runs the step again. In an async
+  workflow, records are written on a worker thread, so the event loop is not held up.
 
   A cancelled async step (`asyncio.CancelledError`) is recorded the same way, with how long it ran,
   and its lease is released, so the workflow's next step lands at the right position. A resume

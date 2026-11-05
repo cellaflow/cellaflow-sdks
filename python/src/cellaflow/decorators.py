@@ -11,8 +11,6 @@ import grpc
 from cellaflow.client import CellaflowClient
 from cellaflow.context import (
     WorkflowContext,
-    has_record_writes,
-    wait_before_starting,
     set_context,
     reset_context,
     get_context,
@@ -53,12 +51,6 @@ def workflow(
                 kwargs.pop("_coordination_id", None)
             )
 
-            # A run of this session that just returned may still be writing its
-            # last failure record; reading the history before it lands would
-            # put this run's next step on that position. Waited for on a worker
-            # thread, so other tasks on the loop keep running.
-            if has_record_writes(session_id):
-                await asyncio.to_thread(wait_before_starting, session_id)
             client = CellaflowClient(target=target, secure=secure)
             resp = client.start_session(
                 workflow_id=func.__name__,
@@ -110,7 +102,9 @@ def workflow(
                 # it. Only on a normal return: a failure the workflow lets
                 # propagate stays unrecorded, so resuming retries the step.
                 ctx.raise_if_refused()
-                ctx.record_pending_failure()
+                if ctx.has_pending_failure():
+                    # Written before returning, off the event loop.
+                    await asyncio.to_thread(ctx.record_pending_failure)
                 return result
             finally:
                 reset_context(token)
@@ -124,11 +118,6 @@ def workflow(
                 kwargs.pop("_coordination_id", None)
             )
 
-            # A run of this session that just returned may still be writing its
-            # last failure record; reading the history before it lands would
-            # put this run's next step on that position.
-            if has_record_writes(session_id):
-                wait_before_starting(session_id)
             client = CellaflowClient(target=target, secure=secure)
             resp = client.start_session(
                 workflow_id=func.__name__,
@@ -733,6 +722,11 @@ def step(
                 return result
             except BaseException as e:
                 failed_at = time.monotonic()
+                if hb:
+                    # Told to stop before the release, so it starts no renewal
+                    # after it. Not awaited: an await is where a cancellation
+                    # lands, and would replace the step's own exception.
+                    hb.stop_soon()
                 # Cancellation too: a lease left held would refuse the step that
                 # takes this position next until it lapsed.
                 if fencing_token > 0 and hb is not None:
@@ -742,10 +736,8 @@ def step(
                 raise e
             finally:
                 if hb:
-                    # Not awaited, after a commit or a failure alike: an await
-                    # here is where a cancellation lands, and it would turn a
-                    # committed step into a cancelled one, or replace a failed
-                    # step's own exception with a cancellation.
+                    # Not awaited after a commit either: a cancellation landing
+                    # there would turn a committed step into a cancelled one.
                     hb.stop_soon()
         except BaseException as exc:
             if live:
@@ -902,6 +894,9 @@ def step(
                 return result
             except BaseException as e:
                 failed_at = time.monotonic()
+                if hb:
+                    # Stopped before the release, so it renews nothing after it.
+                    hb.stop_sync()
                 # Cancellation too: a lease left held would refuse the step that
                 # takes this position next until it lapsed.
                 if fencing_token > 0 and hb is not None:

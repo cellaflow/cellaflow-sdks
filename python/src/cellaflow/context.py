@@ -1,5 +1,4 @@
 import asyncio
-import atexit
 import contextlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -53,74 +52,12 @@ class _RecordHeld(Exception):
         self.retry_after_s = retry_after_s
 
 
-#: Threads writing the last failure record of a workflow that has returned, by
-#: session. See `WorkflowContext._record_in_background`.
-_writers: "Dict[str, set[threading.Thread]]" = {}
-_writers_lock = threading.Lock()
-#: How long a process waits at exit for those writes. They run on daemon
-#: threads, so an engine that stops answering cannot keep the process alive.
-_EXIT_WAIT_S = 10.0
-
-
-class RecordStillBeingWritten(RuntimeError):
-    """A previous run of this session is still writing its last failure record.
-
-    Starting now could read the history before the record lands and run that
-    step again at its position. Nothing has run; try again shortly.
-    """
-
-
-def wait_for_record_writes(
-    timeout: Optional[float] = None, session_id: Optional[str] = None
-) -> bool:
-    """Waits for failure records still being written for workflows that have
-    returned, in one session or in all.
-
-    They are written in the background so a workflow's result never waits on
-    them. A workflow starting a session waits for that session's writes first,
-    and the process waits up to `_EXIT_WAIT_S` for all of them before it exits;
-    call this to be sure of them sooner, as a test does before reading the
-    history. Returns whether they all finished within `timeout`.
-    """
-    with _writers_lock:
-        if session_id is None:
-            writers = [w for group in _writers.values() for w in group]
-        else:
-            writers = list(_writers.get(session_id, ()))
-    # One deadline for all of them, so many stalled writes cannot add up.
-    deadline = None if timeout is None else time.monotonic() + timeout
-    for writer in writers:
-        if deadline is None:
-            writer.join()
-        else:
-            writer.join(max(0.0, deadline - time.monotonic()))
-    return not any(writer.is_alive() for writer in writers)
-
-
-def wait_before_starting(session_id: str) -> None:
-    """Waits for a previous run of `session_id` to finish writing its last
-    failure record, and refuses to start if it does not in time.
-
-    Going ahead without it would read a history missing that position, so the
-    step there would run again, and could take a different branch: a refusal
-    the caller can retry is the safer side (rule 2 over rule 3).
-    """
-    if not wait_for_record_writes(_EXIT_WAIT_S, session_id=session_id):
-        raise RecordStillBeingWritten(
-            f"A previous run of session {session_id} is still writing its last "
-            f"failure record after {_EXIT_WAIT_S:.0f} s, so this run did not "
-            f"start: reading the history now could run that step again. Nothing "
-            f"has run; try again shortly."
-        )
-
-
-def has_record_writes(session_id: str) -> bool:
-    """Whether a failure record is still being written for `session_id`."""
-    with _writers_lock:
-        return bool(_writers.get(session_id))
-
-
-atexit.register(wait_for_record_writes, _EXIT_WAIT_S)
+#: The longest any one engine call writing a record may take. A write that
+#: cannot finish in time is dropped rather than hold up the run.
+_RECORD_RPC_TIMEOUT_S = 10.0
+#: How long the last failure record waits for a lease holding its position,
+#: when that is not the failed step's own unreleased lease, whose lapse is known.
+_FINAL_HELD_WAIT_S = 5.0
 
 
 #: Failures writing a hit's record that may succeed if sent again. The record is
@@ -691,13 +628,16 @@ class WorkflowContext:
                 self._refusal = refusal
 
     def raise_if_refused(self, cause: Optional[BaseException] = None) -> None:
-        """Raises the refusal recorded by `refuse`, if any: the original, so its
-        traceback still shows where the replay refused.
+        """Raises the refusal recorded by `refuse`, if any.
 
-        `cause` is the exception the workflow is ending with, if it is ending
-        with one. A refusal does not replace a cancellation or a process exit
-        (anything not an `Exception`), which must keep propagating as itself,
-        nor an exception that already carries the refusal in its chain.
+        Raised as a fresh copy whose cause is the original, so its traceback
+        still shows where the replay refused, without the original gaining
+        frames each time. `cause` is the exception the workflow is ending with,
+        if it is: the refusal replaces it, even one the workflow raised from the
+        refusal (`except Exception: raise PaymentFailed(...)`), because that
+        outcome is one the first run never produced. A cancellation or process
+        exit (anything not an `Exception`) is not replaced; it keeps
+        propagating as itself.
         """
         refusal = self._refusal
         if refusal is None:
@@ -705,15 +645,10 @@ class WorkflowContext:
         if cause is not None:
             if not isinstance(cause, Exception):
                 return
-            link: Optional[BaseException] = cause
-            for _ in range(20):
-                if link is None:
-                    break
-                if link is refusal:
-                    return
-                link = link.__cause__ or link.__context__
-            raise refusal from cause
-        raise refusal
+            if cause is refusal or cause.__cause__ is refusal:
+                return  # already the refusal, or a copy of it
+        again = type(refusal)(*refusal.args)
+        raise again from refusal
 
     def note_run_ended(self, exc: BaseException) -> None:
         """Warns when the workflow ends by raising a failure that was recorded.
@@ -771,95 +706,73 @@ class WorkflowContext:
             if self._in_flight == 1 and self.sequence == sequence:
                 self.sequence = sequence - 1
 
+    def has_pending_failure(self) -> bool:
+        """Whether a failure is held, waiting to be recorded."""
+        pending = self._pending_hit
+        return pending is not None and pending.get("kind") == "failure"
+
     def record_pending_failure(self) -> None:
-        """Records a failure the workflow caught and finished after.
+        """Records a failure the workflow caught and finished after, before the
+        workflow returns.
 
-        Called when a workflow returns normally. A failure followed by a later
-        step is recorded when that step starts; this covers one followed by none.
-        """
-        self._record_in_background()
+        A failure followed by a later step is recorded when that step starts;
+        this covers one followed by none. It is written before the result is
+        returned, not in the background: a record lost after the run reported
+        its result would let a re-run run the step again, whose side effect
+        could repeat, and which could then take a different branch. That costs
+        one write's round trip at the end of such a run.
 
-    def _record_in_background(self) -> None:
-        """Writes the last failure record without making the workflow wait.
-
-        The workflow has already produced its result, so recording must neither
-        delay nor replace it: a caller with a timeout would otherwise lose a
-        finished run to bookkeeping. The write runs on its own thread; the
-        process waits a bounded time for it before exiting, a new run of the
-        same session waits for it before starting, and nothing is started when
-        no failure is pending. See `wait_for_record_writes`.
+        Every engine call is bounded. A lease still holding the position is
+        waited out, up to when the failed step's own unreleased lease lapses or
+        `_FINAL_HELD_WAIT_S` for anyone else's. A record that cannot be written
+        in that time, or that the engine refuses, is dropped with a warning, and
+        a re-run runs the step again, as before failures were recorded.
         """
         pending = self._pending_hit
         if pending is None or pending.get("kind") != "failure":
             return
-        writer = threading.Thread(
-            target=self._try_record_failure, name="cellaflow-record", daemon=True
+        deadline = time.monotonic() + _FINAL_HELD_WAIT_S
+        unreleased = pending.get("unreleased")
+        if unreleased is not None:
+            deadline = max(deadline, unreleased["lapses_at"] + 1.0)
+        while True:
+            wait = self._try_record_failure()
+            if wait is None:
+                return
+            if time.monotonic() + wait > deadline:
+                self._drop_final_record(pending, "a lease still holds its position")
+                return
+            time.sleep(wait)
+
+    def _try_record_failure(self) -> Optional[float]:
+        """One attempt at the last failure record: None when it is written or
+        dropped, or how long a lease holding its position says to wait."""
+        self._prepare_pending()
+        with self._lock:
+            pending = self._pending_hit
+            if pending is None or pending.get("kind") != "failure":
+                return None
+            try:
+                self.reconcile_sequence()
+                return None
+            except _RecordHeld as held:
+                return held.retry_after_s
+            except Exception as exc:
+                self._drop_final_record(pending, f"{type(exc).__name__}: {exc}")
+                return None
+
+    def _drop_final_record(self, pending: Dict[str, Any], reason: str) -> None:
+        if self._pending_hit is pending:
+            self._pending_hit = None
+        logger.warning(
+            "Cellaflow: the failure of %r at position %d of session %s was not "
+            "recorded (%s). The workflow's result stands; a re-run of this session "
+            "runs that step again.",
+            pending["name"],
+            pending["sequence"],
+            self.session_id,
+            reason,
         )
-        with _writers_lock:
-            _writers.setdefault(self.session_id, set()).add(writer)
-        try:
-            writer.start()
-        except Exception:
-            # Out of threads, say. Never at the cost of the workflow's result:
-            # the record is dropped, and a resume runs the step again.
-            with _writers_lock:
-                group = _writers.get(self.session_id)
-                if group is not None:
-                    group.discard(writer)
-                    if not group:
-                        del _writers[self.session_id]
-            logger.warning(
-                "Cellaflow: could not start writing the failure of %r at position "
-                "%d of session %s; it is not recorded, and a resume runs that step "
-                "again.",
-                pending["name"],
-                pending["sequence"],
-                self.session_id,
-                exc_info=True,
-            )
-
-    def _try_record_failure(self) -> None:
-        """One attempt, and no waiting. On its own thread; see
-        `_record_in_background`.
-
-        The workflow has already produced its result, so recording it must not
-        delay or replace that result: a caller with a timeout would otherwise
-        lose a finished run to bookkeeping. If the record cannot be written at
-        once (an error, or a lease still holding its position), it is dropped
-        with a warning, and a resume runs the step again, as before failures
-        were recorded.
-        """
-        try:
-            self._prepare_pending()
-            with self._lock:
-                pending = self._pending_hit
-                if pending is None or pending.get("kind") != "failure":
-                    return
-                try:
-                    self.reconcile_sequence()
-                    return
-                except _RecordHeld:
-                    reason = "a lease still holds its position"
-                except Exception as exc:
-                    reason = f"{type(exc).__name__}: {exc}"
-                if self._pending_hit is pending:
-                    self._pending_hit = None
-                logger.warning(
-                    "Cellaflow: the failure of %r at position %d of session %s was "
-                    "not recorded (%s). The workflow's result stands; a resume of "
-                    "this session runs that step again.",
-                    pending["name"],
-                    pending["sequence"],
-                    self.session_id,
-                    reason,
-                )
-        finally:
-            with _writers_lock:
-                group = _writers.get(self.session_id)
-                if group is not None:
-                    group.discard(threading.current_thread())
-                    if not group:
-                        del _writers[self.session_id]
 
     def reconcile_sequence(self) -> None:
         """Records a deferred hit, then adopts the position the engine reported.
@@ -976,6 +889,7 @@ class WorkflowContext:
                     idempotency_key=unreleased["key"],
                     fencing_token=unreleased["token"],
                     reason="TOOL_ERROR",
+                    timeout=_RECORD_RPC_TIMEOUT_S,
                 )
                 pending["unreleased"] = None
             except Exception as exc:
@@ -989,6 +903,7 @@ class WorkflowContext:
                 idempotency_key=key,
                 session_id=self.session_id,
                 sequence=pending["sequence"],
+                timeout=_RECORD_RPC_TIMEOUT_S,
             )
         except grpc.RpcError as exc:
             unreleased = pending.get("unreleased")
@@ -1026,6 +941,7 @@ class WorkflowContext:
                 idempotency_key=key,
                 idempotency_fencing_token=token,
                 coordination_id=pending["coordination_id"],
+                timeout=_RECORD_RPC_TIMEOUT_S,
             )
         except Exception:
             try:
@@ -1034,6 +950,7 @@ class WorkflowContext:
                     idempotency_key=key,
                     fencing_token=token,
                     reason="TOOL_ERROR",
+                    timeout=_RECORD_RPC_TIMEOUT_S,
                 )
             except Exception:
                 # The lease lapses on its own. Losing the release is not worth
