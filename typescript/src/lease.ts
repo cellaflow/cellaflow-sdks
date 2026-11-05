@@ -26,12 +26,15 @@ export interface LeaseHeartbeatOptions {
   fencingToken: number;
   /** How often to renew. The engine suggests this on acquisition. */
   heartbeatIntervalMs: number;
-  /** How long each renewal extends the lease. Defaults to 3x the interval. */
+  /**
+   * How long each renewal extends the lease. Defaults to 4x the interval: the
+   * engine suggests an interval of a quarter of the TTL, so this asks for the
+   * TTL itself.
+   */
   extendMs?: number;
   /**
    * How long the acquisition granted, counted from `acquiredSentAt`. Defaults
-   * to 3x the interval, which is shorter than the engine's TTL (4x), so the
-   * default errs towards declaring loss early.
+   * to 4x the interval, the TTL the engine's suggested interval implies.
    */
   leaseTtlMs?: number;
   /**
@@ -78,6 +81,11 @@ export interface LeaseEvent {
  * stopped: a process resumed after SIGSTOP sees its lease as lost before any
  * renewal has had a chance to answer.
  *
+ * Passing the deadline is reported, but renewing carries on: the engine may
+ * still hold the lease, and a caller that cannot act on the report (`tool()`
+ * does not) keeps it for as long as the engine agrees. Renewing stops only when
+ * the engine refuses a renewal, or on `stop()`.
+ *
  * One case the deadline does not see: near the engine's maximum lease lifetime
  * a renewal is granted less than it asked for, and the next renewal is refused
  * with MAX_LIFETIME_EXCEEDED. Until that answer arrives the local deadline can
@@ -104,8 +112,8 @@ export class LeaseHeartbeat {
     this.opts = {
       ...options,
       heartbeatIntervalMs: intervalMs,
-      extendMs: options.extendMs ?? intervalMs * 3,
-      leaseTtlMs: options.leaseTtlMs ?? intervalMs * 3,
+      extendMs: options.extendMs ?? intervalMs * 4,
+      leaseTtlMs: options.leaseTtlMs ?? intervalMs * 4,
     };
     this.marginMs = options.marginMs ?? Math.min(intervalMs, this.opts.extendMs / 2);
     const sentAt = options.acquiredSentAt ?? performance.now();
@@ -122,6 +130,7 @@ export class LeaseHeartbeat {
     if (performance.now() >= this.deadline) {
       this.notifyLost(
         `no renewal was confirmed in time: the lease may already belong to another worker`,
+        false,
       );
       return true;
     }
@@ -139,7 +148,9 @@ export class LeaseHeartbeat {
   private armDeadline(): void {
     if (this.deadlineTimer) clearTimeout(this.deadlineTimer);
     if (this.stopped || this.lost) return;
-    const wait = Math.max(0, this.deadline - performance.now());
+    // setTimeout clamps anything above 2^31-1 ms to 1 ms, which would spin; a
+    // capped wait just arms again when it fires short of the deadline.
+    const wait = Math.min(2 ** 31 - 1, Math.max(0, this.deadline - performance.now()));
     this.deadlineTimer = setTimeout(() => {
       this.deadlineTimer = undefined;
       // Timers run on a millisecond clock and can fire a fraction early against
@@ -151,7 +162,7 @@ export class LeaseHeartbeat {
   }
 
   start(): void {
-    if (this.timer) return;
+    if (this.timer || this.stopped) return;
     this.armDeadline();
     this.timer = setInterval(() => {
       // Never overlap renewals: a slow RPC would otherwise queue them and each
@@ -180,11 +191,16 @@ export class LeaseHeartbeat {
     if (this.inFlight) await this.inFlight.catch(() => {});
   }
 
-  private notifyLost(detail: string): void {
+  /**
+   * @param final True when the engine refused the lease, so renewing is over.
+   *   A passed deadline is not final: the holder must stop acting, but the
+   *   engine may still hold the lease, and renewing keeps it until it refuses.
+   */
+  private notifyLost(detail: string, final: boolean): void {
+    if (final) void this.stop();
     if (this.lost) return;
     this.lost = true;
     this.lostDetail = detail;
-    void this.stop();
     this.emit({ type: "lost", detail });
     try {
       this.opts.onLeaseLost?.(detail);
@@ -203,12 +219,12 @@ export class LeaseHeartbeat {
   }
 
   private async beat(force = false): Promise<void> {
-    if (this.stopped || this.lost) return;
-    // A renewal that answers after the deadline cannot revive the lease: by
-    // then another worker may hold it, and this one has already been told.
-    // The forced renewal skips this, because its whole point is to replace a
-    // deadline known to be too early.
-    if (!force && this.pastDeadline()) return;
+    if (this.stopped) return;
+    // Report a passed deadline before renewing. The forced renewal skips this,
+    // because its whole point is to replace a deadline known to be too early.
+    // A renewal confirmed after the deadline does not clear the report: the
+    // holder was told to stop acting, and another worker may have acted.
+    if (!force) this.pastDeadline();
     const sentAt = performance.now();
     try {
       const resp = await this.opts.client.renewLease(
@@ -220,9 +236,9 @@ export class LeaseHeartbeat {
         // renewal forever and the lease silently ages out while we wait on it.
         Math.max(1, Math.ceil(this.opts.heartbeatIntervalMs / 1000)),
       );
-      if (this.stopped || this.lost) return;
+      if (this.stopped) return;
       if (!resp.renewed) {
-        this.notifyLost(renewFailureDetail(resp.failureReason));
+        this.notifyLost(renewFailureDetail(resp.failureReason), true);
         return;
       }
       // A failed renewal is not itself proof of loss, so only a confirmed one

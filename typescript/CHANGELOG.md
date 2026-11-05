@@ -24,6 +24,16 @@ All notable changes to the CellaFlow TypeScript SDK.
   renewal answers. After waiting for a lease (`waitMs` above 0), one renewal is made before the
   block runs, since the engine may have granted the lease well after the request was sent.
 
+  A passed deadline is reported but does not stop renewing: the engine may still hold the lease,
+  and renewing keeps it until the engine refuses a renewal. `tool()`, which cannot act on a loss,
+  keeps its lease for as long as the engine agrees, and its renewals now also ask for the full TTL
+  (four heartbeat intervals) rather than three.
+
+- **`executionLease` does not run its block on a lease already lost**, for example when the
+  renewal after a wait is refused. It throws `LeaseLostError` instead.
+- **`check()` fails and `signal` aborts once the block has exited**, so work the block started
+  without awaiting cannot act under a lease that has been released.
+
   `check()` still cannot close the gap between the check and the write landing at the other end:
   hand `signal` to the request to narrow it.
 

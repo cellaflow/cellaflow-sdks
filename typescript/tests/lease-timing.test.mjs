@@ -28,10 +28,12 @@ function heartbeat(client, overrides = {}) {
     agentId: "a",
     idempotencyKey: "k",
     fencingToken: 1,
-    heartbeatIntervalMs: 100,
-    extendMs: 400,
-    leaseTtlMs: 400,
-    marginMs: 100,
+    // Wide enough that a late timer on a busy runner does not flip a result:
+    // every assertion sits at least 100 ms from the deadline it tests.
+    heartbeatIntervalMs: 200,
+    extendMs: 800,
+    leaseTtlMs: 800,
+    marginMs: 200,
     acquiredSentAt: performance.now(),
     onLeaseLost: (detail) => lost.push(detail),
     ...overrides,
@@ -43,9 +45,9 @@ test("the lease is lost at its deadline when no renewal answers", async () => {
   const { hb, lost } = heartbeat({ renewLease: never });
   hb.start();
   try {
-    await sleep(250);
+    await sleep(450);
     assert.equal(hb.lost, false, "still inside the deadline");
-    await sleep(120); // deadline is acquiredSentAt + 400 - 100
+    await sleep(250); // deadline is acquiredSentAt + 800 - 200
     assert.equal(hb.lost, true);
     assert.equal(lost.length, 1);
   } finally {
@@ -59,7 +61,7 @@ test("a renewal extends the deadline from when it was sent, not when it answered
     async renewLease() {
       calls += 1;
       if (calls === 1) {
-        await sleep(150); // sent at ~100, answers at ~250
+        await sleep(300); // sent at ~200, answers at ~500
         return { renewed: true };
       }
       return never();
@@ -68,11 +70,11 @@ test("a renewal extends the deadline from when it was sent, not when it answered
   const { hb } = heartbeat(client);
   hb.start();
   try {
-    await sleep(350);
-    assert.equal(hb.lost, false, "renewal sent at ~100 holds until ~400");
-    await sleep(120);
-    // Counted from the answer (~250), the deadline would be ~550.
-    assert.equal(hb.lost, true, "lost at ~400, counted from the send");
+    await sleep(700);
+    assert.equal(hb.lost, false, "renewal sent at ~200 holds until ~800");
+    await sleep(200);
+    // Counted from the answer (~500), the deadline would be ~1100.
+    assert.equal(hb.lost, true, "lost at ~800, counted from the send");
   } finally {
     await hb.stop();
   }
@@ -88,7 +90,7 @@ test("a process that was stalled past its deadline sees the loss before any time
   });
   hb.start();
   try {
-    stall(500);
+    stall(900);
     // No timer or renewal has run since the stall began.
     assert.equal(renewals, 0);
     assert.equal(hb.pastDeadline(), true);
@@ -106,12 +108,75 @@ test("a refused renewal is a loss, with the engine's reason", async () => {
   });
   hb.start();
   try {
-    await sleep(150);
+    await sleep(300);
     assert.equal(hb.lost, true);
     assert.match(lost[0], /another worker took the lease/);
   } finally {
     await hb.stop();
   }
+});
+
+test("a missed deadline is reported but renewing goes on until the engine refuses", async () => {
+  let calls = 0;
+  let refuse = false;
+  const { hb, lost } = heartbeat({
+    async renewLease() {
+      calls += 1;
+      if (calls === 1) await sleep(700); // answers after the deadline (~600)
+      return refuse ? { renewed: false, failureReason: 2 } : { renewed: true };
+    },
+  });
+  hb.start();
+  try {
+    await sleep(1_100);
+    assert.equal(hb.lost, true, "the deadline passed without a confirmed renewal");
+    assert.equal(lost.length, 1);
+    const sofar = calls;
+    assert.ok(sofar >= 2, "kept renewing after reporting the loss");
+    refuse = true;
+    await sleep(500);
+    const afterRefusal = calls;
+    await sleep(500);
+    assert.equal(calls, afterRefusal, "a refusal stops renewing");
+    assert.equal(lost.length, 1, "the loss is reported once");
+  } finally {
+    await hb.stop();
+  }
+});
+
+test("a heartbeat stopped before it started does not start", async () => {
+  let calls = 0;
+  const { hb } = heartbeat({
+    async renewLease() {
+      calls += 1;
+      return { renewed: true };
+    },
+  });
+  await hb.stop();
+  hb.start();
+  await sleep(500);
+  assert.equal(calls, 0);
+});
+
+test("the default renewal asks for the engine's TTL, four intervals", async () => {
+  const asked = [];
+  const hb = new LeaseHeartbeat({
+    client: {
+      async renewLease(agentId, key, token, extendMs) {
+        asked.push(extendMs);
+        return { renewed: true };
+      },
+    },
+    agentId: "a",
+    idempotencyKey: "k",
+    fencingToken: 1,
+    heartbeatIntervalMs: 100,
+  });
+  hb.start();
+  await sleep(250);
+  await hb.stop();
+  assert.ok(asked.length >= 1);
+  assert.ok(asked.every((ms) => ms === 400));
 });
 
 // --- executionLease, with the engine client stubbed on its prototype ---------
@@ -195,4 +260,28 @@ test("check() fails after a stall past the deadline, before any renewal answers"
     assert.equal(calls.renew.length, before, "no renewal ran during the stall");
     assert.throws(() => lease.check(), LeaseLostError);
   });
+});
+
+test("the block does not run when the lease is lost before it starts", async () => {
+  const calls = stubEngine({ renew: () => ({ renewed: false, failureReason: 2 }) });
+  let ran = false;
+  await assert.rejects(
+    executionLease("k", { workerId: "w", ttlMs: 200, waitMs: 1_000 }, async () => {
+      ran = true;
+    }),
+    LeaseLostError,
+  );
+  assert.equal(ran, false);
+  assert.deepEqual(calls.release, ["BLOCK_EXIT"], "the lease is still released");
+});
+
+test("after the block exits, check() fails and the signal aborts", async () => {
+  stubEngine();
+  let kept;
+  await executionLease("k", { workerId: "w", ttlMs: 200 }, async (lease) => {
+    kept = lease;
+  });
+  assert.equal(kept.isLost, true);
+  assert.equal(kept.signal.aborted, true);
+  assert.throws(() => kept.check(), LeaseLostError);
 });
