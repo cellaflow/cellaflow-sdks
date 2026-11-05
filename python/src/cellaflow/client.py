@@ -88,19 +88,22 @@ class CellaflowClient:
                 )
             req.idempotency_fencing_token = idempotency_fencing_token
 
-        if timeout is None:
-            return cast(service_pb2.CommitStepResponse, self.stub.CommitStep(req))
         return cast(
             service_pb2.CommitStepResponse, self.stub.CommitStep(req, timeout=timeout)
         )
 
     def get_graph(
-        self, session_id: str, limit: Optional[int] = None, cursor: Optional[str] = None
+        self,
+        session_id: str,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """
         Returns a tuple of (list of deserialized step results, next_cursor).
         Each step result is a dictionary representation of the StepResult proto,
         with the output_payload fully deserialized into a Python dictionary.
+        `timeout` bounds the RPC in seconds.
         """
         req = service_pb2.GetGraphRequest(session_id=session_id)
         if limit is not None:
@@ -108,7 +111,7 @@ class CellaflowClient:
         if cursor is not None:
             req.cursor = cursor
 
-        resp: service_pb2.GetGraphResponse = self.stub.GetGraph(req)
+        resp: service_pb2.GetGraphResponse = self.stub.GetGraph(req, timeout=timeout)
 
         results = []
         for step in resp.steps:
@@ -173,9 +176,7 @@ class CellaflowClient:
 
         return cast(
             idempotency_pb2.CheckCacheResponse,
-            self.stub.CheckIdempotencyCache(req)
-            if timeout is None
-            else self.stub.CheckIdempotencyCache(req, timeout=timeout),
+            self.stub.CheckIdempotencyCache(req, timeout=timeout),
         )
 
     def renew_lease(
