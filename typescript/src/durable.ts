@@ -186,6 +186,11 @@ export async function durableTools<T>(
     // this run never sees what the session already holds and must not record
     // cache hits into it.
     historyKnown: !resp.isRecovered,
+    // A resumed session's first call is often a tool that never ran (the node
+    // the thread had not reached), which claims a position rather than hitting
+    // the cache. Its position is read before that claim, not here, so a resume
+    // whose calls are all cache hits reads nothing. See `ensurePosition`.
+    positionKnown: !resp.isRecovered,
   });
 
   const session: DurableSession = {

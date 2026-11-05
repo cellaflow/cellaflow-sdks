@@ -3,6 +3,7 @@
 // client, so no engine is needed: `npm test`.
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { serialize } from "../dist/serialization.js";
 
 import {
   CellaflowClient,
@@ -273,4 +274,83 @@ test("an invalid durableTools coordination id fails before the session starts", 
   } finally {
     engine.restore();
   }
+});
+
+/**
+ * Runs `fn` against a resumed session: `graph` answers GetGraph (a step count,
+ * served in pages by cursor, or an error to throw), and `answers` are the
+ * cache's replies in order. Records the cursors read and the leased positions.
+ */
+async function resumed({ graph, answers }, fn) {
+  const engine = fakeEngine({ isRecovered: true, coordinationId: "ticket-4417" });
+  const proto = CellaflowClient.prototype;
+  const saved = { getGraph: proto.getGraph, checkIdempotencyCache: proto.checkIdempotencyCache };
+  const seen = { cursors: [], sequences: [] };
+  proto.getGraph = async (_sessionId, limit, cursor) => {
+    seen.cursors.push(cursor);
+    if (graph instanceof Error) throw graph;
+    const from = cursor === undefined ? 1 : Number(cursor);
+    const last = Math.min(graph, from + limit - 1);
+    const steps = [];
+    for (let n = from; n <= last; n++) steps.push({ sequence: BigInt(n) });
+    return [steps, last < graph ? String(last + 1) : undefined];
+  };
+  proto.checkIdempotencyCache = async (...args) => {
+    seen.sequences.push(args[5]);
+    return answers.shift();
+  };
+  try {
+    await durableTools("thread-1", { coordinationId: "ticket-4417" }, fn);
+  } finally {
+    Object.assign(proto, saved);
+    engine.restore();
+  }
+  return seen;
+}
+
+const granted = () => ({ status: CacheStatus.ACQUIRED, fencingToken: 7n, heartbeatIntervalMs: 60_000n });
+const answered = (now) => ({
+  status: CacheStatus.HIT,
+  currentSequence: BigInt(now),
+  cachedResult: { outputPayload: serialize({ result: "refunded before" }) },
+});
+const lookup = tool(async () => "looked up", { toolName: "lookup" });
+
+test("a resumed session runs a tool it never reached after every position it holds", async () => {
+  // Counted from 0, the first call that is not a cache hit claimed position 1,
+  // which the session already holds, and the engine refused it as divergent.
+  // The history is read across pages: 1500 steps, 1000 to a page.
+  const seen = await resumed({ graph: 1500, answers: [granted()] }, async () => {
+    await refund({ customer: "customer-88", cents: 10 });
+  });
+  assert.deepEqual(seen.cursors, ["1", "1001"]);
+  assert.deepEqual(seen.sequences, [1501]);
+});
+
+test("a resumed session the engine cannot find is an error, not a session at 0", async () => {
+  const gone = Object.assign(new Error("session not found"), { code: 5 });
+  const seen = await resumed({ graph: gone, answers: [granted()] }, async () => {
+    await assert.rejects(refund({ customer: "customer-88", cents: 10 }), /not found/);
+  });
+  assert.deepEqual(seen.sequences, []);
+});
+
+test("a resume whose history cannot be read right now still answers its cache hits", async () => {
+  // A cache hit needs no position. A read that fails with an error that may pass
+  // does not stop the call; only a session the engine cannot find does.
+  const unavailable = Object.assign(new Error("engine unavailable"), { code: 14 });
+  const seen = await resumed({ graph: unavailable, answers: [answered(4)] }, async () => {
+    assert.equal(await refund({ customer: "customer-88", cents: 10 }), "refunded before");
+  });
+  assert.deepEqual(seen.cursors, ["1"]);
+});
+
+test("the position is read once per resumed session", async () => {
+  // The first call reads it; the next calls take the following positions.
+  const seen = await resumed({ graph: 4, answers: [granted(), granted()] }, async () => {
+    await refund({ customer: "customer-88", cents: 10 });
+    assert.equal(await lookup(), "looked up");
+  });
+  assert.deepEqual(seen.cursors, ["1"]);
+  assert.deepEqual(seen.sequences, [5, 6]);
 });

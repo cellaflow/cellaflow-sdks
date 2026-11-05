@@ -43,6 +43,9 @@ export interface UnreleasedLease {
   lapsesAt?: number;
 }
 
+/** How many steps to ask the engine for per page of a session's history. */
+const GRAPH_PAGE = 1000;
+
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** The longest message and stack a failure record keeps, as the Python SDK. */
@@ -144,6 +147,7 @@ export class WorkflowContext {
     sequence?: number;
     coordinationId?: string;
     historyKnown?: boolean;
+    positionKnown?: boolean;
   }) {
     this.client = init.client;
     this.sessionId = init.sessionId;
@@ -153,7 +157,16 @@ export class WorkflowContext {
     // Opt-in: a context built for a session whose history it never read must not
     // record into it.
     this.historyKnown = init.historyKnown ?? false;
+    this.positionKnown = init.positionKnown ?? true;
   }
+
+  /**
+   * Whether {@link sequence} is where the session is. False for a resumed
+   * `durableTools` session, which does not replay from the start: its first call
+   * reads the session's position, unless a cache hit has reported it by then. See
+   * {@link ensurePosition}.
+   */
+  positionKnown: boolean;
 
   /**
    * Holds a cache hit's result to be recorded at `sequence` in this session.
@@ -489,15 +502,56 @@ export class WorkflowContext {
   }
 
   /**
+   * Moves the counter to where the session is, before a resumed session's first
+   * call claims a position. Counted from 0, a call that is not a cache hit took
+   * position 1, which the session already holds, and the engine refused it as
+   * divergent before its body ran. Not needed once a cache hit has reported the
+   * session's position, which the claim adopts.
+   *
+   * A history the engine cannot find is an error, not a session at 0: the engine
+   * reported this session as recovered. A read that fails with an error that may
+   * pass is not: the call goes ahead as it did before, which a cache hit needs no
+   * position for, and the next call reads again.
+   */
+  async ensurePosition(): Promise<void> {
+    if (this.positionKnown || this.reportedSequence !== undefined) {
+      this.positionKnown = true;
+      return;
+    }
+    let position: number;
+    try {
+      position = await this.enginePosition(1, { strict: true });
+    } catch (err) {
+      if (!isRetryable(err)) throw err;
+      console.warn(
+        `Cellaflow: could not read where session ${this.sessionId} is ` +
+          `(${errorCode(err)}); this call goes ahead without it, and the next one ` +
+          "reads it again.",
+      );
+      return;
+    }
+    if (!this.positionKnown) {
+      if (this.reportedSequence === undefined) {
+        this.sequence = Math.max(this.sequence, position);
+      }
+      this.positionKnown = true;
+    }
+  }
+
+  /**
    * The session's highest committed position at or after `fromSequence`, or 0 if
    * there is none. The engine's page cursor is the first sequence to read and is
    * inclusive, so only the tail of the session is read.
    *
    * A session the engine does not know answers NOT_FOUND rather than an empty
-   * page, which means it holds nothing. NOT_FOUND after the first page means the
-   * session went away mid-read, and propagates like any other failure.
+   * page, which means it holds nothing, unless `strict`: for a session the engine
+   * just reported as recovered, it is an error. NOT_FOUND after the first page
+   * means the session went away mid-read, and propagates like any other failure.
    */
-  private async enginePosition(fromSequence: number): Promise<number> {
+  private async enginePosition(
+    fromSequence: number,
+    { strict = false }: { strict?: boolean } = {},
+  ): Promise<number> {
     let highest = 0;
     let cursor: string | undefined = String(fromSequence);
     let firstPage = true;
@@ -505,9 +559,9 @@ export class WorkflowContext {
       let steps: Record<string, any>[];
       let next: string | undefined;
       try {
-        [steps, next] = await this.client.getGraph(this.sessionId, 1000, cursor);
+        [steps, next] = await this.client.getGraph(this.sessionId, GRAPH_PAGE, cursor);
       } catch (err) {
-        if (firstPage && isNotFound(err)) return 0;
+        if (firstPage && !strict && isNotFound(err)) return 0;
         throw err;
       }
       firstPage = false;

@@ -143,6 +143,7 @@ export function tool<A extends unknown[], R>(
     // order they arrived, so positions are still claimed in call order, and each
     // settles again in case anything changed while it waited. With nothing being
     // written there is no await, and the claim stays synchronous as before.
+    if (!ctx.positionKnown) await ctx.ensurePosition();
     for (;;) {
       ctx.reconcileSequence();
       if (!ctx.recordingInFlight) break;
@@ -219,6 +220,8 @@ export function tool<A extends unknown[], R>(
     // right move is to wait for their result rather than to act.
     for (;;) {
       let resp;
+      const acquiredSentAt = performance.now();
+      const acquiredSentWallAt = Date.now();
       try {
         resp = await ctx.client.checkIdempotencyCache(
           agentId,
@@ -278,6 +281,8 @@ export function tool<A extends unknown[], R>(
           idempotencyKey: ikey,
           fencingToken,
           heartbeatIntervalMs: intervalMs,
+          acquiredSentAt,
+          acquiredSentWallAt,
         });
         hb.start();
       }

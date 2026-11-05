@@ -243,9 +243,11 @@ export class CellaflowClient {
 
     return await this.client.renewLease(req, {
       // Guard against timeout=0 which would cause an instant timeout.
+      // Whole milliseconds: the grpc-timeout header carries an integer, and a
+      // fractional value is dropped by the server rather than rounded.
       timeoutMs:
         timeoutSecs !== undefined && timeoutSecs > 0
-          ? timeoutSecs * 1000
+          ? Math.max(1, Math.round(timeoutSecs * 1000))
           : undefined,
     });
   }
@@ -274,7 +276,7 @@ export class CellaflowClient {
     return await this.client.releaseLease(req, {
       timeoutMs:
         timeoutSecs !== undefined && timeoutSecs > 0
-          ? timeoutSecs * 1000
+          ? Math.max(1, Math.round(timeoutSecs * 1000))
           : undefined,
     });
   }

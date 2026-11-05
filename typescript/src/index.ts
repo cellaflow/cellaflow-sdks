@@ -28,4 +28,5 @@ export {
   LeaseLostError,
 } from "./execution.js";
 export type { ExecutionLeaseOptions } from "./execution.js";
+export type { LeaseEvent } from "./lease.js";
 export { WorkflowContext } from "./context.js";
