@@ -281,35 +281,39 @@ def _texts(value: Any) -> List[str]:
     return texts
 
 
-def _small_enough(encoded: Any) -> bool:
+def _small_enough(encoded: Any, limit: int = _MAX_VALUE_BYTES) -> bool:
     try:
-        return len(serialize({"v": encoded})) <= _MAX_VALUE_BYTES
+        return len(serialize({"v": encoded})) <= limit
     except Exception:
         return False
 
 
 def _builtin_fields(exc: BaseException) -> Dict[str, Any]:
-    """Fields Python's own exception classes keep outside `args` and `__dict__`.
+    """Fields kept outside `args` and `__dict__`.
 
-    `OSError.errno`, `ImportError.name`, `StopIteration.value` and the like. An
-    exception whose class defines its own `__init__` sets them there, and the
-    rebuild never runs that `__init__`, so they are recorded and set directly.
+    Python's own: `OSError.errno`, `ImportError.name`, `StopIteration.value` and
+    the like, which a class's own `__init__` sets and the rebuild never runs, so
+    they are recorded and set directly (an unset one reads as None, and is left
+    out). And a class's `__slots__`, which `vars` does not show: recorded the
+    same way, None included, and left out only when never set.
     """
     fields: Dict[str, Any] = {}
+    builtin_field = (types.GetSetDescriptorType, types.MemberDescriptorType)
     for klass in type(exc).__mro__:
-        if klass.__module__ != "builtins":
-            continue
+        own = klass.__module__ == "builtins"
         for name, descriptor in vars(klass).items():
             if name.startswith("__") or name == "args":
                 continue
-            builtin_field = (types.GetSetDescriptorType, types.MemberDescriptorType)
-            if not isinstance(descriptor, builtin_field):
-                continue
+            if own:
+                if not isinstance(descriptor, builtin_field):
+                    continue
+            elif not isinstance(descriptor, types.MemberDescriptorType):
+                continue  # only a slot, among a class's own attributes
             try:
-                value = getattr(exc, name)
+                value = descriptor.__get__(exc, type(exc))
             except Exception:
-                continue
-            if value is not None:
+                continue  # a slot never set
+            if value is not None or not own:
                 fields.setdefault(name, value)
     return fields
 
@@ -462,10 +466,7 @@ def _minimal(exc: BaseException, depth: int) -> Dict[str, Any]:
         return member
     for i, arg in enumerate(exc.args):
         ok, encoded = _safe_encode(arg)
-        try:
-            ok = ok and len(serialize({"v": encoded})) <= _MAX_MEMBER_ARG_BYTES
-        except Exception:
-            ok = False
+        ok = ok and _small_enough(encoded, _MAX_MEMBER_ARG_BYTES)
         member["args"].append(encoded if ok else None)
         if not ok:
             member["unavailable_args"].append(i)

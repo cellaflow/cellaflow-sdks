@@ -31,7 +31,8 @@ All notable changes to the CellaFlow Python SDK.
   would rebuild it. These warnings come when the
   failure is recorded, so a failure the workflow lets propagate says nothing. Tuples,
   enums and subclasses of plain types are recorded, the last two as their plain value, as are the
-  fields Python keeps outside `args` (`OSError.errno`, `ImportError.name` and the like). An
+  fields Python keeps outside `args` (`OSError.errno`, `ImportError.name` and the like) and fields
+  in a class's `__slots__`. An
   exception group comes back with its members, every one of them keeping at least its type and
   message, so `except*` behaves the same; a group too large to record that way (over 2,000 members
   or 512 KB) is refused on resume, with a warning when it happens. An engine call's gRPC
@@ -52,28 +53,31 @@ All notable changes to the CellaFlow Python SDK.
   recording, so no later failure is recorded above the position it left empty; nor is one in a run that has
   not read the session's history (a resumed `durable_tools` thread). A record still unwritten when
   the workflow returns is written in the background, in one attempt, after the result has been
-  returned, so the result never waits on it; the process waits for the write before exiting, and
+  returned, so the result never waits on it; a new run of the same session waits for the write
+  before starting, the process waits up to 10 seconds for it before exiting, and
   `cellaflow.context.wait_for_record_writes()` waits for it sooner. If it cannot be written at once,
   it is dropped with a warning, and a resume runs the step again. If the failed step's lease could not be released, the record
   retries the release, or waits for the lease to lapse (counted from when the step's heartbeat
   stopped), rather than be refused at a position that lease still claims. In an async workflow, records are written on a worker
   thread, so the event loop is not held up.
 
-  A cancelled async step (`asyncio.CancelledError`) is recorded the same way, with how long it ran
-  before the cancellation, and its lease is released. On replay it does not raise at once: it waits,
-  so whatever cancelled it the first time cancels it again and the code sees the same exception
-  (`asyncio.wait_for` turns its own cancellation into `TimeoutError`). Any timeout in the code
-  fires again no later than it did, so the replay waits until the resumed run is as far in as the
-  first run was when the cancellation came, with a 25% margin; if nothing has cancelled the step by
-  then, the cancellation came from outside the code, and the replay delivers it itself. The wait is
-  never capped below that, which would raise `CancelledError` where the first run saw
-  `TimeoutError`; a wait longer than a few seconds is logged, with why. A replayed timeout therefore takes about as long as the original wait; putting the timeout
-  inside the step (`return await asyncio.wait_for(call(), 5)` in its body) records a plain
-  `TimeoutError` instead, which replays at once.
+  A cancelled async step (`asyncio.CancelledError`) is recorded the same way, with how long it ran,
+  and its lease is released, so the workflow's next step lands at the right position. A resume
+  refuses at it with `FailureNotReplayableError` rather than replay it: what the workflow saw
+  depended on what cancelled the step (`asyncio.wait_for` turns its own cancellation into
+  `TimeoutError`, one from outside arrives as `CancelledError`), which the record cannot say, and
+  waiting to be cancelled again cannot reliably tell either, since earlier steps replay instantly
+  and move every timer. A timeout inside the step's body (`return await asyncio.wait_for(call(),
+  5)`) records a plain `TimeoutError` instead, which replays exactly. A `CancelledError` raised out
+  of a synchronous step is that step's own exception, and is recorded and replayed as one.
+
+  A refusal stops the run even when the workflow catches it: every later step raises it again
+  before its body runs, and the workflow raises it when it ends, so a broad `except` around the
+  refused step cannot carry the run down a branch nothing checked.
 
 - **Two kinds of `NondeterministicWorkflowError`.** `ReplayDivergedError` means the resumed run
   called a different step than its history records at a position; its message names the session,
-  the position, both steps, the last failure or cancellation before them, and the way on.
+  the position, both steps, the last failure before them, and the way on.
   `FailureNotReplayableError` means a recorded failure or cancellation cannot be reproduced as it
   happened. Both subclass `NondeterministicWorkflowError`, so code that catches it still does.
 

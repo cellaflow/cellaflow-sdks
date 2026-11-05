@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import contextlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -52,27 +53,43 @@ class _RecordHeld(Exception):
         self.retry_after_s = retry_after_s
 
 
-#: Failures writing a hit's record that may succeed if sent again. The record is
-#: kept for the next step to retry; any other failure drops it. INTERNAL is how
-#: the engine reports a failed storage write, which it does not retry itself, and
-#: CANCELLED is the call being abandoned rather than refused.
-#: Threads writing the last failure record of a workflow that has returned.
-#: See `WorkflowContext._record_in_background`.
-_writers: "set[threading.Thread]" = set()
+#: Threads writing the last failure record of a workflow that has returned, by
+#: session. See `WorkflowContext._record_in_background`.
+_writers: "Dict[str, set[threading.Thread]]" = {}
 _writers_lock = threading.Lock()
+#: How long a process waits at exit for those writes. They run on daemon
+#: threads, so an engine that stops answering cannot keep the process alive.
+_EXIT_WAIT_S = 10.0
 
 
-def wait_for_record_writes(timeout: Optional[float] = None) -> None:
+def wait_for_record_writes(
+    timeout: Optional[float] = None, session_id: Optional[str] = None
+) -> None:
     """Waits for failure records still being written for workflows that have
-    returned. They are written in the background so a workflow's result never
-    waits on them, and the process waits for them before it exits; call this
-    to be sure of them sooner, as a test does before reading the history."""
+    returned, in one session or in all.
+
+    They are written in the background so a workflow's result never waits on
+    them. A workflow starting a session waits for that session's writes first,
+    and the process waits up to `_EXIT_WAIT_S` for all of them before it exits;
+    call this to be sure of them sooner, as a test does before reading the
+    history.
+    """
     with _writers_lock:
-        writers = list(_writers)
+        if session_id is None:
+            writers = [w for group in _writers.values() for w in group]
+        else:
+            writers = list(_writers.get(session_id, ()))
     for writer in writers:
         writer.join(timeout)
 
 
+atexit.register(wait_for_record_writes, _EXIT_WAIT_S)
+
+
+#: Failures writing a hit's record that may succeed if sent again. The record is
+#: kept for the next step to retry; any other failure drops it. INTERNAL is how
+#: the engine reports a failed storage write, which it does not retry itself, and
+#: CANCELLED is the call being abandoned rather than refused.
 _RETRYABLE_CODES = frozenset(
     {
         grpc.StatusCode.UNAVAILABLE,
@@ -126,12 +143,9 @@ class WorkflowContext:
     # Calls in one session can overlap: asyncio tasks, or a framework running
     # tools on a thread pool. See `take_hit`.
     _in_flight: int = 0
-    # When this run started, on the monotonic clock. A cancellation records how
-    # far into the run it happened, so a replay can wait at least that long for
-    # whatever cancelled it to do so again. See `decorators._replay_cancellation`.
-    run_started: float = field(
-        default_factory=time.monotonic, repr=False, compare=False
-    )
+    # The refusal that stopped this run's replay, if one did. Every later step
+    # raises it again, and so does the workflow's end. See `refuse`.
+    _refusal: Optional[BaseException] = field(default=None, repr=False, compare=False)
     # The modules loaded when the first run in this process started. A failure
     # whose class comes from a module loaded later was most likely imported by a
     # step, and a resume does not run steps, so the run warns. Taken once per
@@ -429,21 +443,19 @@ class WorkflowContext:
         coordination_id: Optional[str],
         agent_id: str = "default",
         step_key: str = "",
-        since_run_start_s: Optional[float] = None,
         source: Optional[BaseException] = None,
         unreleased: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Holds a step's cancellation to be recorded at `sequence`.
 
-        Recorded with how long the step ran before it was cancelled, because a
-        replay reproduces a cancellation by waiting to be cancelled again rather
-        than by raising one: what the workflow saw depended on what cancelled the
-        step. Written and guarded exactly as a failure is; see
-        `defer_failure_record`.
+        The record fills the position, so the workflow's next step lands where
+        it should. A resume refuses at it rather than replay it, because what
+        the workflow saw depended on what cancelled the step, which the record
+        cannot say; see `decorators._replay_recorded`. Recorded with how long
+        the step ran, for whoever reads the history. Written and guarded exactly
+        as a failure is; see `defer_failure_record`.
         """
         cancelled = {"format": 1, "sdk": "python", "elapsed_s": round(elapsed_s, 3)}
-        if since_run_start_s is not None:
-            cancelled["since_run_start_s"] = round(since_run_start_s, 3)
         self._hold_failure(
             sequence,
             name,
@@ -627,6 +639,27 @@ class WorkflowContext:
                 ", ".join(missing),
             )
 
+    def refuse(self, refusal: BaseException) -> None:
+        """Records that this run's replay refused to go on.
+
+        The refusal is raised at a step the workflow called inside its own
+        `try` (a failure was recorded there because the workflow caught one),
+        so a broad `except` can catch it and carry on down a branch nothing
+        checked. From here every step raises it again before its body runs,
+        and the workflow raises it at its end however it ends.
+        """
+        with self._lock:
+            if self._refusal is None:
+                self._refusal = refusal
+
+    def raise_if_refused(self, cause: Optional[BaseException] = None) -> None:
+        """Raises the refusal recorded by `refuse`, if any."""
+        refusal = self._refusal
+        if refusal is None or refusal is cause:
+            return
+        again = type(refusal)(*refusal.args)
+        raise again from cause
+
     def note_run_ended(self, exc: BaseException) -> None:
         """Warns when the workflow ends by raising a failure that was recorded.
 
@@ -679,27 +712,24 @@ class WorkflowContext:
         """
         self._record_in_background()
 
-    async def record_pending_failure_async(self) -> None:
-        """`record_pending_failure` for an async workflow."""
-        self._record_in_background()
-
     def _record_in_background(self) -> None:
         """Writes the last failure record without making the workflow wait.
 
         The workflow has already produced its result, so recording must neither
         delay nor replace it: a caller with a timeout would otherwise lose a
-        finished run to bookkeeping. The write runs on its own thread, which
-        the process waits for before exiting, and nothing is started when no
-        failure is pending. See `wait_for_record_writes`.
+        finished run to bookkeeping. The write runs on its own thread; the
+        process waits a bounded time for it before exiting, a new run of the
+        same session waits for it before starting, and nothing is started when
+        no failure is pending. See `wait_for_record_writes`.
         """
         pending = self._pending_hit
         if pending is None or pending.get("kind") != "failure":
             return
         writer = threading.Thread(
-            target=self._try_record_failure, name="cellaflow-record", daemon=False
+            target=self._try_record_failure, name="cellaflow-record", daemon=True
         )
         with _writers_lock:
-            _writers.add(writer)
+            _writers.setdefault(self.session_id, set()).add(writer)
         writer.start()
 
     def _try_record_failure(self) -> None:
@@ -739,7 +769,11 @@ class WorkflowContext:
                 )
         finally:
             with _writers_lock:
-                _writers.discard(threading.current_thread())
+                group = _writers.get(self.session_id)
+                if group is not None:
+                    group.discard(threading.current_thread())
+                    if not group:
+                        del _writers[self.session_id]
 
     def reconcile_sequence(self) -> None:
         """Records a deferred hit, then adopts the position the engine reported.

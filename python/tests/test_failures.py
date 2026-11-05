@@ -699,121 +699,7 @@ def _cancelled(sequence: int, name: str, elapsed_s: float) -> Any:
     )
 
 
-def test_a_replayed_timeout_takes_the_same_branch(
-    mock_stub: MagicMock, mock_client: None
-) -> None:
-    """The replay waits rather than raising, so the workflow's own wait_for times
-    out again and the code sees TimeoutError, as it did the first time."""
-    import time
-
-    _history(
-        mock_stub,
-        "sess-timeout",
-        [_cancelled(1, "charge", 0.05), _succeeded(2, "fallback", "fallback")],
-    )
-    ran: List[str] = []
-
-    @step
-    async def charge() -> str:
-        ran.append("charge")
-        return "charged"
-
-    @step
-    async def fallback() -> str:
-        ran.append("fallback")
-        return "live fallback"
-
-    @workflow(version="1.0.0")
-    async def checkout() -> str:
-        try:
-            return await asyncio.wait_for(charge(), 0.05)
-        except asyncio.TimeoutError:
-            return await fallback()  # type: ignore[no-any-return]
-
-    started = time.monotonic()
-    result = asyncio.run(checkout(_session_id="sess-timeout"))  # type: ignore[call-arg]
-    assert result == "fallback"
-    assert ran == []
-    assert 0.04 <= time.monotonic() - started < 1.0
-    mock_stub.CommitStep.assert_not_called()
-
-
-def test_a_replayed_outside_cancel_is_delivered_by_the_replay(
-    mock_stub: MagicMock, mock_client: None
-) -> None:
-    """The first run was cancelled from outside the code (a Cancel button). Nothing
-    repeats that on replay, so after waiting as long as the step ran, the replay
-    cancels it itself, and the workflow takes the same branch."""
-    _history(
-        mock_stub,
-        "sess-button",
-        [_cancelled(1, "issue_refund", 0.05), _succeeded(2, "escalate", "escalated")],
-    )
-    ran: List[str] = []
-
-    @step
-    async def issue_refund() -> str:
-        ran.append("issue_refund")
-        return "refunded"
-
-    @step
-    async def escalate() -> str:
-        ran.append("escalate")
-        return "live escalate"
-
-    @workflow(version="1.0.0")
-    async def handle() -> str:
-        task = asyncio.ensure_future(issue_refund())
-        try:
-            return await task  # type: ignore[no-any-return]
-        except asyncio.CancelledError:
-            return await escalate()  # type: ignore[no-any-return]
-
-    result = asyncio.run(handle(_session_id="sess-button"))  # type: ignore[call-arg]
-    assert result == "escalated"
-    assert ran == []
-
-
-def test_a_divergence_after_a_cancellation_says_where_the_paths_parted(
-    mock_stub: MagicMock, mock_client: None
-) -> None:
-    """The code changed since the first run and now calls a different step after
-    the timeout. The error names the session, the position, both steps and the
-    cancellation before them, and the way on."""
-    from cellaflow import NondeterministicWorkflowError, ReplayDivergedError
-
-    _history(
-        mock_stub,
-        "sess-changed",
-        [_cancelled(1, "charge", 0.05), _succeeded(2, "escalate", "escalated")],
-    )
-
-    @step
-    async def charge() -> str:
-        return "charged"
-
-    @step
-    async def send_reply() -> str:
-        return "sent"
-
-    @workflow(version="1.0.0")
-    async def handle() -> str:
-        try:
-            return await asyncio.wait_for(charge(), 0.05)
-        except asyncio.TimeoutError:
-            return await send_reply()  # type: ignore[no-any-return]
-
-    with pytest.raises(ReplayDivergedError) as excinfo:
-        asyncio.run(handle(_session_id="sess-changed"))  # type: ignore[call-arg]
-    assert isinstance(excinfo.value, NondeterministicWorkflowError)
-    message = str(excinfo.value)
-    assert "Session sess-changed cannot resume at position 2" in message
-    assert "'send_reply'" in message and "'escalate'" in message
-    assert "Position 1 ('charge') was cancelled on the first run" in message
-    assert "start a new session" in message
-
-
-def test_a_cancellation_cannot_replay_on_a_step_that_is_now_synchronous(
+def test_a_recorded_cancellation_refuses_on_a_synchronous_step_too(
     mock_stub: MagicMock, mock_client: None
 ) -> None:
     from cellaflow import FailureNotReplayableError
@@ -828,7 +714,7 @@ def test_a_cancellation_cannot_replay_on_a_step_that_is_now_synchronous(
     def handle() -> str:
         return charge()  # type: ignore[no-any-return]
 
-    with pytest.raises(FailureNotReplayableError, match="now a synchronous one"):
+    with pytest.raises(FailureNotReplayableError, match="cannot tell what cancel"):
         handle(_session_id="sess-sync")  # type: ignore[call-arg]
 
 
@@ -859,63 +745,6 @@ def test_an_unreplayable_failure_is_a_failure_not_replayable_error(
 
 
 # --- Review fixes, round two ----------------------------------------------------
-
-
-def test_a_timeout_around_several_steps_replays_its_branch(
-    mock_stub: MagicMock, mock_client: None
-) -> None:
-    """The timeout started before the first step, which took most of it. On replay
-    that step is instant, so the timeout fires later relative to the cancelled
-    step than it did. The replay waits until the run is as far in as it was."""
-    _history(
-        mock_stub,
-        "sess-scope",
-        [
-            _succeeded(1, "prepare", "ready"),
-            common_pb2.StepResult(
-                sequence=2,
-                name="charge",
-                status=FAILED,
-                output_payload=serialize(
-                    {
-                        "cancelled": {
-                            "format": 1,
-                            "sdk": "python",
-                            "elapsed_s": 0.1,
-                            "since_run_start_s": 1.0,
-                        }
-                    }
-                ),
-            ),
-            _succeeded(3, "fallback", "fallback"),
-        ],
-    )
-
-    @step
-    async def prepare() -> str:
-        return "ready"
-
-    @step
-    async def charge() -> str:
-        return "charged"
-
-    @step
-    async def fallback() -> str:
-        return "live fallback"
-
-    @workflow(version="1.0.0")
-    async def checkout() -> str:
-        async def both() -> str:
-            await prepare()
-            return await charge()  # type: ignore[no-any-return]
-
-        try:
-            return await asyncio.wait_for(both(), 1.0)
-        except asyncio.TimeoutError:
-            return await fallback()  # type: ignore[no-any-return]
-
-    result = asyncio.run(checkout(_session_id="sess-scope"))  # type: ignore[call-arg]
-    assert result == "fallback"
 
 
 class FetchFailed(OSError):
@@ -1218,70 +1047,6 @@ def _cancelled_at(seq: int, elapsed_s: float, since_run_start_s: float) -> Any:
             }
         ),
     )
-
-
-def test_a_long_timeout_around_earlier_steps_still_replays_as_a_timeout(
-    mock_stub: MagicMock, mock_client: None, monkeypatch: Any
-) -> None:
-    """The replay waits until the run is as far in as the first was, however
-    long that is. A cap below it raised `CancelledError` where the first run saw
-    `TimeoutError`, so the run took a different branch."""
-    # The previous code capped this wait; at 0.2 s it would give up first.
-    monkeypatch.setattr(
-        "cellaflow.decorators._CANCEL_WAIT_RUN_CAP_S", 0.2, raising=False
-    )
-    _history(
-        mock_stub,
-        "sess-long-scope",
-        [_succeeded(1, "prepare", "ready"), _cancelled_at(2, 0.01, 0.6)],
-    )
-
-    @step
-    async def prepare() -> str:
-        return "ready"
-
-    @step
-    async def charge() -> str:
-        return "charged"
-
-    @workflow(version="1.0.0")
-    async def wf() -> str:
-        async def both() -> str:
-            await prepare()
-            return await charge()  # type: ignore[no-any-return]
-
-        try:
-            return await asyncio.wait_for(both(), 0.6)
-        except asyncio.TimeoutError:
-            return "timed out"
-
-    run_wf: Any = wf
-    assert asyncio.run(run_wf(_session_id="sess-long-scope")) == "timed out"
-
-
-def test_a_cancellation_from_outside_is_delivered_after_the_bounded_wait(
-    mock_stub: MagicMock, mock_client: None
-) -> None:
-    """Nothing in the code cancels the step on replay, so once the run is as far
-    in as the first was (with the margin), the replay delivers the cancellation
-    itself, and not much later."""
-    import time
-
-    _history(mock_stub, "sess-own", [_cancelled_at(1, 0.3, 0.3)])
-
-    @step
-    async def charge() -> str:
-        return "charged"
-
-    @workflow(version="1.0.0")
-    async def wf() -> str:
-        return await charge()  # type: ignore[no-any-return]
-
-    started = time.monotonic()
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(wf(_session_id="sess-own"))  # type: ignore[call-arg]
-    waited = time.monotonic() - started
-    assert 0.6 <= waited < 1.5  # 0.3 * 1.25 + 0.25, from the start of the run
 
 
 def test_a_timeout_that_expires_during_the_commit_does_not_cancel_a_committed_step(
@@ -2013,27 +1778,6 @@ def test_a_new_exception_at_a_recorded_ones_address_is_not_mistaken_for_it(
     assert "resuming this session raises it again" in caplog.text
 
 
-def test_a_long_replayed_cancellation_says_why_it_waits(
-    mock_stub: MagicMock, mock_client: None, caplog: Any, monkeypatch: Any
-) -> None:
-    monkeypatch.setattr("cellaflow.decorators._CANCEL_WAIT_LOG_S", 0.1)
-    _history(mock_stub, "sess-explain", [_cancelled_at(1, 0.2, 0.2)])
-
-    @step
-    async def charge() -> str:
-        return "charged"
-
-    @workflow(version="1.0.0")
-    async def wf() -> str:
-        return await charge()  # type: ignore[no-any-return]
-
-    run_wf: Any = wf
-    with caplog.at_level("WARNING", logger="cellaflow.decorators"):
-        with pytest.raises(asyncio.CancelledError):
-            asyncio.run(run_wf(_session_id="sess-explain"))
-    assert "replaying the cancellation of 'charge' at position 1" in caplog.text
-
-
 def test_a_release_retried_by_the_record_is_timed_from_the_heartbeat_stopping(
     mock_stub: MagicMock, mock_client: None
 ) -> None:
@@ -2177,3 +1921,199 @@ def test_a_cancellation_records_how_long_the_step_ran_not_its_cleanup(
     first = mock_stub.CommitStep.call_args_list[0][0][0]
     record = deserialize(first.step_result.output_payload)["cancelled"]
     assert record["elapsed_s"] < 0.3
+
+
+# --- Review fixes, round seven --------------------------------------------------
+
+
+def test_a_recorded_cancellation_refuses_the_resume_and_says_how_to_fix_it(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """A replay cannot tell what cancelled the step, a timeout around it or
+    something outside the run, so it refuses at once rather than guess or wait."""
+    import time
+
+    from cellaflow import FailureNotReplayableError
+
+    _history(mock_stub, "sess-cancel-refused", [_cancelled_at(1, 0.05, 30.0)])
+    ran: List[str] = []
+
+    @step
+    async def charge() -> str:
+        ran.append("charge")
+        return "charged"
+
+    @workflow(version="1.0.0")
+    async def wf() -> str:
+        try:
+            return await asyncio.wait_for(charge(), 10)
+        except asyncio.TimeoutError:
+            return "timed out"
+
+    run_wf: Any = wf
+    started = time.monotonic()
+    with pytest.raises(FailureNotReplayableError, match="inside the step's body"):
+        asyncio.run(run_wf(_session_id="sess-cancel-refused"))
+    assert time.monotonic() - started < 1.0
+    assert ran == []
+
+
+class NotFound(Exception):
+    pass
+
+
+def test_a_refusal_the_workflow_catches_still_stops_the_run(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """A recorded failure exists because the workflow caught it, so the refusal
+    is raised inside the workflow's own `try`. A broad `except` catching it must
+    not let the run carry on: the next step refuses before its body runs."""
+    from cellaflow import FailureNotReplayableError
+
+    failed = capture(NotFound("x"))
+    failed["type"] = "no_such_module:NotFound"
+    _history(
+        mock_stub,
+        "sess-swallowed",
+        [
+            common_pb2.StepResult(
+                sequence=1,
+                name="charge",
+                status=FAILED,
+                output_payload=serialize({"error": failed}),
+            )
+        ],
+    )
+    ran: List[str] = []
+
+    @step
+    def charge() -> str:
+        ran.append("charge")
+        return "charged"
+
+    @step
+    def fallback() -> str:
+        ran.append("fallback")
+        return "fell back"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            return charge()  # type: ignore[no-any-return]
+        except Exception:
+            return fallback()  # type: ignore[no-any-return]
+
+    with pytest.raises(FailureNotReplayableError):
+        wf(_session_id="sess-swallowed")  # type: ignore[call-arg]
+    assert ran == []
+
+
+def test_a_refusal_swallowed_with_no_step_after_it_ends_the_run(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    from cellaflow import ReplayDivergedError
+
+    _history(mock_stub, "sess-swallowed-end", [_succeeded(1, "warmup", "ok")])
+
+    @step
+    def charge() -> str:
+        return "charged"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            charge()
+        except Exception:
+            pass
+        return "carried on"
+
+    with pytest.raises(ReplayDivergedError):
+        wf(_session_id="sess-swallowed-end")  # type: ignore[call-arg]
+
+
+def test_a_cancellation_raised_out_of_a_synchronous_step_replays_as_itself(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """There it is the step's own exception (an `asyncio.run` inside the step,
+    say), so it is recorded as a failure, and replays."""
+    _fresh(mock_stub, "sess-sync-cancel")
+
+    @step
+    def fetch() -> str:
+        raise asyncio.CancelledError("inner run cancelled")
+
+    @step
+    def fallback() -> str:
+        return "fell back"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            return fetch()  # type: ignore[no-any-return]
+        except asyncio.CancelledError:
+            return fallback()  # type: ignore[no-any-return]
+
+    assert wf() == "fell back"
+    first = mock_stub.CommitStep.call_args_list[0][0][0]
+    record = deserialize(first.step_result.output_payload)
+    assert "error" in record and "cancelled" not in record
+    rebuilt = _round_trip(asyncio.CancelledError("inner run cancelled"))
+    assert type(rebuilt) is asyncio.CancelledError
+
+
+class RetryLater(Exception):
+    __slots__ = ("retry_after", "reason")
+    retry_after: int
+    reason: str
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__("retry later")
+        self.retry_after = retry_after
+
+
+def test_fields_kept_in_slots_are_recorded_and_replayed() -> None:
+    """`vars` does not show them, so they were dropped without a warning."""
+    from cellaflow.failures import UnavailableOnReplay
+
+    recorded = capture(RetryLater(30))
+    assert recorded["attrs"]["retry_after"] == 30
+    rebuilt: Any = _round_trip(RetryLater(30))
+    assert type(rebuilt) is RetryLater and rebuilt.retry_after == 30
+    with pytest.raises(AttributeError):
+        rebuilt.reason  # never set, so not set on replay either
+    assert not isinstance(getattr(rebuilt, "retry_after"), UnavailableOnReplay)
+
+
+@pytest.mark.background_records
+def test_a_new_run_of_a_session_waits_for_its_last_record(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """Otherwise it could read the history before the record lands, and put its
+    own next step on that position."""
+    import threading
+    import time
+
+    _fresh(mock_stub, "sess-rerun")
+    order: List[str] = []
+    answer = mock_stub.CommitStep.side_effect
+
+    def slow_commit(req: Any, **kwargs: Any) -> Any:
+        if req.step_result.status == FAILED:
+            time.sleep(0.3)
+            order.append("record written")
+        return answer(req, **kwargs)
+
+    def start(req: Any, **kwargs: Any) -> Any:
+        order.append("session started")
+        return service_pb2.StartSessionResponse(
+            session_id="sess-rerun", version="1.0.0", is_recovered=False
+        )
+
+    mock_stub.CommitStep.side_effect = slow_commit
+    mock_stub.StartSession.side_effect = start
+    wf = _caught_then_returns(PaymentDeclined("no funds"))
+    wf(_session_id="sess-rerun")
+    writers = [t for t in threading.enumerate() if t.name == "cellaflow-record"]
+    assert writers and all(t.daemon for t in writers)
+    wf(_session_id="sess-rerun")
+    assert order[:3] == ["session started", "record written", "session started"]
