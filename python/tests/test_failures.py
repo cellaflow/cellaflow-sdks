@@ -1527,9 +1527,10 @@ def _caught_then_returns(raise_in_step: BaseException) -> Callable[..., Any]:
 
 
 def test_a_record_that_cannot_be_written_after_the_workflow_returns_keeps_its_result(
-    mock_stub: MagicMock, mock_client: None, caplog: Any, monkeypatch: Any
+    mock_stub: MagicMock, mock_client: None, caplog: Any
 ) -> None:
-    monkeypatch.setattr("cellaflow.context._END_RETRY_BASE_S", 0.0)
+    """One attempt, then the record is dropped: the workflow's result never
+    waits on, or is replaced by, the bookkeeping."""
     _fresh(mock_stub, "sess-end")
     answer = mock_stub.CommitStep.side_effect
 
@@ -1542,26 +1543,33 @@ def test_a_record_that_cannot_be_written_after_the_workflow_returns_keeps_its_re
     wf = _caught_then_returns(PaymentDeclined("no funds"))
     with caplog.at_level("WARNING", logger="cellaflow.context"):
         assert wf() == "done"
-    assert mock_stub.CommitStep.call_count == 4  # the first try and three retries
+    assert mock_stub.CommitStep.call_count == 1
     assert "The workflow's result stands" in caplog.text
 
 
-def test_a_record_that_lands_on_a_retry_after_the_workflow_returns_is_kept(
-    mock_stub: MagicMock, mock_client: None, monkeypatch: Any
+def test_a_record_held_by_a_lease_is_not_waited_for_after_the_workflow_returns(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
 ) -> None:
-    monkeypatch.setattr("cellaflow.context._END_RETRY_BASE_S", 0.0)
-    _fresh(mock_stub, "sess-end-retry")
-    answer = mock_stub.CommitStep.side_effect
-    failures = [Unavailable()]
+    """A caller with a timeout would otherwise lose a finished run to a record
+    waiting for a lease to lapse."""
+    import time
 
-    def commit(req: Any, **kwargs: Any) -> Any:
-        if failures:
-            raise failures.pop()
-        return answer(req, **kwargs)
+    _fresh(mock_stub, "sess-end-held")
+    acquired = mock_stub.CheckIdempotencyCache.return_value
 
-    mock_stub.CommitStep.side_effect = commit
-    assert _caught_then_returns(PaymentDeclined("no funds"))() == "done"
-    assert _commits(mock_stub)[-1] == (1, "charge", FAILED)
+    def check(req: Any, **kwargs: Any) -> Any:
+        if ":failure:" in req.idempotency_key:
+            return idempotency_pb2.CheckCacheResponse(
+                status=idempotency_pb2.CACHE_STATUS_IN_PROGRESS, retry_after_ms=5000
+            )
+        return acquired
+
+    mock_stub.CheckIdempotencyCache.side_effect = check
+    started = time.monotonic()
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert _caught_then_returns(PaymentDeclined("no funds"))() == "done"
+    assert time.monotonic() - started < 1.0
+    assert "a lease still holds its position" in caplog.text
 
 
 def test_a_failure_is_not_recorded_by_a_run_that_does_not_know_the_history() -> None:
@@ -1732,10 +1740,12 @@ def test_an_exception_from_a_module_a_step_imported_is_warned_about(
 
 
 def test_a_module_loaded_before_the_run_is_not_warned_about(
-    mock_stub: MagicMock, mock_client: None, caplog: Any
+    mock_stub: MagicMock, mock_client: None, caplog: Any, monkeypatch: Any
 ) -> None:
     _fresh(mock_stub, "sess-eager")
     lazy = _lazy_module("eager_payments")
+    # As if this were the process's first run, so the snapshot holds the module.
+    monkeypatch.setattr("cellaflow.failures._first_run_modules", None)
 
     @step
     def charge() -> str:
@@ -1925,3 +1935,127 @@ def test_an_interrupted_run_with_a_cleanup_step_says_the_same(
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(interrupt())
     assert "the workflow ended with CancelledError from 'long_task'" in caplog.text
+
+
+def test_every_run_warns_about_a_module_a_step_imported_not_only_the_first(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
+) -> None:
+    """The snapshot is taken once per process, so a second run, which finds the
+    module already loaded, still warns."""
+    _fresh(mock_stub, "sess-lazy-twice")
+
+    @step
+    def charge() -> str:
+        lazy = sys.modules.get("lazy_twice") or _lazy_module("lazy_twice")
+        raise lazy.LazyError("card declined")
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            charge()
+        except Exception:
+            return "fallback"
+        return "charged"
+
+    try:
+        with caplog.at_level("WARNING", logger="cellaflow.context"):
+            assert wf() == "fallback"
+            assert wf() == "fallback"
+    finally:
+        sys.modules.pop("lazy_twice", None)
+    assert caplog.text.count("Add `import lazy_twice`") == 2
+
+
+def test_a_new_exception_at_a_recorded_ones_address_is_not_mistaken_for_it(
+    mock_stub: MagicMock, mock_client: None, caplog: Any
+) -> None:
+    """Python reuses a freed exception's address for the next one of the same
+    size, so the workflow's own ValueError can sit where a recorded one was."""
+    from cellaflow.context import _identity
+
+    _fresh(mock_stub, "sess-reused")
+
+    @step
+    def parse() -> str:
+        raise ValueError("not a number")
+
+    @step
+    def note() -> str:
+        return "noted"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            parse()
+        except ValueError:
+            note()
+        raise ValueError("bad input")
+
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        with pytest.raises(ValueError, match="bad input"):
+            wf()
+    assert "resuming this session raises it again" not in caplog.text
+
+    # The reuse itself, made certain: a recorded failure whose address and class
+    # match the exception the workflow ends with, but whose message does not.
+    from cellaflow.context import WorkflowContext
+
+    ending = ValueError("bad input")
+    ctx = WorkflowContext(client=MagicMock(), session_id="s", workflow_version="1")
+    ctx._recorded_failures.append(((id(ending), ValueError, "not a number"), "x", 1))
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        ctx.note_run_ended(ending)
+    assert "resuming this session raises it again" not in caplog.text
+    ctx._recorded_failures.append((_identity(ending), "x", 1))  # type: ignore[arg-type]
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        ctx.note_run_ended(ending)
+    assert "resuming this session raises it again" in caplog.text
+
+
+def test_a_long_replayed_cancellation_says_why_it_waits(
+    mock_stub: MagicMock, mock_client: None, caplog: Any, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr("cellaflow.decorators._CANCEL_WAIT_LOG_S", 0.1)
+    _history(mock_stub, "sess-explain", [_cancelled_at(1, 0.2, 0.2)])
+
+    @step
+    async def charge() -> str:
+        return "charged"
+
+    @workflow(version="1.0.0")
+    async def wf() -> str:
+        return await charge()  # type: ignore[no-any-return]
+
+    run_wf: Any = wf
+    with caplog.at_level("WARNING", logger="cellaflow.decorators"):
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(run_wf(_session_id="sess-explain"))
+    assert "replaying the cancellation of 'charge' at position 1" in caplog.text
+
+
+def test_a_release_retried_by_the_record_is_timed_from_the_heartbeat_stopping(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """The lease's lapse is counted from when the record is held, after the
+    heartbeat stopped, so a renewal in flight at the failed release cannot
+    outlast the wait."""
+    from cellaflow.context import WorkflowContext
+
+    ctx = WorkflowContext(
+        client=MagicMock(),
+        session_id="s",
+        workflow_version="1",
+        sequence=1,
+        replayed_steps={},
+        history_known=True,
+    )
+    ctx._in_flight = 1
+    lease = {"agent_id": "a", "key": "k", "token": 7, "lapses_in_s": 21.0}
+    import time
+
+    before = time.monotonic()
+    ctx.defer_failure_record(1, "charge", ValueError("x"), None, unreleased=lease)
+    held = ctx._pending_hit
+    assert held is not None and held["unreleased"]["lapses_at"] >= before + 21.0
+    assert "lapses_at" not in lease  # the caller's copy is left alone

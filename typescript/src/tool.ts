@@ -1,7 +1,7 @@
 import { isFailedPrecondition } from "./errors.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
-import { getContext, type WorkflowContext } from "./context.js";
+import { getContext, type UnreleasedLease, type WorkflowContext } from "./context.js";
 import { IdempotencyScope, deriveIdempotencyKey, normalizeCoordinationId } from "./idempotency.js";
 import { LeaseHeartbeat } from "./lease.js";
 import { deserialize } from "./serialization.js";
@@ -149,7 +149,7 @@ export function tool<A extends unknown[], R>(
       await ctx.settleRecording();
     }
     const seq = ctx.claimPosition();
-    const known: { key?: string } = {};
+    const known: { key?: string; unreleased?: UnreleasedLease } = {};
     try {
       return await runAt(ctx, seq, args, callCoordination, coordinationId, known);
     } catch (err) {
@@ -157,7 +157,15 @@ export function tool<A extends unknown[], R>(
       // next call does not land past the gap. Not for a refused lease: another
       // writer owns that position and fills it.
       if (!(err instanceof DivergentStepError)) {
-        ctx.deferFailureRecord(seq, toolName, err, callCoordination, agentId, known.key ?? "");
+        ctx.deferFailureRecord(
+          seq,
+          toolName,
+          err,
+          callCoordination,
+          agentId,
+          known.key ?? "",
+          known.unreleased,
+        );
       }
       throw err;
     } finally {
@@ -172,7 +180,7 @@ export function tool<A extends unknown[], R>(
     args: A,
     callCoordination: string | undefined,
     coordinationId: string | undefined,
-    known: { key?: string },
+    known: { key?: string; unreleased?: UnreleasedLease },
   ): Promise<R> {
 
     let ikey = idempotencyKey;
@@ -302,8 +310,14 @@ export function tool<A extends unknown[], R>(
             // The lease expires on its own. Losing the release is not worth
             // masking the error that caused it. Until it does, it still claims
             // this position, so the failure record there retries the release
-            // or waits for it. Renewals extend it by at most three intervals.
-            ctx.noteUnreleased(seq, agentId, ikey, fencingToken, intervalMs * 4 + 1000);
+            // or waits for it. Renewals extend it by at most three intervals,
+            // counted once the heartbeat below has stopped.
+            known.unreleased = {
+              agentId,
+              key: ikey,
+              token: fencingToken,
+              lapsesInMs: intervalMs * 4 + 1000,
+            };
           });
       }
       throw err;

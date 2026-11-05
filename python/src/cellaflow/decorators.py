@@ -4,7 +4,7 @@ import uuid
 import asyncio
 import time
 import logging
-from typing import Any, Callable, Dict, Optional, Sequence, TypeVar, cast
+from typing import Any, Callable, Dict, NoReturn, Optional, Sequence, TypeVar, cast
 
 import grpc
 
@@ -228,6 +228,9 @@ class FailureNotReplayableError(NondeterministicWorkflowError):
 #: run going slower than the first. See `_replay_cancellation`.
 _CANCEL_WAIT_FACTOR = 1.25
 _CANCEL_WAIT_EXTRA_S = 0.25
+#: A replayed cancellation that waits longer than this says why, so a resume
+#: that pauses there is not mistaken for a hang.
+_CANCEL_WAIT_LOG_S = 5.0
 #: How long a lease lasts when there is no heartbeat to say: four of the
 #: engine's default 5-second heartbeat intervals.
 _DEFAULT_LEASE_TTL_MS = 20_000
@@ -301,7 +304,9 @@ def _divergence_message(
     return "\n".join(lines)
 
 
-async def _replay_cancellation(ctx: WorkflowContext, cancelled: Dict[str, Any]) -> None:
+async def _replay_cancellation(
+    ctx: WorkflowContext, cancelled: Dict[str, Any], seq: int, name: str
+) -> NoReturn:
     """Reproduces a cancellation: waits to be cancelled, as the step did then.
 
     What the workflow saw depended on what cancelled the step, not on the step:
@@ -331,6 +336,18 @@ async def _replay_cancellation(ctx: WorkflowContext, cancelled: Dict[str, Any]) 
             + _CANCEL_WAIT_EXTRA_S
         )
         wait = max(wait, deadline - time.monotonic())
+    if wait > _CANCEL_WAIT_LOG_S:
+        logger.warning(
+            "Cellaflow: replaying the cancellation of %r at position %d of session "
+            "%s. Waiting up to %.0f s for what cancelled it on the first run (a "
+            "timeout in the code, say) to cancel it again: the first run was that "
+            "far in when it was cancelled, and a timeout set earlier fires again no "
+            "sooner. A timeout inside the step's own body replays at once.",
+            name,
+            seq,
+            ctx.session_id,
+            wait,
+        )
     await asyncio.sleep(wait)
     raise asyncio.CancelledError()
 
@@ -346,6 +363,11 @@ def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
     than replayed.
     """
     _check_recorded_name(ctx, seq, expected_name)
+    return _replay_recorded(ctx, seq, expected_name)
+
+
+def _replay_recorded(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
+    """`_replay` once the recorded name has been checked."""
     recorded = ctx.replayed_steps[seq]
     payload = recorded.get("payload")
     if _cancellation(recorded) is not None:
@@ -376,8 +398,8 @@ async def _replay_async(ctx: WorkflowContext, seq: int, expected_name: str) -> A
     _check_recorded_name(ctx, seq, expected_name)
     cancelled = _cancellation(ctx.replayed_steps[seq])
     if cancelled is not None:
-        await _replay_cancellation(ctx, cancelled)
-    return _replay(ctx, seq, expected_name)
+        await _replay_cancellation(ctx, cancelled, seq, expected_name)
+    return _replay_recorded(ctx, seq, expected_name)
 
 
 def _release_after_failure(
@@ -386,11 +408,17 @@ def _release_after_failure(
     ikey: str,
     fencing_token: int,
     name: str,
-    seq: int,
     hb: Optional[LeaseHeartbeat],
-) -> None:
+) -> Optional[Dict[str, Any]]:
     """Releases the lease of a step that failed or was cancelled, so the step
-    that takes this position next is not refused until it lapses."""
+    that takes this position next is not refused until it lapses.
+
+    If the release fails, returns the lease, for the failure record to retry the
+    release or wait for the lapse: the lease still claims the step's position,
+    so the engine would refuse the record there. When it lapses is counted from
+    the moment the record is held, after the heartbeat has stopped, because a
+    renewal still in flight now can extend it.
+    """
     try:
         ctx.client.release_lease(
             agent_id=agent_id,
@@ -407,8 +435,14 @@ def _release_after_failure(
             name,
             exc_info=True,
         )
-        lapses_in_s = (hb.lease_ttl_ms if hb else _DEFAULT_LEASE_TTL_MS) / 1000.0
-        ctx.note_unreleased(seq, agent_id, ikey, fencing_token, lapses_in_s + 1.0)
+        ttl_ms = hb.lease_ttl_ms if hb else _DEFAULT_LEASE_TTL_MS
+        return {
+            "agent_id": agent_id,
+            "key": ikey,
+            "token": fencing_token,
+            "lapses_in_s": ttl_ms / 1000.0 + 1.0,
+        }
+    return None
 
 
 def _note_failure(
@@ -420,6 +454,7 @@ def _note_failure(
     agent_id: str,
     ikey: Optional[str],
     elapsed_s: float,
+    unreleased: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Holds a live step's failure or cancellation to be recorded at its position.
 
@@ -443,13 +478,20 @@ def _note_failure(
                 step_key=ikey or "",
                 since_run_start_s=time.monotonic() - ctx.run_started,
                 source=exc,
+                unreleased=unreleased,
             )
             return
         if not isinstance(exc, Exception):
             ctx.give_back_position(seq)
             return
         ctx.defer_failure_record(
-            seq, name, exc, call_coordination, agent_id=agent_id, step_key=ikey or ""
+            seq,
+            name,
+            exc,
+            call_coordination,
+            agent_id=agent_id,
+            step_key=ikey or "",
+            unreleased=unreleased,
         )
     except Exception:
         # Noting the failure must never replace the step's own exception, which
@@ -589,6 +631,9 @@ def step(
         # failure is recorded; `ikey` once it is known.
         live = False
         ikey: Optional[str] = None
+        # A lease the step could not release after failing, kept with its
+        # failure record. See `_release_after_failure`.
+        unreleased: Optional[Dict[str, Any]] = None
         started = time.monotonic()
         try:
             if seq in ctx.replayed_steps:
@@ -702,8 +747,8 @@ def step(
                 # Cancellation too: a lease left held would refuse the step that
                 # takes this position next until it lapsed.
                 if fencing_token > 0:
-                    _release_after_failure(
-                        ctx, agent_id, ikey, fencing_token, actual_tool_name, seq, hb
+                    unreleased = _release_after_failure(
+                        ctx, agent_id, ikey, fencing_token, actual_tool_name, hb
                     )
                 raise e
             finally:
@@ -725,6 +770,7 @@ def step(
                     agent_id,
                     ikey,
                     time.monotonic() - started,
+                    unreleased,
                 )
             raise
         finally:
@@ -749,6 +795,9 @@ def step(
         # failure is recorded; `ikey` once it is known.
         live = False
         ikey: Optional[str] = None
+        # A lease the step could not release after failing, kept with its
+        # failure record. See `_release_after_failure`.
+        unreleased: Optional[Dict[str, Any]] = None
         started = time.monotonic()
         try:
             if seq in ctx.replayed_steps:
@@ -860,8 +909,8 @@ def step(
                 # Cancellation too: a lease left held would refuse the step that
                 # takes this position next until it lapsed.
                 if fencing_token > 0:
-                    _release_after_failure(
-                        ctx, agent_id, ikey, fencing_token, actual_tool_name, seq, hb
+                    unreleased = _release_after_failure(
+                        ctx, agent_id, ikey, fencing_token, actual_tool_name, hb
                     )
                 raise e
             finally:
@@ -878,6 +927,7 @@ def step(
                     agent_id,
                     ikey,
                     time.monotonic() - started,
+                    unreleased,
                 )
             raise
         finally:

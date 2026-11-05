@@ -24,6 +24,23 @@ interface PendingHit {
   agentId: string;
   /** The idempotency key the hit answered, or the failed step's own key. */
   receivedKey: string;
+  /**
+   * The failed call's own lease, if it could not be released: it still claims
+   * this position, so the record retries the release or waits for it to lapse.
+   * It lives and goes with the record. See {@link WorkflowContext.writeRecord}.
+   */
+  unreleased?: UnreleasedLease;
+}
+
+/** A failed call's lease that could not be released. */
+export interface UnreleasedLease {
+  agentId: string;
+  key: string;
+  token: number;
+  /** How long it can still last, from when the heartbeat stopped. */
+  lapsesInMs: number;
+  /** When it lapses; set when the record is held. */
+  lapsesAt?: number;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -120,31 +137,6 @@ export class WorkflowContext {
    */
   private inFlight = 0;
 
-  /**
-   * Leases of failed calls that could not be released, by position, with when
-   * each lapses on its own. A failure record at that position retries the
-   * release, or waits for the lapse. See {@link writeRecord}.
-   */
-  private unreleased = new Map<
-    number,
-    { agentId: string; key: string; token: number; lapsesAt: number }
-  >();
-
-  /**
-   * Remembers a failed call's lease that could not be released. It still claims
-   * the call's position until it lapses, so the engine would refuse the failure
-   * record there and the run would continue as though another agent owned it.
-   */
-  noteUnreleased(
-    sequence: number,
-    agentId: string,
-    key: string,
-    token: number,
-    lapsesInMs: number,
-  ): void {
-    this.unreleased.set(sequence, { agentId, key, token, lapsesAt: Date.now() + lapsesInMs });
-  }
-
   constructor(init: {
     client: CellaflowClient;
     sessionId: string;
@@ -219,10 +211,14 @@ export class WorkflowContext {
     coordinationId?: string,
     agentId = "default",
     stepKey = "",
+    unreleased?: UnreleasedLease,
   ): void {
     // As for a hit: a run that does not know everything the session holds (a
     // resumed `durableTools` session) would record at a position already filled.
     if (!(this.historyKnown && this.inFlight === 1 && this.sequence === sequence)) return;
+    // Counted from now: the call's heartbeat has stopped, so no renewal can
+    // extend the lease past this.
+    const lease = unreleased && { ...unreleased, lapsesAt: Date.now() + unreleased.lapsesInMs };
     this.pendingHit = {
       kind: "failure",
       status: StepStatus.FAILED,
@@ -232,6 +228,7 @@ export class WorkflowContext {
       coordinationId,
       agentId,
       receivedKey: stepKey,
+      unreleased: lease,
     };
   }
 
@@ -395,7 +392,7 @@ export class WorkflowContext {
       pending.kind === "failure"
         ? failureIdempotencyKey(this.sessionId, pending.sequence, pending.name, pending.receivedKey)
         : recordIdempotencyKey(this.sessionId, pending.sequence, pending.receivedKey);
-    const unreleased = this.unreleased.get(pending.sequence);
+    const unreleased = pending.unreleased;
     if (unreleased) {
       // The failed call's own lease still claims this position, so the engine
       // would refuse the record. Try the release again first.
@@ -406,10 +403,10 @@ export class WorkflowContext {
           unreleased.token,
           "TOOL_ERROR",
         );
-        this.unreleased.delete(pending.sequence);
+        pending.unreleased = undefined;
       } catch (err) {
         // Already released or lapsed: nothing is left to free.
-        if (!isRetryable(err)) this.unreleased.delete(pending.sequence);
+        if (!isRetryable(err)) pending.unreleased = undefined;
       }
     }
     let token = 0;
@@ -425,15 +422,20 @@ export class WorkflowContext {
           pending.sequence,
         );
       } catch (err) {
-        const held = this.unreleased.get(pending.sequence);
-        const remaining = held ? held.lapsesAt - Date.now() : 0;
-        if (held && isFailedPrecondition(err) && remaining > 0) {
-          // Refused because of that lease, which lapses on its own: wait for it,
-          // as for any held record.
-          await sleep(Math.min(1000, remaining));
-          continue;
+        const held = pending.unreleased;
+        if (held && isFailedPrecondition(err)) {
+          const remaining = (held.lapsesAt ?? 0) - Date.now();
+          if (remaining > 0) {
+            // Refused because of that lease, which lapses on its own: wait for
+            // it, as for any held record.
+            await sleep(Math.min(1000, remaining));
+            continue;
+          }
+          // Lapsed, so the refusal is someone else's claim.
+          pending.unreleased = undefined;
         }
-        this.unreleased.delete(pending.sequence);
+        // Anything else, including an error that may pass, keeps the lease, so
+        // the next attempt still retries the release or waits for the lapse.
         throw err;
       }
       // Written by an earlier attempt whose answer was lost.

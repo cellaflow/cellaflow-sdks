@@ -653,6 +653,33 @@ test("a failure record waits for an unreleased lease to lapse", async () => {
   );
 });
 
+test("an error that may pass does not make the record forget the unreleased lease", async () => {
+  // The record is kept for the next call. That call must still know the failed
+  // call's lease holds the position, or it drops the record as someone else's.
+  const answers = [
+    () => { throw Object.assign(new Error("engine unavailable"), { code: 14 }); },
+    () => { throw Object.assign(new Error("position claimed"), { code: 9 }); },
+    () => ({ status: CacheStatus.ACQUIRED, fencingToken: 99n, heartbeatIntervalMs: 60_000n }),
+  ];
+  const client = scriptedClient([acquired(), acquired(), acquired()], {
+    recordLease: () => answers.shift()(),
+  });
+  client.releaseLease = async () => {
+    throw Object.assign(new Error("engine unavailable"), { code: 14 });
+  };
+  const charge = tool(async () => { throw new Error("boom"); }, { toolName: "charge" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), /boom/);
+    await assert.rejects(notify(), /engine unavailable/);
+    assert.equal(await notify(), "notified");
+  });
+  assert.deepEqual(
+    client.commits.map((c) => [c.sequence, c.name]),
+    [[1, "charge"], [2, "notify"]],
+  );
+});
+
 test("a failure nothing follows records nothing", async () => {
   const client = scriptedClient([acquired()]);
   const charge = tool(async () => { throw new Error("boom"); }, { toolName: "charge" });

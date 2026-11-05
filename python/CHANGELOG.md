@@ -19,7 +19,7 @@ All notable changes to the CellaFlow Python SDK.
   be rebuilt that way, so its resume is refused. Its class must be defined
   at module level in a module the workflow imports, as it is when an `except` clause names it. A
   library the step imports inside its own body is not imported on resume, since the step does not
-  run; the run warns when such a class is recorded, and a resume that cannot find it names the
+  run; every run warns when such a class is recorded, and a resume that cannot find it names the
   import to add, after which the same session resumes.
   Otherwise the resume stops with `FailureNotReplayableError` rather than run the step again.
   The original run logs a warning when the failure is recorded if the class cannot be found by name,
@@ -50,10 +50,11 @@ All notable changes to the CellaFlow Python SDK.
   it ends that way, and says to start a new session to run the step again. A failure
   while another step of the session is in flight is not recorded either, nor one in a run that has
   not read the session's history (a resumed `durable_tools` thread). A record still unwritten when
-  the workflow returns is written then; if that fails after a few retries, the workflow's result
-  stands, with a warning, and a resume runs the step again. If the failed step's lease could not be
-  released, the record retries the release, or waits for the lease to lapse, rather than be refused
-  at a position that lease still claims. In an async workflow, records are written on a worker
+  the workflow returns is written then, in one attempt with no waiting, so the result is never
+  delayed by it; if it cannot be written at once, the workflow's result stands, with a warning, and
+  a resume runs the step again. If the failed step's lease could not be released, the record
+  retries the release, or waits for the lease to lapse (counted from when the step's heartbeat
+  stopped), rather than be refused at a position that lease still claims. In an async workflow, records are written on a worker
   thread, so the event loop is not held up.
 
   A cancelled async step (`asyncio.CancelledError`) is recorded the same way, with how long it ran
@@ -64,7 +65,7 @@ All notable changes to the CellaFlow Python SDK.
   first run was when the cancellation came, with a 25% margin; if nothing has cancelled the step by
   then, the cancellation came from outside the code, and the replay delivers it itself. The wait is
   never capped below that, which would raise `CancelledError` where the first run saw
-  `TimeoutError`. A replayed timeout therefore takes about as long as the original wait; putting the timeout
+  `TimeoutError`; a wait longer than a few seconds is logged, with why. A replayed timeout therefore takes about as long as the original wait; putting the timeout
   inside the step (`return await asyncio.wait_for(call(), 5)` in its body) records a plain
   `TimeoutError` instead, which replays at once.
 

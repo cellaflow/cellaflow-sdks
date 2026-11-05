@@ -18,7 +18,7 @@ from cellaflow.failures import (
     capture,
     findable,
     incomplete_group,
-    loaded_modules,
+    modules_at_first_run,
     rebuild,
     type_location,
     unrecorded,
@@ -29,12 +29,19 @@ from cellaflow.v1 import common_pb2, idempotency_pb2, service_pb2
 logger = logging.getLogger(__name__)
 
 
-def _identity(exc: Optional[BaseException]) -> Optional[Tuple[int, type]]:
+def _identity(exc: Optional[BaseException]) -> Optional[Tuple[int, type, str]]:
     """An exception's identity without a reference to it, which would keep its
     traceback, and every frame in it, alive. Exceptions cannot be weakly
-    referenced; the class is kept with the id so a reused id is not mistaken
-    for the same exception."""
-    return None if exc is None else (id(exc), type(exc))
+    referenced, and Python reuses a freed exception's id for the next one of the
+    same size, so the class and message are kept with it: a new exception of
+    the same class at the same address is told apart by what it says."""
+    if exc is None:
+        return None
+    try:
+        message = str(exc)[:200]
+    except Exception:
+        message = ""
+    return (id(exc), type(exc), message)
 
 
 class _RecordHeld(Exception):
@@ -49,11 +56,6 @@ class _RecordHeld(Exception):
 #: kept for the next step to retry; any other failure drops it. INTERNAL is how
 #: the engine reports a failed storage write, which it does not retry itself, and
 #: CANCELLED is the call being abandoned rather than refused.
-#: How many times a failure record is retried after the workflow has returned,
-#: on an error that may pass, and the first wait, doubled each time.
-_END_RETRIES = 3
-_END_RETRY_BASE_S = 0.5
-
 _RETRYABLE_CODES = frozenset(
     {
         grpc.StatusCode.UNAVAILABLE,
@@ -108,21 +110,17 @@ class WorkflowContext:
     run_started: float = field(
         default_factory=time.monotonic, repr=False, compare=False
     )
-    # The modules loaded when this run started. A failure whose class comes from
-    # a module loaded later was most likely imported by a step, and a resume
-    # does not run steps, so the run warns. See `_warn_if_not_replayable`.
+    # The modules loaded when the first run in this process started. A failure
+    # whose class comes from a module loaded later was most likely imported by a
+    # step, and a resume does not run steps, so the run warns. Taken once per
+    # process, so every run warns, not only the first. See
+    # `_warn_if_not_replayable`.
     _modules_at_start: "frozenset[str]" = field(
-        default_factory=loaded_modules, repr=False, compare=False
-    )
-    # Leases of failed steps that could not be released, by position, with when
-    # each lapses on its own. A failure record at that position waits for it.
-    # See `_write_record`.
-    _unreleased: Dict[int, Dict[str, Any]] = field(
-        default_factory=dict, repr=False, compare=False
+        default_factory=lambda: modules_at_first_run(), repr=False, compare=False
     )
     # The failures this run recorded, by the identity of their exception, with
     # the step's name and position. See `note_run_ended`.
-    _recorded_failures: List[Tuple[Tuple[int, type], str, int]] = field(
+    _recorded_failures: List[Tuple[Tuple[int, type, str], str, int]] = field(
         default_factory=list, repr=False, compare=False
     )
     # The write of a pending record that async steps are waiting on. See
@@ -311,6 +309,7 @@ class WorkflowContext:
         coordination_id: Optional[str],
         agent_id: str = "default",
         step_key: str = "",
+        unreleased: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Holds a step's failure to be recorded at `sequence` in this session.
 
@@ -347,6 +346,7 @@ class WorkflowContext:
             agent_id,
             step_key,
             source=exc,
+            unreleased=unreleased,
         )
 
     def defer_cancellation_record(
@@ -359,6 +359,7 @@ class WorkflowContext:
         step_key: str = "",
         since_run_start_s: Optional[float] = None,
         source: Optional[BaseException] = None,
+        unreleased: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Holds a step's cancellation to be recorded at `sequence`.
 
@@ -379,6 +380,7 @@ class WorkflowContext:
             agent_id,
             step_key,
             source=source,
+            unreleased=unreleased,
         )
 
     def _hold_failure(
@@ -390,13 +392,23 @@ class WorkflowContext:
         agent_id: str,
         step_key: str,
         source: Optional[BaseException] = None,
+        unreleased: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Holds a failure-kind record, if nothing claimed a later position.
 
         `source` is the exception, kept only as its identity and class: to warn
         about replaying it when it is recorded, and to recognise it if the
         workflow later ends by raising it. See `note_run_ended`.
+
+        `unreleased` is the step's own lease, if it could not be released: it
+        still claims this position, so the record retries the release or waits
+        for it to lapse. It lives and goes with the record. See `_write_record`.
         """
+        if unreleased is not None:
+            # Counted from now: the step's heartbeat has stopped, so no renewal
+            # can extend the lease past this.
+            unreleased = dict(unreleased)
+            unreleased["lapses_at"] = time.monotonic() + unreleased["lapses_in_s"]
         with self._lock:
             if not self._can_hold(sequence):
                 return
@@ -407,6 +419,7 @@ class WorkflowContext:
                 "name": name,
                 "payload": payload,
                 "source": _identity(source),
+                "unreleased": unreleased,
                 "warn": source is not None and "error" in payload,
                 "coordination_id": coordination_id,
                 "agent_id": agent_id,
@@ -545,7 +558,7 @@ class WorkflowContext:
         resume replays them and ends with the same exception: it cannot run the
         failed step again, because a later position is already filled.
         """
-        chain: List[Optional[Tuple[int, type]]] = []
+        chain: List[Optional[Tuple[int, type, str]]] = []
         link: Optional[BaseException] = exc
         while link is not None and len(chain) < 20:
             chain.append(_identity(link))
@@ -564,24 +577,6 @@ class WorkflowContext:
                     name,
                 )
                 return
-
-    def note_unreleased(
-        self, sequence: int, agent_id: str, key: str, token: int, lapses_in_s: float
-    ) -> None:
-        """Remembers a failed step's lease that could not be released.
-
-        It still claims the step's position until it lapses, so the engine would
-        refuse the failure record there and the run would continue as though
-        another agent owned it. The record retries the release, and otherwise
-        waits for the lapse.
-        """
-        with self._lock:
-            self._unreleased[sequence] = {
-                "agent_id": agent_id,
-                "key": key,
-                "token": token,
-                "lapses_at": time.monotonic() + lapses_in_s,
-            }
 
     def give_back_position(self, sequence: int) -> None:
         """Returns the position of a step a process exit interrupted.
@@ -603,60 +598,46 @@ class WorkflowContext:
         Called when a workflow returns normally. A failure followed by a later
         step is recorded when that step starts; this covers one followed by none.
         """
-        attempt = 0
-        while True:
-            wait = self._try_record_failure(attempt)
-            if wait is None:
-                return
-            attempt += 1
-            time.sleep(wait)
+        self._try_record_failure()
 
     async def record_pending_failure_async(self) -> None:
         """`record_pending_failure` for an async workflow, written on a worker
         thread so the event loop is not stalled."""
-        attempt = 0
-        while True:
-            wait = await asyncio.to_thread(self._try_record_failure, attempt)
-            if wait is None:
-                return
-            attempt += 1
-            await asyncio.sleep(wait)
+        await asyncio.to_thread(self._try_record_failure)
 
-    def _try_record_failure(self, attempt: int) -> Optional[float]:
-        """One attempt: how long to wait before the next, or None when done.
+    def _try_record_failure(self) -> None:
+        """One attempt, and no waiting.
 
-        The workflow has already finished, so a record that cannot be written
-        never replaces its result. An error that may pass is retried a few
-        times; then, or for any other error, the record is dropped with a
-        warning, and a resume runs the step again, as it did before failures
+        The workflow has already produced its result, so recording it must not
+        delay or replace that result: a caller with a timeout would otherwise
+        lose a finished run to bookkeeping. If the record cannot be written at
+        once (an error, or a lease still holding its position), it is dropped
+        with a warning, and a resume runs the step again, as before failures
         were recorded.
         """
         self._prepare_pending()
         with self._lock:
             pending = self._pending_hit
             if pending is None or pending.get("kind") != "failure":
-                return None
+                return
             try:
                 self.reconcile_sequence()
-            except _RecordHeld as held:
-                return held.retry_after_s
+                return
+            except _RecordHeld:
+                reason = "a lease still holds its position"
             except Exception as exc:
-                code = exc.code() if isinstance(exc, grpc.RpcError) else None
-                if code in _RETRYABLE_CODES and attempt < _END_RETRIES:
-                    return float(_END_RETRY_BASE_S * (2**attempt))
-                if self._pending_hit is pending:
-                    self._pending_hit = None
-                logger.warning(
-                    "Cellaflow: the failure of %r at position %d of session %s was "
-                    "not recorded (%s: %s). The workflow's result stands; a resume "
-                    "of this session runs that step again.",
-                    pending["name"],
-                    pending["sequence"],
-                    self.session_id,
-                    type(exc).__name__,
-                    exc,
-                )
-            return None
+                reason = f"{type(exc).__name__}: {exc}"
+            if self._pending_hit is pending:
+                self._pending_hit = None
+            logger.warning(
+                "Cellaflow: the failure of %r at position %d of session %s was not "
+                "recorded (%s). The workflow's result stands; a resume of this "
+                "session runs that step again.",
+                pending["name"],
+                pending["sequence"],
+                self.session_id,
+                reason,
+            )
 
     def reconcile_sequence(self) -> None:
         """Records a deferred hit, then adopts the position the engine reported.
@@ -762,7 +743,7 @@ class WorkflowContext:
                 self.session_id, pending["sequence"], pending["received_key"]
             )
         agent_id = pending["agent_id"]
-        unreleased = self._unreleased.get(pending["sequence"])
+        unreleased = pending.get("unreleased")
         if unreleased is not None:
             # The failed step's own lease still claims this position, so the
             # engine would refuse the record. Try the release again first.
@@ -773,12 +754,12 @@ class WorkflowContext:
                     fencing_token=unreleased["token"],
                     reason="TOOL_ERROR",
                 )
-                self._unreleased.pop(pending["sequence"], None)
+                pending["unreleased"] = None
             except Exception as exc:
                 code = exc.code() if isinstance(exc, grpc.RpcError) else None
                 if code not in _RETRYABLE_CODES:
                     # Already released or lapsed: nothing is left to free.
-                    self._unreleased.pop(pending["sequence"], None)
+                    pending["unreleased"] = None
         try:
             resp = self.client.check_idempotency_cache(
                 agent_id=agent_id,
@@ -787,7 +768,7 @@ class WorkflowContext:
                 sequence=pending["sequence"],
             )
         except grpc.RpcError as exc:
-            unreleased = self._unreleased.get(pending["sequence"])
+            unreleased = pending.get("unreleased")
             if (
                 unreleased is not None
                 and exc.code() == grpc.StatusCode.FAILED_PRECONDITION
@@ -797,7 +778,7 @@ class WorkflowContext:
                     # Refused because of that lease, which lapses on its own:
                     # wait for it, as for any held record.
                     raise _RecordHeld(min(1.0, remaining)) from None
-                self._unreleased.pop(pending["sequence"], None)
+                pending["unreleased"] = None
             raise
         if resp.status == idempotency_pb2.CACHE_STATUS_HIT:
             # Written by an earlier attempt whose answer was lost.

@@ -219,10 +219,17 @@ def findable(cls: type) -> bool:
     return _resolve(type_location(cls)) is cls
 
 
-def loaded_modules() -> "frozenset[str]":
-    """The names of the modules loaded now. `copy` takes them in one step, so an
-    import on another thread cannot change the dict while it is read."""
-    return frozenset(sys.modules.copy())
+_first_run_modules: "Optional[frozenset[str]]" = None
+
+
+def modules_at_first_run() -> "frozenset[str]":
+    """The names of the modules loaded when this was first called in this
+    process, which is when its first run started. `copy` takes them in one step,
+    so an import on another thread cannot change the dict while it is read."""
+    global _first_run_modules
+    if _first_run_modules is None:
+        _first_run_modules = frozenset(sys.modules.copy())
+    return _first_run_modules
 
 
 #: Bounds on a recorded failure, so a record always fits in a commit. A value over
