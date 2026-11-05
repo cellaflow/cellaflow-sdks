@@ -315,13 +315,14 @@ export function tool<A extends unknown[], R>(
             // The lease expires on its own. Losing the release is not worth
             // masking the error that caused it. Until it does, it still claims
             // this position, so the failure record there retries the release
-            // or waits for it. Renewals extend it by at most three intervals,
-            // counted once the heartbeat below has stopped.
+            // or waits for it. It lasts at most as long as the heartbeat's own
+            // lease settings say, counted once the heartbeat below has stopped,
+            // plus a second for the engine's clock.
             known.unreleased = {
               agentId,
               key: ikey,
               token: fencingToken,
-              lapsesInMs: intervalMs * 4 + 1000,
+              lapsesInMs: (hb?.lastsAtMostMs ?? intervalMs * 4) + 1000,
             };
           });
       }

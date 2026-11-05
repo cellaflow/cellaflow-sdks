@@ -79,8 +79,19 @@ def wait_for_record_writes(
             writers = [w for group in _writers.values() for w in group]
         else:
             writers = list(_writers.get(session_id, ()))
+    # One deadline for all of them, so many stalled writes cannot add up.
+    deadline = None if timeout is None else time.monotonic() + timeout
     for writer in writers:
-        writer.join(timeout)
+        if deadline is None:
+            writer.join()
+        else:
+            writer.join(max(0.0, deadline - time.monotonic()))
+
+
+def has_record_writes(session_id: str) -> bool:
+    """Whether a failure record is still being written for `session_id`."""
+    with _writers_lock:
+        return bool(_writers.get(session_id))
 
 
 atexit.register(wait_for_record_writes, _EXIT_WAIT_S)
@@ -156,7 +167,7 @@ class WorkflowContext:
     )
     # The failures this run recorded, by the identity of their exception, with
     # the step's name and position. See `note_run_ended`.
-    _recorded_failures: List[Tuple[Tuple[int, type, str], str, int]] = field(
+    _recorded_failures: List[Tuple[Tuple[int, type, str], str, int, bool]] = field(
         default_factory=list, repr=False, compare=False
     )
     # The write of a pending record that async steps are waiting on. See
@@ -675,7 +686,19 @@ class WorkflowContext:
         while link is not None and len(chain) < 20:
             chain.append(_identity(link))
             link = link.__cause__ or link.__context__
-        for source, name, sequence in self._recorded_failures:
+        for source, name, sequence, cancelled in self._recorded_failures:
+            if source in chain and cancelled:
+                logger.warning(
+                    "Cellaflow: the workflow ended with %r cancelled at position %d "
+                    "of session %s. A step ran after the cancellation, so it was "
+                    "recorded, and a resume of this session refuses at that "
+                    "position: a replay cannot tell what cancelled it. To run it "
+                    "again, start a new session.",
+                    name,
+                    sequence,
+                    self.session_id,
+                )
+                return
             if source in chain:
                 logger.warning(
                     "Cellaflow: the workflow ended with %s from %r at position %d "
@@ -725,12 +748,40 @@ class WorkflowContext:
         pending = self._pending_hit
         if pending is None or pending.get("kind") != "failure":
             return
+        if "cancelled" in (pending.get("payload") or {}):
+            # Nothing follows it, so no position needs filling, and a resume
+            # refuses at a recorded cancellation: recording it would only stop
+            # this session from being replayed, even to read its result. Left
+            # unrecorded, a resume runs the step again, as before.
+            with self._lock:
+                if self._pending_hit is pending:
+                    self._pending_hit = None
+            return
         writer = threading.Thread(
             target=self._try_record_failure, name="cellaflow-record", daemon=True
         )
         with _writers_lock:
             _writers.setdefault(self.session_id, set()).add(writer)
-        writer.start()
+        try:
+            writer.start()
+        except Exception:
+            # Out of threads, say. Never at the cost of the workflow's result:
+            # the record is dropped, and a resume runs the step again.
+            with _writers_lock:
+                group = _writers.get(self.session_id)
+                if group is not None:
+                    group.discard(writer)
+                    if not group:
+                        del _writers[self.session_id]
+            logger.warning(
+                "Cellaflow: could not start writing the failure of %r at position "
+                "%d of session %s; it is not recorded, and a resume runs that step "
+                "again.",
+                pending["name"],
+                pending["sequence"],
+                self.session_id,
+                exc_info=True,
+            )
 
     def _try_record_failure(self) -> None:
         """One attempt, and no waiting. On its own thread; see
@@ -848,8 +899,9 @@ class WorkflowContext:
                 )
                 return
             if pending.get("kind") == "failure" and pending.get("source"):
+                cancelled = "cancelled" in (pending.get("payload") or {})
                 self._recorded_failures.append(
-                    (pending["source"], pending["name"], pending["sequence"])
+                    (pending["source"], pending["name"], pending["sequence"], cancelled)
                 )
             self._pending_hit = None
             return

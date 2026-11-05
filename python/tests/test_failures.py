@@ -596,12 +596,26 @@ class Unavailable(grpc.RpcError):  # type: ignore[misc]
 
 
 def test_an_engine_error_replays_with_its_code_and_details() -> None:
+    """gRPC's own error classes have internal constructors, so one replays as
+    an equivalent RpcError with the same code and details."""
+    from grpc.aio import AioRpcError, Metadata
+
     from cellaflow.failures import ReplayedRpcError
 
-    rebuilt = _round_trip(Unavailable())
+    error = AioRpcError(
+        grpc.StatusCode.UNAVAILABLE, Metadata(), Metadata(), "engine restarting"
+    )
+    rebuilt = _round_trip(error)
     assert isinstance(rebuilt, grpc.RpcError) and isinstance(rebuilt, ReplayedRpcError)
     assert rebuilt.code() == grpc.StatusCode.UNAVAILABLE
     assert rebuilt.details() == "engine restarting"
+
+
+def test_a_users_own_rpc_error_class_replays_as_itself() -> None:
+    """So an `except` clause naming it still matches on replay."""
+    rebuilt = _round_trip(Unavailable())
+    assert type(rebuilt) is Unavailable
+    assert rebuilt.code() == grpc.StatusCode.UNAVAILABLE
 
 
 class WithStatus(Exception):
@@ -1699,7 +1713,8 @@ def test_an_interrupted_run_with_a_cleanup_step_says_the_same(
     with caplog.at_level("WARNING", logger="cellaflow.context"):
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(interrupt())
-    assert "the workflow ended with CancelledError from 'long_task'" in caplog.text
+    assert "the workflow ended with 'long_task' cancelled at position 1" in caplog.text
+    assert "a resume of this session refuses at that position" in caplog.text
 
 
 def test_every_run_warns_about_a_module_a_step_imported_not_only_the_first(
@@ -1767,12 +1782,16 @@ def test_a_new_exception_at_a_recorded_ones_address_is_not_mistaken_for_it(
 
     ending = ValueError("bad input")
     ctx = WorkflowContext(client=MagicMock(), session_id="s", workflow_version="1")
-    ctx._recorded_failures.append(((id(ending), ValueError, "not a number"), "x", 1))
+    ctx._recorded_failures.append(
+        ((id(ending), ValueError, "not a number"), "x", 1, False)
+    )
     caplog.clear()
     with caplog.at_level("WARNING", logger="cellaflow.context"):
         ctx.note_run_ended(ending)
     assert "resuming this session raises it again" not in caplog.text
-    ctx._recorded_failures.append((_identity(ending), "x", 1))  # type: ignore[arg-type]
+    ctx._recorded_failures.append(
+        (_identity(ending), "x", 1, False)  # type: ignore[arg-type]
+    )
     with caplog.at_level("WARNING", logger="cellaflow.context"):
         ctx.note_run_ended(ending)
     assert "resuming this session raises it again" in caplog.text
@@ -1866,6 +1885,7 @@ def test_steps_failing_together_stop_recording_rather_than_skip_a_position(
 
     @step
     async def a() -> str:
+        await asyncio.sleep(0.01)  # b has claimed its position by now
         raise PaymentDeclined("a")
 
     @step
@@ -2117,3 +2137,150 @@ def test_a_new_run_of_a_session_waits_for_its_last_record(
     assert writers and all(t.daemon for t in writers)
     wf(_session_id="sess-rerun")
     assert order[:3] == ["session started", "record written", "session started"]
+
+
+# --- Review fixes, round eight --------------------------------------------------
+
+
+def test_a_cancellation_nothing_follows_is_not_recorded(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """No position needs filling, and a resume refuses at a recorded
+    cancellation: recording it would only stop the finished session from being
+    replayed, even to read its result."""
+    _fresh(mock_stub, "sess-cancel-last")
+
+    @step
+    async def charge() -> str:
+        await asyncio.sleep(5)
+        return "charged"
+
+    @workflow(version="1.0.0")
+    async def wf() -> str:
+        try:
+            return await asyncio.wait_for(charge(), 0.05)
+        except asyncio.TimeoutError:
+            return "timed out"
+
+    assert asyncio.run(wf()) == "timed out"
+    assert _commits(mock_stub) == []
+
+
+def test_waiting_for_record_writes_has_one_deadline_for_all() -> None:
+    import threading
+    import time
+
+    from cellaflow import context
+
+    stalled = [
+        threading.Thread(target=time.sleep, args=(1.0,), daemon=True) for _ in range(3)
+    ]
+    for writer in stalled:
+        writer.start()
+    context._writers["sess-stalled"] = set(stalled)
+    try:
+        started = time.monotonic()
+        context.wait_for_record_writes(0.3, session_id="sess-stalled")
+        assert time.monotonic() - started < 0.6
+    finally:
+        del context._writers["sess-stalled"]
+
+
+@pytest.mark.background_records
+def test_a_writer_that_cannot_start_never_costs_the_workflows_result(
+    mock_stub: MagicMock, mock_client: None, monkeypatch: Any, caplog: Any
+) -> None:
+    import threading
+
+    from cellaflow import context
+
+    original = threading.Thread.start
+
+    def refuse(self: threading.Thread) -> None:
+        if self.name == "cellaflow-record":
+            raise RuntimeError("can't start new thread")
+        original(self)
+
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    _fresh(mock_stub, "sess-no-thread")
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert _caught_then_returns(PaymentDeclined("no funds"))() == "done"
+    assert "could not start writing the failure" in caplog.text
+    assert "sess-no-thread" not in context._writers
+
+
+def test_a_steps_own_nondeterministic_error_replays_without_stopping_the_run(
+    mock_stub: MagicMock, mock_client: None
+) -> None:
+    """A step that drives another workflow can fail with a replay error of its
+    own. The workflow caught it the first time; replaying it is not a refusal
+    of this run."""
+    from cellaflow import ReplayDivergedError
+
+    recorded = capture(ReplayDivergedError("the inner workflow diverged"))
+    _history(
+        mock_stub,
+        "sess-inner",
+        [
+            common_pb2.StepResult(
+                sequence=1,
+                name="run_inner",
+                status=FAILED,
+                output_payload=serialize({"error": recorded}),
+            )
+        ],
+    )
+    ran: List[str] = []
+
+    @step
+    def run_inner() -> str:
+        ran.append("run_inner")
+        return "inner done"
+
+    @step
+    def report() -> str:
+        ran.append("report")
+        return "reported"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            return run_inner()  # type: ignore[no-any-return]
+        except ReplayDivergedError:
+            return report()  # type: ignore[no-any-return]
+
+    assert wf(_session_id="sess-inner") == "reported"  # type: ignore[call-arg]
+    assert ran == ["report"]
+
+
+def test_a_failed_steps_exception_is_not_replaced_while_its_heartbeat_stops(
+    mock_stub: MagicMock, mock_client: None, monkeypatch: Any
+) -> None:
+    """Stopping the heartbeat is not awaited, so a timeout that expires then
+    cannot land in the step and replace its own exception with a cancellation."""
+
+    async def slow_stop(self: Any) -> None:
+        await asyncio.sleep(0.3)
+
+    monkeypatch.setattr("cellaflow.lease.LeaseHeartbeat.stop_async", slow_stop)
+    _fresh(mock_stub, "sess-stop")
+
+    @step
+    async def charge() -> str:
+        await asyncio.sleep(0.05)
+        raise PaymentDeclined("no funds")
+
+    @step
+    async def fallback() -> str:
+        return "fell back"
+
+    @workflow(version="1.0.0")
+    async def wf() -> str:
+        try:
+            return await asyncio.wait_for(charge(), 0.15)
+        except PaymentDeclined:
+            return await fallback()  # type: ignore[no-any-return]
+
+    assert asyncio.run(wf()) == "fell back"
+    first = mock_stub.CommitStep.call_args_list[0][0][0]
+    assert "error" in deserialize(first.step_result.output_payload)

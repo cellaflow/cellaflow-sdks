@@ -4,7 +4,7 @@ import uuid
 import asyncio
 import time
 import logging
-from typing import Any, Callable, Dict, Optional, Sequence, TypeVar, cast
+from typing import Any, Callable, Dict, NoReturn, Optional, Sequence, TypeVar, cast
 
 import grpc
 
@@ -12,6 +12,7 @@ from cellaflow.client import CellaflowClient
 from cellaflow.context import (
     _EXIT_WAIT_S,
     WorkflowContext,
+    has_record_writes,
     set_context,
     reset_context,
     get_context,
@@ -55,8 +56,12 @@ def workflow(
 
             # A run of this session that just returned may still be writing its
             # last failure record; reading the history before it lands would
-            # put this run's next step on that position.
-            wait_for_record_writes(_EXIT_WAIT_S, session_id=session_id)
+            # put this run's next step on that position. Waited for on a worker
+            # thread, so other tasks on the loop keep running.
+            if has_record_writes(session_id):
+                await asyncio.to_thread(
+                    wait_for_record_writes, _EXIT_WAIT_S, session_id
+                )
             client = CellaflowClient(target=target, secure=secure)
             resp = client.start_session(
                 workflow_id=func.__name__,
@@ -304,6 +309,12 @@ def _divergence_message(
     return "\n".join(lines)
 
 
+def _refuse(ctx: WorkflowContext, refusal: NondeterministicWorkflowError) -> NoReturn:
+    """Raises a replay refusal, after recording it so the run stops there."""
+    ctx.refuse(refusal)
+    raise refusal from None
+
+
 def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
     """Returns the recorded result at `seq`, or raises if it is a different step.
 
@@ -321,14 +332,20 @@ def _replay(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
     """
     try:
         _check_recorded_name(ctx, seq, expected_name)
-        return _replay_recorded(ctx, seq, expected_name)
     except NondeterministicWorkflowError as refusal:
         ctx.refuse(refusal)
         raise
+    return _replay_recorded(ctx, seq, expected_name)
 
 
 def _replay_recorded(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
-    """`_replay` once the recorded name has been checked."""
+    """`_replay` once the recorded name has been checked.
+
+    Only the replay's own refusals go through `ctx.refuse`. A recorded failure
+    raised again is the step's own exception, even one that happens to be a
+    `NondeterministicWorkflowError` (from a workflow the step drives, say):
+    the workflow caught it the first time, and may again.
+    """
     recorded = ctx.replayed_steps[seq]
     payload = recorded.get("payload")
     if _cancellation(recorded) is not None:
@@ -340,7 +357,7 @@ def _replay_recorded(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
         # instantly, so timers around them fire at different moments, and one
         # that did not fire the first time can fire now. So the replay refuses
         # rather than guess.
-        raise FailureNotReplayableError(
+        _refuse(ctx, FailureNotReplayableError(
             f"Cannot replay position {seq} ({expected_name!r}) of session "
             f"{ctx.session_id}: it was cancelled on the first run, and a replay "
             f"cannot tell what cancelled it (a timeout around the step, or "
@@ -349,14 +366,14 @@ def _replay_recorded(ctx: WorkflowContext, seq: int, expected_name: str) -> Any:
             f"(`return await asyncio.wait_for(call(), 5)`), which records the "
             f"TimeoutError itself and replays it. Nothing has run twice; start a "
             f"new session for this work."
-        )
+        ))
     if recorded.get("status") == STEP_STATUS_FAILED:
         # The step failed the first time, and the workflow carried on past it.
         # Raise the same exception, so the resumed run takes the same branch.
         try:
             failure = rebuild((payload or {}).get("error", {}), expected_name, seq)
         except ReplayedFailureError as exc:
-            raise FailureNotReplayableError(str(exc)) from None
+            _refuse(ctx, FailureNotReplayableError(str(exc)))
         raise failure
     if payload is None:
         return None
@@ -645,7 +662,6 @@ def step(
                         **kwargs,
                     )
 
-            committed = False
             fencing_token = 0
             hb: Optional[LeaseHeartbeat] = None
 
@@ -714,7 +730,6 @@ def step(
                     # session's default.
                     coordination_id=call_coordination,
                 )
-                committed = True
                 return result
             except BaseException as e:
                 failed_at = time.monotonic()
@@ -727,12 +742,11 @@ def step(
                 raise e
             finally:
                 if hb:
-                    if committed:
-                        # Nothing is awaited between the commit and the return,
-                        # so a cancellation cannot land on a committed step.
-                        hb.stop_soon()
-                    else:
-                        await hb.stop_async()
+                    # Not awaited, after a commit or a failure alike: an await
+                    # here is where a cancellation lands, and it would turn a
+                    # committed step into a cancelled one, or replace a failed
+                    # step's own exception with a cancellation.
+                    hb.stop_soon()
         except BaseException as exc:
             if live:
                 _note_failure(

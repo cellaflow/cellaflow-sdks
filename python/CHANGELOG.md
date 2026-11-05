@@ -36,7 +36,8 @@ All notable changes to the CellaFlow Python SDK.
   exception group comes back with its members, every one of them keeping at least its type and
   message, so `except*` behaves the same; a group too large to record that way (over 2,000 members
   or 512 KB) is refused on resume, with a warning when it happens. An engine call's gRPC
-  error comes back as a `grpc.RpcError` with the same `code()` and `details()`. A record is kept
+  error comes back as a `grpc.RpcError` with the same `code()` and `details()`; a subclass of
+  `grpc.RpcError` defined outside gRPC comes back as itself. A record is kept
   within a commit's size: a value over 64 KB is left out, and the traceback is trimmed. Recording a
   failure never replaces the step's own exception, and neither does a lease that cannot be
   released after it.
@@ -68,8 +69,10 @@ All notable changes to the CellaFlow Python SDK.
   `TimeoutError`, one from outside arrives as `CancelledError`), which the record cannot say, and
   waiting to be cancelled again cannot reliably tell either, since earlier steps replay instantly
   and move every timer. A timeout inside the step's body (`return await asyncio.wait_for(call(),
-  5)`) records a plain `TimeoutError` instead, which replays exactly. A `CancelledError` raised out
-  of a synchronous step is that step's own exception, and is recorded and replayed as one.
+  5)`) records a plain `TimeoutError` instead, which replays exactly. A cancellation nothing
+  follows is not recorded, since no position needs filling, so a finished session can still be
+  replayed. A `CancelledError` raised out of a synchronous step is that step's own exception, and
+  is recorded and replayed as one.
 
   A refusal stops the run even when the workflow catches it: every later step raises it again
   before its body runs, and the workflow raises it when it ends, so a broad `except` around the

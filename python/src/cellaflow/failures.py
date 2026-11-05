@@ -360,7 +360,11 @@ def _capture(exc: BaseException, depth: int) -> Dict[str, Any]:
     }
 
     code = getattr(exc, "code", None)
-    if isinstance(exc, grpc.RpcError) and callable(code):
+    # gRPC's own error classes only: their constructors are internal, so the
+    # error is replayed as an equivalent RpcError. A user's subclass of RpcError
+    # is rebuilt as itself, so `except` clauses naming it still match.
+    grpc_own = type(exc).__module__.partition(".")[0] == "grpc"
+    if grpc_own and isinstance(exc, grpc.RpcError) and callable(code):
         try:
             status = code()
             details = exc.details()
