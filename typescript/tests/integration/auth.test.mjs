@@ -2,7 +2,7 @@
 // CELLAFLOW_AUTH_TARGET names such an engine and CELLAFLOW_AUTH_TEST_KEY is its
 // token, for example:
 //
-//   docker run -d -p 50052:50051 -e CELLAFLOW_AUTH_TOKEN=s3cret \
+//   docker run -d -p 50052:50051 -e CELLAFLOW_API_KEY=s3cret \
 //     ghcr.io/cellaflow/cellaflow:0.2.0
 //   CELLAFLOW_AUTH_TARGET=localhost:50052 CELLAFLOW_AUTH_TEST_KEY=s3cret \
 //     npm run test:integration

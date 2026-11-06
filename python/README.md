@@ -565,7 +565,7 @@ flowchart TD
 
 ### Authenticating with the engine
 
-An engine started with a token (`CELLAFLOW_AUTH_TOKEN`) refuses calls without it. Set the token in the SDK's environment as `CELLAFLOW_API_KEY`, and every call sends it, with no code change:
+An engine started with a token refuses calls without it. Start the engine with the token in `CELLAFLOW_API_KEY`, set the same variable in the SDK's environment, and every call sends it, with no code change:
 
 ```bash
 export CELLAFLOW_API_KEY=your-engine-token
@@ -577,7 +577,8 @@ Or pass it explicitly. Every entry point that talks to the engine takes `api_key
 @workflow(version="1.0.0", target="engine.example.com:50051", secure=True, api_key=key)
 ```
 
-- **Where it comes from:** `api_key` if given, else `CELLAFLOW_API_KEY`. A blank value means no key. That is the only variable the SDK reads: the engine's `CELLAFLOW_AUTH_TOKEN` configures the token it checks against, and a variable as generic as `API_KEY` often holds another service's secret.
+- **Where it comes from:** `api_key` if given, else `CELLAFLOW_API_KEY`. A blank value means no key. That is the only variable the SDK reads. It never reads the engine's older name, `CELLAFLOW_AUTH_TOKEN`, or the generic `AUTH_TOKEN` and `API_KEY`: a variable that generic often holds another service's secret.
+- **On the engine:** engine releases up to 0.2.0 read their token from `CELLAFLOW_AUTH_TOKEN` first and fall back to `CELLAFLOW_API_KEY`, so if both are set on the engine, `CELLAFLOW_AUTH_TOKEN` wins. Set only `CELLAFLOW_API_KEY` there.
 - **How it's sent:** as `authorization: Bearer <key>` on every call.
 - **Kept out of sight:** the SDK never puts the key in a log message, an exception message or a `repr`. grpc's own stack frames do hold the outgoing header, so a tool that records a traceback's local variables (loguru's `diagnose`, Sentry's frame variables, `pytest -l`) can show it. Turn that off wherever the key matters.
 - **Refused early:** a key that cannot be sent as a header (surrounding whitespace, or a character outside printable ASCII) is refused before a connection opens, naming where it came from. A decorator given one refuses it when it is applied.

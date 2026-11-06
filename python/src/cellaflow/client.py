@@ -16,10 +16,11 @@ from cellaflow.serialization import serialize, deserialize
 logger = logging.getLogger(__name__)
 
 #: Where an API key is read from when none is passed, and the only variable
-#: read. The engine's own variables (`CELLAFLOW_AUTH_TOKEN`, and the generic
-#: `AUTH_TOKEN` and `API_KEY`) configure the token it checks against, not a
-#: caller's key, and a variable as generic as `API_KEY` often holds another
-#: service's secret, which would then be sent to the engine.
+#: read: the same one the engine reads its token from. The engine also accepts
+#: older names for its token (`CELLAFLOW_AUTH_TOKEN`, and the generic
+#: `AUTH_TOKEN` and `API_KEY`); the SDK reads none of them, because a variable
+#: as generic as `API_KEY` often holds another service's secret, which would
+#: then be sent to the engine.
 API_KEY_ENV_VAR = "CELLAFLOW_API_KEY"
 
 _HEADER_SAFE = re.compile(r"[\x20-\x7e]*")

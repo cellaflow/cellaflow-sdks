@@ -137,7 +137,7 @@ jobs:
           docker run -d --name engine -p 50051:50051 \
             -e CELLAFLOW_ALLOW_UNAUTHENTICATED=true "$ENGINE_IMAGE"
           docker run -d --name engine-auth -p 50052:50051 \
-            -e CELLAFLOW_AUTH_TOKEN="$CELLAFLOW_AUTH_TEST_KEY" "$ENGINE_IMAGE"
+            -e CELLAFLOW_API_KEY="$CELLAFLOW_AUTH_TEST_KEY" "$ENGINE_IMAGE"
           # An open port only means Docker's proxy is listening. The image's own
           # healthcheck polls /health/ready, so wait for that, and stop at once
           # with the engine's log if it exits instead.
