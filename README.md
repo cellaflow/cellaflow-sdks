@@ -30,7 +30,7 @@ cellaflow-sdks/
 │   ├── tests/          # Comprehensive test suite (pytest)
 │   └── README.md       # Python SDK documentation & quickstarts
 ├── typescript/         # Official TypeScript SDK (npm install @cellaflow/sdk)
-│   ├── src/            # gRPC client, connect-es definitions, MessagePack
+│   ├── src/            # gRPC client, Connect-ES service definitions, MessagePack
 │   └── README.md       # TypeScript SDK documentation & quickstarts
 ├── LICENSE             # Project license (Apache 2.0 or MIT)
 └── buf.gen.yaml        # Buf code generation configuration
