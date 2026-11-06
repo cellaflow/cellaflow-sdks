@@ -2,6 +2,30 @@
 
 All notable changes to the CellaFlow TypeScript SDK.
 
+## Unreleased
+
+### Behaviour changes
+
+Code written against 0.9.0 can see these:
+
+- **The exported protobuf messages are types, not classes.** The SDK now uses Connect 2 and
+  protobuf-es 2. `StepResult`, `CheckCacheResponse`, `RenewLeaseResponse` and the other exported
+  messages are plain object types, each with a `...Schema` export beside it. Code that called
+  `new StepResult(...)`, tested `instanceof`, or called `toJson()` or `toBinary()` on a response
+  builds and converts them with `create`, `toJson` and `toBinary` from `@bufbuild/protobuf`, passing
+  the schema. Field names and types are unchanged, so code that only reads fields from what the
+  client returns is unaffected. The enums (`StepStatus`, `CacheStatus` and the others) are
+  unchanged.
+- **Node.js 18.14.1 or later,** up from 18.0.0, which Connect 2 requires.
+
+### Fixed
+
+- **`npm install` reported four vulnerabilities (two high) through the SDK.** Connect 1's Node
+  transport depended on `undici` 5, which pulls in an affected `@fastify/busboy`. Connect 2's does
+  not depend on `undici`, and an install of the SDK reports none. The affected code parses
+  multipart form uploads, which the SDK never does. The SDK stays on Connect 2.0, the last line
+  that supports Node 18.
+
 ## 0.9.0
 
 0.8.1 was prepared but never published; its changes are part of 0.9.0.
