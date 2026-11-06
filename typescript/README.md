@@ -49,7 +49,7 @@ main().catch(console.error);
 
 ## Authenticating with the engine
 
-An engine started with a token (`CELLAFLOW_AUTH_TOKEN`) refuses calls without it. Set `CELLAFLOW_API_KEY` in the environment and every call sends it, with no code change. Or pass `apiKey` to `CellaflowClient`, `durableTools` or `executionLease`:
+An engine started with a token (`CELLAFLOW_AUTH_TOKEN`) refuses calls without it. Set the token in the environment, as `CELLAFLOW_API_KEY` or `CELLAFLOW_AUTH_TOKEN`, and every call sends it, with no code change. Or pass `apiKey` to `CellaflowClient`, `durableTools` or `executionLease`:
 
 ```typescript
 await durableTools(threadId, { target: "engine.example.com:50051", secure: true, apiKey }, async () => {
@@ -57,7 +57,7 @@ await durableTools(threadId, { target: "engine.example.com:50051", secure: true,
 });
 ```
 
-- **Where it comes from:** `apiKey` if given, then `CELLAFLOW_API_KEY`, then `CELLAFLOW_AUTH_TOKEN` (the engine's own variable). An empty `apiKey` means none.
+- **Where it comes from:** `apiKey` if given, then `CELLAFLOW_AUTH_TOKEN`, then `CELLAFLOW_API_KEY`: the engine's own order. A blank value counts as unset, as it does to the engine. The generic `AUTH_TOKEN` and `API_KEY` are never read: a variable that generic often holds another service's secret.
 - **How it's sent:** as `authorization: Bearer <key>` on every call.
 - **Without TLS:** sending a key to a host other than localhost with `secure: false` warns once per target, since anyone on the path can read it.
 

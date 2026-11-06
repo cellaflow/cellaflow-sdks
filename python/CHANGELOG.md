@@ -8,11 +8,14 @@ All notable changes to the CellaFlow Python SDK.
 
 - **An API key, for an engine that requires a token.** `CellaflowClient`, `@workflow`,
   `durable_tools`, `execution_lease`, `async_execution_lease`, `task_lease` and `CellaflowSaver`
-  take `api_key`, sent as `authorization: Bearer <key>` on every call. Without it, the key is read
-  from `CELLAFLOW_API_KEY`, then `CELLAFLOW_AUTH_TOKEN`, so existing code works against a secured
-  engine with no change. Before this, the SDK could only talk to an engine running unauthenticated.
-  The key never appears in logs, exceptions or `repr`, a key that cannot be a header is refused,
-  and sending one without TLS to a host other than localhost logs a warning once per target.
+  take `api_key`, sent as `authorization: Bearer <key>` on every call, streaming calls included.
+  Without it, the key is read from `CELLAFLOW_AUTH_TOKEN`, then `CELLAFLOW_API_KEY`, the engine's
+  own order, so existing code works against a secured engine with no change; a blank value counts
+  as unset, and the generic `AUTH_TOKEN` and `API_KEY` are never read. Before this, the SDK could
+  only talk to an engine running unauthenticated. The key never appears in logs, exceptions or
+  `repr`. A key that cannot be a header (outside printable ASCII, or with surrounding whitespace)
+  is refused before a connection is opened, naming where it came from. Sending one without TLS to
+  a host other than this machine logs a warning once per target.
 
 ## 0.9.0
 

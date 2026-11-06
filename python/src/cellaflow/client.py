@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import threading
 from collections import namedtuple
 from typing import Any, Dict, List, Optional, Tuple, cast
@@ -13,25 +14,68 @@ from cellaflow.serialization import serialize, deserialize
 
 logger = logging.getLogger(__name__)
 
-#: Where an API key is read from when none is passed, in order. The engine reads
-#: its own token from `CELLAFLOW_AUTH_TOKEN`, so a process that runs both can
-#: set it once.
-API_KEY_ENV_VARS = ("CELLAFLOW_API_KEY", "CELLAFLOW_AUTH_TOKEN")
+#: Where an API key is read from when none is passed, in the engine's own order,
+#: so the SDK sends the token the engine expects when both are set. The engine
+#: also falls back to the generic `AUTH_TOKEN` and `API_KEY`; the SDK does not,
+#: because a variable that generic often holds another service's secret, which
+#: would then be sent to the engine.
+API_KEY_ENV_VARS = ("CELLAFLOW_AUTH_TOKEN", "CELLAFLOW_API_KEY")
 
-_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_HEADER_SAFE = re.compile(r"[\x20-\x7e]*")
 _warned_plaintext: "set[str]" = set()
 _warned_lock = threading.Lock()
 
 
+def _api_key_and_source(api_key: Optional[str]) -> Tuple[Optional[str], str]:
+    """The API key to send and where it came from. A blank value means none,
+    as it does to the engine."""
+    if api_key is not None:
+        return (api_key if api_key.strip() else None), "the api_key argument"
+    for name in API_KEY_ENV_VARS:
+        api_key = os.environ.get(name)
+        if api_key and api_key.strip():
+            return api_key, name
+    return None, ""
+
+
 def resolve_api_key(api_key: Optional[str] = None) -> Optional[str]:
     """The API key to send: `api_key` if given, else the first of
-    `API_KEY_ENV_VARS` that is set. An empty value means none."""
-    if api_key is None:
-        for name in API_KEY_ENV_VARS:
-            api_key = os.environ.get(name)
-            if api_key:
-                break
-    return api_key or None
+    `API_KEY_ENV_VARS` that is set. A blank value means none."""
+    return _api_key_and_source(api_key)[0]
+
+
+def _check_api_key(api_key: str, source: str) -> None:
+    """Refuses a key gRPC cannot send as a header, naming where it came from
+    but never what it is."""
+    if api_key != api_key.strip() or not _HEADER_SAFE.fullmatch(api_key):
+        raise ValueError(
+            f"The Cellaflow API key from {source} cannot be sent in a header: it "
+            f"has surrounding whitespace or a character outside printable ASCII "
+            f"(a trailing newline from a secret file, say)."
+        )
+
+
+def _is_local(target: str) -> bool:
+    """Whether `target` names this machine, in any form gRPC accepts."""
+    if target.startswith(("unix:", "unix-abstract:")):
+        return True
+    rest = target
+    if rest.startswith("dns:"):
+        rest = rest[4:]
+        if rest.startswith("//"):  # dns://[authority]/host:port
+            start = rest.find("/", 2) + 1
+            rest = rest[start:] if start else rest[2:]
+    elif rest.startswith(("ipv4:", "ipv6:")):
+        rest = rest[5:].split(",", 1)[0]
+    if rest.startswith("["):
+        end = rest.find("]")
+        host = rest[1:end] if end != -1 else rest
+    elif rest.count(":") > 1:
+        host = rest  # a bare IPv6 address, with no port
+    else:
+        host = rest.rsplit(":", 1)[0]
+    return host in _LOCAL_HOSTS
 
 
 class _CallDetails(
@@ -54,6 +98,8 @@ class _CallDetails(
 class _BearerKey(
     grpc.UnaryUnaryClientInterceptor,  # type: ignore[misc]
     grpc.UnaryStreamClientInterceptor,  # type: ignore[misc]
+    grpc.StreamUnaryClientInterceptor,  # type: ignore[misc]
+    grpc.StreamStreamClientInterceptor,  # type: ignore[misc]
 ):
     """Adds `authorization: Bearer <key>` to every call on the channel, so no
     call site can forget it. Its `repr` never shows the key."""
@@ -85,10 +131,19 @@ class _BearerKey(
     ) -> Any:
         return continuation(self._with_key(details), request)
 
+    def intercept_stream_unary(
+        self, continuation: Any, details: Any, requests: Any
+    ) -> Any:
+        return continuation(self._with_key(details), requests)
+
+    def intercept_stream_stream(
+        self, continuation: Any, details: Any, requests: Any
+    ) -> Any:
+        return continuation(self._with_key(details), requests)
+
 
 def _warn_if_sent_in_the_clear(target: str) -> None:
-    host = target.rsplit(":", 1)[0] if ":" in target else target
-    if host in _LOCAL_HOSTS or host.startswith("unix:"):
+    if _is_local(target):
         return
     with _warned_lock:
         if target in _warned_plaintext:
@@ -108,10 +163,10 @@ class CellaflowClient:
     MessagePack for state payloads.
 
     `api_key` authenticates every call, sent as `authorization: Bearer <key>`.
-    When it is not given, it is read from `CELLAFLOW_API_KEY`, then
-    `CELLAFLOW_AUTH_TOKEN`; with neither set, calls go unauthenticated, which
-    an engine started without a token accepts. The key never appears in logs,
-    exceptions or `repr`.
+    When it is not given, it is read from `CELLAFLOW_AUTH_TOKEN`, then
+    `CELLAFLOW_API_KEY`, the engine's own order; with neither set, calls go
+    unauthenticated, which an engine started without a token accepts. The key
+    never appears in logs, exceptions or `repr`.
     """
 
     def __init__(
@@ -120,20 +175,20 @@ class CellaflowClient:
         secure: bool = False,
         api_key: Optional[str] = None,
     ) -> None:
+        # Checked before a channel is opened, so a refused key leaves none behind.
+        # Held only in variables named `api_key`, which error reporters that
+        # record a frame's locals scrub by name.
+        api_key, source = _api_key_and_source(api_key)
+        if api_key is not None:
+            _check_api_key(api_key, source)
+            if not secure:
+                _warn_if_sent_in_the_clear(target)
         if secure:
             channel = grpc.secure_channel(target, grpc.ssl_channel_credentials())
         else:
             channel = grpc.insecure_channel(target)
-        key = resolve_api_key(api_key)
-        if key is not None:
-            if any(c in key for c in "\r\n") or not key.isascii() or key != key.strip():
-                raise ValueError(
-                    "The Cellaflow API key cannot be sent in a header: it has "
-                    "surrounding whitespace, a line break or a non-ASCII character."
-                )
-            if not secure:
-                _warn_if_sent_in_the_clear(target)
-            channel = grpc.intercept_channel(channel, _BearerKey(key))
+        if api_key is not None:
+            channel = grpc.intercept_channel(channel, _BearerKey(api_key))
         self.channel = channel
         self.stub = service_pb2_grpc.WorkflowEngineServiceStub(self.channel)
 

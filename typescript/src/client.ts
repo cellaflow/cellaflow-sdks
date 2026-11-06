@@ -34,35 +34,57 @@ export interface CellaflowClientOptions {
   secure?: boolean;
   /**
    * Authenticates every call, sent as `authorization: Bearer <apiKey>`. When it
-   * is not given, it is read from `CELLAFLOW_API_KEY`, then `CELLAFLOW_AUTH_TOKEN`
-   * (the engine's own name for its token); with neither set, calls go
-   * unauthenticated, which an engine started without a token accepts. An empty
-   * string means no key, even with the variables set.
+   * is not given, it is read from `CELLAFLOW_AUTH_TOKEN`, then `CELLAFLOW_API_KEY`,
+   * the engine's own order; with neither set, calls go unauthenticated, which an
+   * engine started without a token accepts. A blank string means no key, even
+   * with the variables set.
    */
   apiKey?: string;
 }
 
-/** Where an API key is read from when none is passed, in order. */
-export const API_KEY_ENV_VARS = ["CELLAFLOW_API_KEY", "CELLAFLOW_AUTH_TOKEN"] as const;
+/**
+ * Where an API key is read from when none is passed, in the engine's own order,
+ * so the SDK sends the token the engine expects when both are set. The engine
+ * also falls back to the generic `AUTH_TOKEN` and `API_KEY`; the SDK does not,
+ * because a variable that generic often holds another service's secret, which
+ * would then be sent to the engine.
+ */
+export const API_KEY_ENV_VARS = ["CELLAFLOW_AUTH_TOKEN", "CELLAFLOW_API_KEY"] as const;
+
+/** The key to send and where it came from. A blank value means none, as it does to the engine. */
+function apiKeyAndSource(apiKey?: string): [string | undefined, string] {
+  if (apiKey !== undefined) return [apiKey.trim() ? apiKey : undefined, "the apiKey option"];
+  for (const name of API_KEY_ENV_VARS) {
+    const value = process.env[name];
+    if (value && value.trim()) return [value, name];
+  }
+  return [undefined, ""];
+}
 
 /** The API key to send: `apiKey` if given, else the first variable that is set. */
 export function resolveApiKey(apiKey?: string): string | undefined {
-  if (apiKey === undefined) {
-    for (const name of API_KEY_ENV_VARS) {
-      const value = process.env[name];
-      if (value) return value;
-    }
-    return undefined;
-  }
-  return apiKey || undefined;
+  return apiKeyAndSource(apiKey)[0];
 }
 
-const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 const warnedPlaintext = new Set<string>();
 
+/** Whether `target` (`host:port` or `[v6]:port`) names this machine. */
+function isLocal(target: string): boolean {
+  let host: string;
+  if (target.startsWith("[")) {
+    const end = target.indexOf("]");
+    host = end === -1 ? target : target.slice(1, end);
+  } else if ((target.match(/:/g) ?? []).length > 1) {
+    host = target; // a bare IPv6 address, with no port
+  } else {
+    host = target.includes(":") ? target.slice(0, target.lastIndexOf(":")) : target;
+  }
+  return LOCAL_HOSTS.has(host);
+}
+
 function warnIfSentInTheClear(target: string): void {
-  const host = target.includes(":") ? target.slice(0, target.lastIndexOf(":")) : target;
-  if (LOCAL_HOSTS.has(host) || warnedPlaintext.has(target)) return;
+  if (isLocal(target) || warnedPlaintext.has(target)) return;
   warnedPlaintext.add(target);
   console.warn(
     `Cellaflow: sending an API key to ${target} without TLS, so anyone on the path ` +
@@ -93,13 +115,14 @@ export class CellaflowClient {
     // Use http/https based on the secure flag
     const baseUrl = secure ? `https://${target}` : `http://${target}`;
 
-    const apiKey = resolveApiKey(options.apiKey);
+    const [apiKey, source] = apiKeyAndSource(options.apiKey);
     const interceptors: Interceptor[] = [];
     if (apiKey !== undefined) {
-      if (/[\r\n]/.test(apiKey) || apiKey !== apiKey.trim() || !/^[\x20-\x7e]*$/.test(apiKey)) {
+      if (apiKey !== apiKey.trim() || !/^[\x20-\x7e]*$/.test(apiKey)) {
         throw new Error(
-          "The Cellaflow API key cannot be sent in a header: it has surrounding " +
-            "whitespace, a line break or a character outside printable ASCII.",
+          `The Cellaflow API key from ${source} cannot be sent in a header: it has ` +
+            "surrounding whitespace or a character outside printable ASCII (a " +
+            "trailing newline from a secret file, say).",
         );
       }
       if (!secure) warnIfSentInTheClear(target);

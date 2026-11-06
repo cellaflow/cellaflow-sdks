@@ -72,20 +72,41 @@ test("the key is read from the environment", async () => {
   assert.deepEqual(received, [`Bearer ${KEY}`]);
 });
 
-test("the engine's own variable is the fallback, and an empty key means none", () => {
-  process.env.CELLAFLOW_AUTH_TOKEN = "from-engine-var";
-  assert.equal(resolveApiKey(), "from-engine-var");
+test("the variables are read in the engine's order, and a blank key means none", () => {
   process.env.CELLAFLOW_API_KEY = "from-sdk-var";
   assert.equal(resolveApiKey(), "from-sdk-var");
+  process.env.CELLAFLOW_AUTH_TOKEN = "from-engine-var";
+  assert.equal(resolveApiKey(), "from-engine-var");
   assert.equal(resolveApiKey("passed"), "passed");
   assert.equal(resolveApiKey(""), undefined);
+  assert.equal(resolveApiKey("   "), undefined);
+  process.env.CELLAFLOW_AUTH_TOKEN = "  ";
+  assert.equal(resolveApiKey(), "from-sdk-var");
 });
 
-test("a key that cannot be a header is refused without showing it", () => {
-  assert.throws(
-    () => new CellaflowClient({ target, apiKey: "secret-value\n" }),
-    (err) => !String(err.message).includes("secret-value"),
-  );
+test("generic variables are never read", () => {
+  process.env.API_KEY = "someone-elses-secret";
+  process.env.AUTH_TOKEN = "someone-elses-secret";
+  try {
+    assert.equal(resolveApiKey(), undefined);
+  } finally {
+    delete process.env.API_KEY;
+    delete process.env.AUTH_TOKEN;
+  }
+});
+
+for (const bad of ["MARKER\n", "MAR\tKER", "MAR\x7fKER", "MARKER\x00", "MARKÉR"]) {
+  test(`a key that cannot be a header is refused without showing it (${JSON.stringify(bad)})`, () => {
+    assert.throws(
+      () => new CellaflowClient({ target, apiKey: bad }),
+      (err) => !String(err.message).includes("MAR") && String(err.message).includes("the apiKey option"),
+    );
+  });
+}
+
+test("a refused key names the variable it came from", () => {
+  process.env.CELLAFLOW_API_KEY = "from-a-secret-file\n";
+  assert.throws(() => new CellaflowClient({ target }), /from CELLAFLOW_API_KEY/);
 });
 
 test("the key never appears in a refusal or in the client's own properties", async () => {
@@ -113,4 +134,14 @@ test("sending a key without TLS to another host warns once", (t) => {
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /engine\.example\.com:50051 without TLS/);
   assert.ok(!warnings[0].includes(KEY));
+});
+
+test("a local target in any form gets no warning", (t) => {
+  const warnings = [];
+  t.mock.method(console, "warn", (message) => warnings.push(message));
+  // A bare `::1` is not a URL Connect accepts, so it is not a target here.
+  for (const local of ["localhost:50051", "127.0.0.1:50051", "[::1]:50051"]) {
+    new CellaflowClient({ target: local, apiKey: KEY });
+  }
+  assert.deepEqual(warnings, []);
 });

@@ -138,11 +138,18 @@ jobs:
             -e CELLAFLOW_ALLOW_UNAUTHENTICATED=true "$ENGINE_IMAGE"
           docker run -d --name engine-auth -p 50052:50051 \
             -e CELLAFLOW_AUTH_TOKEN="$CELLAFLOW_AUTH_TEST_KEY" "$ENGINE_IMAGE"
-          for port in 50051 50052; do
+          # An open port only means Docker's proxy is listening. The image's own
+          # healthcheck polls /health/ready, so wait for that, and stop at once
+          # with the engine's log if it exits instead.
+          for name in engine engine-auth; do
             for i in $(seq 1 60); do
-              if nc -z localhost $port; then break; fi
-              if [ "$i" = 60 ]; then docker logs engine; docker logs engine-auth; exit 1; fi
-              sleep 1
+              state=$(docker inspect -f '{{.State.Status}} {{.State.Health.Status}}' "$name")
+              case "$state" in
+                "running healthy") break ;;
+                exited*|dead*) docker logs "$name"; exit 1 ;;
+              esac
+              if [ "$i" = 60 ]; then docker logs "$name"; exit 1; fi
+              sleep 2
             done
           done
 

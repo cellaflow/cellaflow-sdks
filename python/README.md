@@ -565,7 +565,7 @@ flowchart TD
 
 ### Authenticating with the engine
 
-An engine started with a token (`CELLAFLOW_AUTH_TOKEN`) refuses calls without it. Set `CELLAFLOW_API_KEY` in the SDK's environment and every call sends it, with no code change:
+An engine started with a token (`CELLAFLOW_AUTH_TOKEN`) refuses calls without it. Set the token in the SDK's environment, as `CELLAFLOW_API_KEY` or `CELLAFLOW_AUTH_TOKEN`, and every call sends it, with no code change:
 
 ```bash
 export CELLAFLOW_API_KEY=your-engine-token
@@ -577,7 +577,7 @@ Or pass it explicitly. Every entry point that talks to the engine takes `api_key
 @workflow(version="1.0.0", target="engine.example.com:50051", secure=True, api_key=key)
 ```
 
-- **Where it comes from:** `api_key` if given, then `CELLAFLOW_API_KEY`, then `CELLAFLOW_AUTH_TOKEN` (the engine's own variable, so a process that runs both sets it once). An empty `api_key` means none.
+- **Where it comes from:** `api_key` if given, then `CELLAFLOW_AUTH_TOKEN`, then `CELLAFLOW_API_KEY`: the engine's own order, so with both set the SDK sends the token the engine expects. A blank value counts as unset, as it does to the engine. The generic `AUTH_TOKEN` and `API_KEY`, which the engine also reads, are never read by the SDK: a variable that generic often holds another service's secret.
 - **How it's sent:** as `authorization: Bearer <key>` on every call.
 - **Kept out of sight:** the key never appears in logs, exceptions or `repr`.
 - **Without TLS:** sending a key to a host other than localhost with `secure=False` logs a warning, once per target, since anyone on the path can read it.
