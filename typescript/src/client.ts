@@ -1,32 +1,23 @@
-import {
-  createPromiseClient,
-  Interceptor,
-  PromiseClient,
-  Transport,
-} from "@connectrpc/connect";
+import { createClient, Client, Interceptor, Transport } from "@connectrpc/connect";
 import { createGrpcTransport } from "@connectrpc/connect-node";
 import { checkedApiKey, checkPlaintext } from "./apikey.js";
-import type { PartialMessage } from "@bufbuild/protobuf";
-import { WorkflowEngineService } from "./cellaflow/v1/service_connect.js";
+import type { MessageInitShape } from "@bufbuild/protobuf";
+import { WorkflowEngineService } from "./cellaflow/v1/service_pb.js";
 import type {
   StartSessionResponse,
   CommitStepResponse,
-} from "./cellaflow/v1/service_pb.js";
-import {
-  StartSessionRequest,
-  CommitStepRequest,
-  GetGraphRequest,
+  StartSessionRequestSchema,
+  CommitStepRequestSchema,
+  GetGraphRequestSchema,
 } from "./cellaflow/v1/service_pb.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import type {
   CheckCacheResponse,
   RenewLeaseResponse,
   ReleaseLeaseResponse,
-} from "./cellaflow/v1/idempotency_pb.js";
-import {
-  CheckCacheRequest,
-  RenewLeaseRequest,
-  ReleaseLeaseRequest,
+  CheckCacheRequestSchema,
+  RenewLeaseRequestSchema,
+  ReleaseLeaseRequestSchema,
 } from "./cellaflow/v1/idempotency_pb.js";
 import { serialize, deserialize } from "./serialization.js";
 
@@ -66,7 +57,7 @@ export class CellaflowClient {
    * Handles communication with the engine and strictly uses MessagePack
    * for state payloads.
    */
-  private client: PromiseClient<typeof WorkflowEngineService>;
+  private client: Client<typeof WorkflowEngineService>;
 
   constructor(options: CellaflowClientOptions = {}) {
     const { target = "localhost:50051", secure = false } = options;
@@ -81,13 +72,10 @@ export class CellaflowClient {
       interceptors.push(bearerKey(apiKey));
     }
 
-    const transport: Transport = createGrpcTransport({
-      baseUrl,
-      httpVersion: "2",
-      interceptors,
-    });
+    // gRPC always runs over HTTP/2; Connect 2 no longer takes an httpVersion.
+    const transport: Transport = createGrpcTransport({ baseUrl, interceptors });
 
-    this.client = createPromiseClient(WorkflowEngineService, transport);
+    this.client = createClient(WorkflowEngineService, transport);
   }
 
   /**
@@ -109,7 +97,7 @@ export class CellaflowClient {
     sessionId?: string,
     coordinationId?: string
   ): Promise<StartSessionResponse> {
-    const req: PartialMessage<StartSessionRequest> = { workflowId, version };
+    const req: MessageInitShape<typeof StartSessionRequestSchema> = { workflowId, version };
     // Only set sessionId when truthy, matching Python's `if session_id:` guard.
     // Sending an empty string may trigger the engine's custom-ID validation path.
     if (sessionId) {
@@ -147,7 +135,7 @@ export class CellaflowClient {
     // Strictly serialize object to MessagePack
     const serializedState = serialize(outputPayload);
 
-    const req: PartialMessage<CommitStepRequest> = {
+    const req: MessageInitShape<typeof CommitStepRequestSchema> = {
       sessionId,
       stepResult: {
         sequence: BigInt(sequence),
@@ -185,7 +173,7 @@ export class CellaflowClient {
     limit?: number,
     cursor?: string
   ): Promise<[Record<string, any>[], string | undefined]> {
-    const req: PartialMessage<GetGraphRequest> = { sessionId };
+    const req: MessageInitShape<typeof GetGraphRequestSchema> = { sessionId };
     if (limit !== undefined) {
       req.limit = limit;
     }
@@ -236,7 +224,7 @@ export class CellaflowClient {
     sessionId?: string,
     sequence?: number
   ): Promise<CheckCacheResponse> {
-    const req: PartialMessage<CheckCacheRequest> = { agentId, idempotencyKey };
+    const req: MessageInitShape<typeof CheckCacheRequestSchema> = { agentId, idempotencyKey };
     // These proto fields are uint64 → bigint; convert from the JS number API.
     if (waitTimeoutMs !== undefined) {
       req.waitTimeoutMs = BigInt(waitTimeoutMs);
@@ -269,7 +257,7 @@ export class CellaflowClient {
     extendMs: number,
     timeoutSecs?: number
   ): Promise<RenewLeaseResponse> {
-    const req: PartialMessage<RenewLeaseRequest> = {
+    const req: MessageInitShape<typeof RenewLeaseRequestSchema> = {
       agentId,
       idempotencyKey,
       fencingToken: BigInt(fencingToken),
@@ -299,7 +287,7 @@ export class CellaflowClient {
     reason?: string,
     timeoutSecs?: number
   ): Promise<ReleaseLeaseResponse> {
-    const req: PartialMessage<ReleaseLeaseRequest> = {
+    const req: MessageInitShape<typeof ReleaseLeaseRequestSchema> = {
       agentId,
       idempotencyKey,
       fencingToken: BigInt(fencingToken),
@@ -319,13 +307,13 @@ export class CellaflowClient {
   /**
    * Provided for API compatibility with the Python client.
    *
-   * Connect-ES v1 with `createGrpcTransport` does not expose an explicit
+   * Connect-ES with `createGrpcTransport` does not expose an explicit
    * close/shutdown method — HTTP/2 sessions are managed by Node.js and are
    * cleaned up on process exit or when the client is garbage-collected.
    * Long-lived server processes with many short-lived clients should let the
    * garbage collector handle cleanup.
    */
   close(): void {
-    // No-op: Connect-ES v1 does not provide a transport.close() API.
+    // No-op: Connect-ES does not provide a transport.close() API.
   }
 }

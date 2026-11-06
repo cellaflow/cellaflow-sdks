@@ -10,7 +10,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { CellaflowClient, resolveApiKey } from "../dist/client.js";
 import { durableTools } from "../dist/durable.js";
 import { executionLease, taskLease } from "../dist/execution.js";
-import { WorkflowEngineService } from "../dist/cellaflow/v1/service_connect.js";
+import { WorkflowEngineService } from "../dist/cellaflow/v1/service_pb.js";
 
 const KEY = "cf_test_" + "k".repeat(43);
 const received = [];

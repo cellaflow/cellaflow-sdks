@@ -126,7 +126,7 @@ await executionLease("task:repo#42", { workerId: "worker-1", ttlMs: 30_000 }, as
 
 ## Requirements
 
-- Node.js 18.0.0 or higher.
+- Node.js 18.14.1 or higher.
 
 ## License
 
