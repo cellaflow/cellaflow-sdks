@@ -64,7 +64,7 @@ import logging
 import warnings
 from typing import Any, AsyncIterator, Callable, Iterator, Optional, Union
 
-from cellaflow.client import CellaflowClient
+from cellaflow.client import CellaflowClient, _check_api_key_argument
 from cellaflow.lease import LeaseHeartbeat
 from cellaflow.v1 import idempotency_pb2
 
@@ -224,8 +224,7 @@ def execution_lease(
         Whether to use TLS. Defaults to ``False``.
     api_key:
         Authenticates with the engine. When omitted it is read from
-        ``CELLAFLOW_AUTH_TOKEN``, then ``CELLAFLOW_API_KEY``. See
-        :class:`~cellaflow.client.CellaflowClient`.
+        ``CELLAFLOW_API_KEY``. See :class:`~cellaflow.client.CellaflowClient`.
     ttl_ms:
         Lease time-to-live in milliseconds, applied to the initial acquisition
         and to every renewal. After a crash, the task becomes reclaimable once
@@ -450,7 +449,8 @@ def task_lease(
         from the call's arguments.
     worker_id, target, secure, api_key, ttl_ms, heartbeat_interval_ms,
     on_lease_lost:
-        Same as :func:`execution_lease`.
+        Same as :func:`execution_lease`. A key that cannot be sent is refused
+        here, when the decorator is applied.
     preempt:
         Async functions only; same as :func:`async_execution_lease`. Ignored for
         synchronous functions, which cannot be preempted.
@@ -460,6 +460,8 @@ def task_lease(
     LeaseNotAcquired
         If the lease cannot be acquired, raised in place of calling the function.
     """
+
+    _check_api_key_argument(api_key)
 
     def _key_for(args: Any, kwargs: Any) -> str:
         if callable(key):

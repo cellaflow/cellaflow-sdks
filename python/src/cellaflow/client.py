@@ -15,39 +15,32 @@ from cellaflow.serialization import serialize, deserialize
 
 logger = logging.getLogger(__name__)
 
-#: Where an API key is read from when none is passed, in the engine's own order,
-#: so the SDK sends the token the engine expects when both are set. The engine
-#: also falls back to the generic `AUTH_TOKEN` and `API_KEY`; the SDK does not,
-#: because a variable that generic often holds another service's secret, which
-#: would then be sent to the engine.
-API_KEY_ENV_VARS = ("CELLAFLOW_AUTH_TOKEN", "CELLAFLOW_API_KEY")
+#: Where an API key is read from when none is passed, and the only variable
+#: read. The engine's own variables (`CELLAFLOW_AUTH_TOKEN`, and the generic
+#: `AUTH_TOKEN` and `API_KEY`) configure the token it checks against, not a
+#: caller's key, and a variable as generic as `API_KEY` often holds another
+#: service's secret, which would then be sent to the engine.
+API_KEY_ENV_VAR = "CELLAFLOW_API_KEY"
 
 _HEADER_SAFE = re.compile(r"[\x20-\x7e]*")
-_warned_plaintext: "set[str]" = set()
-_warned_lock = threading.Lock()
+_checked_plaintext: "set[str]" = set()
+_checked_lock = threading.Lock()
 
 
 def _api_key_and_source(api_key: Optional[str]) -> Tuple[Optional[str], str]:
-    """The API key to send and where it came from.
-
-    Exactly the engine's rule: the first of the variables that is set decides,
-    even if it is blank, and a blank value means no key. Skipping a blank one
-    to read the next would send a key to an engine that, reading the same
-    environment, has none.
-    """
-    if api_key is not None:
-        return (api_key if api_key.strip() else None), "the api_key argument"
-    for name in API_KEY_ENV_VARS:
-        api_key = os.environ.get(name)
-        if api_key is not None:
-            return (api_key if api_key.strip() else None), name
-    return None, ""
+    """The API key to send and where it came from: `api_key` if given, else
+    `CELLAFLOW_API_KEY`. A blank value means no key."""
+    source = "the api_key argument"
+    if api_key is None:
+        api_key, source = os.environ.get(API_KEY_ENV_VAR), API_KEY_ENV_VAR
+    if api_key is None or not api_key.strip():
+        return None, source
+    return api_key, source
 
 
 def resolve_api_key(api_key: Optional[str] = None) -> Optional[str]:
-    """The API key to send: `api_key` if given, else the first of
-    `API_KEY_ENV_VARS` that is set. A blank value means none, and a blank
-    variable is not skipped for the next, as the engine does not skip it."""
+    """The API key to send: `api_key` if given, else `CELLAFLOW_API_KEY`. A
+    blank value means none."""
     return _api_key_and_source(api_key)[0]
 
 
@@ -62,14 +55,26 @@ def _check_api_key(api_key: str, source: str) -> None:
         )
 
 
+def _check_api_key_argument(api_key: Optional[str]) -> None:
+    """Refuses an `api_key` argument gRPC cannot send. Decorators call it when
+    they are applied, so a bad key fails at import rather than on the first
+    call, after whatever ran before it."""
+    if api_key is not None and api_key.strip():
+        _check_api_key(api_key, "the api_key argument")
+
+
 def _host_is_local(host: str) -> bool:
     host = host.lower().rstrip(".")
     if host == "localhost":
         return True
     try:
-        return ipaddress.ip_address(host).is_loopback  # all of 127.0.0.0/8, ::1
+        address = ipaddress.ip_address(host)
     except ValueError:
         return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        # ::ffff:127.0.0.1, which Python before 3.13 does not call loopback.
+        return address.ipv4_mapped.is_loopback
+    return address.is_loopback  # all of 127.0.0.0/8, ::1
 
 
 def _host_of(address: str) -> str:
@@ -164,12 +169,13 @@ class _BearerKey(
 
 
 def _warn_if_sent_in_the_clear(target: str) -> None:
+    # Each target is looked at once: `@workflow` builds a client per call.
+    with _checked_lock:
+        if target in _checked_plaintext:
+            return
+        _checked_plaintext.add(target)
     if _is_local(target):
         return
-    with _warned_lock:
-        if target in _warned_plaintext:
-            return
-        _warned_plaintext.add(target)
     logger.warning(
         "Cellaflow: sending an API key to %s without TLS, so anyone on the path "
         "can read it. Pass secure=True to send it encrypted.",
@@ -184,10 +190,14 @@ class CellaflowClient:
     MessagePack for state payloads.
 
     `api_key` authenticates every call, sent as `authorization: Bearer <key>`.
-    When it is not given, it is read from `CELLAFLOW_AUTH_TOKEN`, then
-    `CELLAFLOW_API_KEY`, the engine's own order; with neither set, calls go
-    unauthenticated, which an engine started without a token accepts. The key
-    never appears in logs, exceptions or `repr`.
+    When it is not given, it is read from `CELLAFLOW_API_KEY`; with neither,
+    calls go unauthenticated, which an engine started without a token accepts.
+
+    The SDK never puts the key in a log message, an exception message or a
+    `repr`. grpc's own stack frames do hold the outgoing header, though, so a
+    tool that records a traceback's local variables (loguru's `diagnose`,
+    Sentry's frame variables, `pytest -l`) can show it. Turn that off wherever
+    the key matters.
     """
 
     def __init__(
@@ -197,8 +207,9 @@ class CellaflowClient:
         api_key: Optional[str] = None,
     ) -> None:
         # Checked before a channel is opened, so a refused key leaves none behind.
-        # Held only in variables named `api_key`, which error reporters that
-        # record a frame's locals scrub by name.
+        # Held here only in a variable named `api_key`, which error reporters
+        # that record a frame's locals scrub by name. grpc's frames hold the
+        # header itself; see the class docstring.
         api_key, source = _api_key_and_source(api_key)
         if api_key is not None:
             _check_api_key(api_key, source)

@@ -147,7 +147,7 @@ def durable_tools(
     accepted too, for callers who have no config to hand.
 
     `api_key` authenticates with the engine; when omitted it is read from
-    `CELLAFLOW_AUTH_TOKEN`, then `CELLAFLOW_API_KEY`. See `CellaflowClient`.
+    `CELLAFLOW_API_KEY`. See `CellaflowClient`.
     """
     from cellaflow.context import (
         WorkflowContext,

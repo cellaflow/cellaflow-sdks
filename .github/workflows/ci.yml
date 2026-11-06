@@ -186,5 +186,6 @@ jobs:
       - name: Engine logs
         if: failure()
         run: |
-          docker logs engine
-          docker logs engine-auth
+          # Each on its own, so one missing container does not hide the other's log.
+          docker logs engine || true
+          docker logs engine-auth || true

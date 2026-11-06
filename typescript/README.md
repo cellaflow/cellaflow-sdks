@@ -49,7 +49,7 @@ main().catch(console.error);
 
 ## Authenticating with the engine
 
-An engine started with a token (`CELLAFLOW_AUTH_TOKEN`) refuses calls without it. Set the token in the environment, as `CELLAFLOW_API_KEY` or `CELLAFLOW_AUTH_TOKEN`, and every call sends it, with no code change. Or pass `apiKey` to `CellaflowClient`, `durableTools` or `executionLease`:
+An engine started with a token (`CELLAFLOW_AUTH_TOKEN`) refuses calls without it. Set the token in the environment as `CELLAFLOW_API_KEY`, and every call sends it, with no code change. Or pass `apiKey` to `CellaflowClient`, `durableTools`, `executionLease` or `taskLease`:
 
 ```typescript
 await durableTools(threadId, { target: "engine.example.com:50051", secure: true, apiKey }, async () => {
@@ -57,7 +57,8 @@ await durableTools(threadId, { target: "engine.example.com:50051", secure: true,
 });
 ```
 
-- **Where it comes from:** `apiKey` if given, then `CELLAFLOW_AUTH_TOKEN`, then `CELLAFLOW_API_KEY`: the engine's own order. As in the engine, the first variable that is set decides, and if it is blank no key is sent. The generic `AUTH_TOKEN` and `API_KEY` are never read: a variable that generic often holds another service's secret.
+- **Where it comes from:** `apiKey` if given, else `CELLAFLOW_API_KEY`. A blank value means no key. That is the only variable the SDK reads: the engine's `CELLAFLOW_AUTH_TOKEN` configures the token it checks against, and a variable as generic as `API_KEY` often holds another service's secret.
+- **Refused early:** a key that cannot be sent as a header (surrounding whitespace, or a character outside printable ASCII) is refused when the client is built, naming where it came from.
 - **How it's sent:** as `authorization: Bearer <key>` on every call.
 - **Without TLS:** sending a key to a host other than localhost with `secure: false` warns once per target, since anyone on the path can read it.
 

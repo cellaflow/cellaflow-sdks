@@ -1,6 +1,7 @@
 """Sending an API key: what reaches the engine, where it comes from, and where
 it must never appear."""
 
+import asyncio
 import logging
 from concurrent import futures
 from typing import Any, Iterator, List, Tuple
@@ -10,7 +11,10 @@ import pytest
 
 from cellaflow import CellaflowClient
 from cellaflow import client as client_module
+from cellaflow import decorators, durable, execution, langgraph
 from cellaflow.client import resolve_api_key
+from cellaflow.durable import durable_tools
+from cellaflow.execution import async_execution_lease, execution_lease, task_lease
 from cellaflow.v1 import service_pb2
 
 KEY = "cf_test_" + "k" * 43
@@ -60,12 +64,6 @@ def engine() -> Iterator[Tuple[str, Recorder]]:
         server.stop(None)
 
 
-@pytest.fixture(autouse=True)
-def no_key_in_environment(monkeypatch: Any) -> None:
-    for name in client_module.API_KEY_ENV_VARS:
-        monkeypatch.delenv(name, raising=False)
-
-
 def test_the_key_is_sent_as_a_bearer_token_on_every_call(
     engine: Tuple[str, Recorder],
 ) -> None:
@@ -98,34 +96,25 @@ def test_the_key_is_read_from_the_environment(
     assert ("authorization", f"Bearer {KEY}") in recorder.metadata[0]
 
 
-def test_the_variables_are_read_in_the_engines_order(monkeypatch: Any) -> None:
-    """So with both set, the SDK sends the token the engine expects."""
-    monkeypatch.setenv("CELLAFLOW_API_KEY", "from-sdk-var")
-    assert resolve_api_key() == "from-sdk-var"
-    monkeypatch.setenv("CELLAFLOW_AUTH_TOKEN", "from-engine-var")
-    assert resolve_api_key() == "from-engine-var"
-    assert resolve_api_key("passed") == "passed"
-    # An empty argument means no key, even with the variables set.
-    assert resolve_api_key("") is None
-
-
-def test_a_blank_variable_means_no_key_and_is_not_skipped_as_the_engine_does(
-    monkeypatch: Any,
-) -> None:
-    """The engine stops at the first variable that is set, even blank, and then
-    has no token. Reading on to the next would send a key it does not have."""
-    monkeypatch.setenv("CELLAFLOW_AUTH_TOKEN", "  ")
+def test_only_cellaflow_api_key_is_read(monkeypatch: Any) -> None:
+    """The engine's variables configure the token it checks against, not a
+    caller's key, and one named API_KEY often holds another service's secret,
+    which would then be sent to the engine."""
+    for name in ("CELLAFLOW_AUTH_TOKEN", "AUTH_TOKEN", "API_KEY"):
+        monkeypatch.setenv(name, "not-this-one")
+    assert resolve_api_key() is None
     monkeypatch.setenv("CELLAFLOW_API_KEY", "the-key")
+    assert resolve_api_key() == "the-key"
+    assert resolve_api_key("passed") == "passed"
+
+
+def test_a_blank_key_means_none(monkeypatch: Any) -> None:
+    monkeypatch.setenv("CELLAFLOW_API_KEY", "  ")
     assert resolve_api_key() is None
+    monkeypatch.setenv("CELLAFLOW_API_KEY", "the-key")
+    # An empty argument means no key, even with the variable set.
+    assert resolve_api_key("") is None
     assert resolve_api_key("   ") is None
-
-
-def test_generic_variables_are_never_read(monkeypatch: Any) -> None:
-    """A variable named API_KEY often holds another service's secret, which
-    would then be sent to the engine."""
-    monkeypatch.setenv("API_KEY", "someone-elses-secret")
-    monkeypatch.setenv("AUTH_TOKEN", "someone-elses-secret")
-    assert resolve_api_key() is None
 
 
 @pytest.mark.parametrize(
@@ -149,6 +138,83 @@ def test_a_refused_key_names_the_variable_it_came_from(monkeypatch: Any) -> None
     monkeypatch.setenv("CELLAFLOW_API_KEY", "from-a-secret-file\n")
     with pytest.raises(ValueError, match="from CELLAFLOW_API_KEY"):
         CellaflowClient()
+
+
+def test_a_decorator_refuses_a_bad_key_when_it_is_applied() -> None:
+    """Not on the first call, after whatever ran before it."""
+    with pytest.raises(ValueError, match="the api_key argument"):
+        decorators.workflow(api_key="MARKER\n")
+    with pytest.raises(ValueError, match="the api_key argument"):
+        task_lease("task:1", worker_id="w", api_key="MARKER\n")
+    # A blank key means none, so there is nothing to refuse.
+    decorators.workflow(api_key="")
+    task_lease("task:1", worker_id="w", api_key="  ")
+
+
+class _Built(Exception):
+    """Raised by the stand-in client, once it has seen the key."""
+
+
+@pytest.fixture
+def keys_received(monkeypatch: Any) -> List[Any]:
+    """Replaces the client in every module that builds one, recording the
+    `api_key` each is given."""
+    keys: List[Any] = []
+
+    def build(*args: Any, **kwargs: Any) -> None:
+        keys.append(kwargs.get("api_key"))
+        raise _Built
+
+    for module in (decorators, durable, execution, langgraph):
+        monkeypatch.setattr(module, "CellaflowClient", build)
+    return keys
+
+
+def test_every_entry_point_passes_the_key_to_its_client(
+    keys_received: List[Any],
+) -> None:
+    @decorators.workflow(api_key=KEY)
+    async def a_workflow() -> None:
+        pass
+
+    @task_lease("task:1", worker_id="w", api_key=KEY)
+    def a_task() -> None:
+        pass
+
+    @task_lease("task:1", worker_id="w", api_key=KEY)
+    async def an_async_task() -> None:
+        pass
+
+    async def in_an_async_lease() -> None:
+        async with async_execution_lease("task:1", worker_id="w", api_key=KEY):
+            pass
+
+    with pytest.raises(_Built):
+        asyncio.run(a_workflow())
+    with pytest.raises(_Built):
+        a_task()
+    with pytest.raises(_Built):
+        asyncio.run(an_async_task())
+    with pytest.raises(_Built):
+        asyncio.run(in_an_async_lease())
+    with pytest.raises(_Built):
+        with execution_lease("task:1", worker_id="w", api_key=KEY):
+            pass
+    with pytest.raises(_Built):
+        with durable_tools("thread-1", api_key=KEY):
+            pass
+    if langgraph.HAS_LANGGRAPH:
+        with pytest.raises(_Built):
+            langgraph.CellaflowSaver(api_key=KEY)
+    assert keys_received and all(key == KEY for key in keys_received)
+
+
+@pytest.mark.skipif(not langgraph.HAS_LANGGRAPH, reason="needs langgraph")
+def test_the_saver_refuses_a_key_it_would_ignore() -> None:
+    """A client sends its own key, so one passed beside it would never go out."""
+    client = CellaflowClient()
+    with pytest.raises(ValueError, match="both a client and an api_key"):
+        langgraph.CellaflowSaver(client=client, api_key=KEY)
 
 
 def test_every_kind_of_call_gets_the_key() -> None:
@@ -187,7 +253,7 @@ def test_the_key_never_appears_in_repr_logs_or_a_refusal(
 
 
 def test_sending_a_key_without_tls_to_another_host_warns_once(caplog: Any) -> None:
-    client_module._warned_plaintext.clear()
+    client_module._checked_plaintext.clear()
     with caplog.at_level(logging.WARNING, logger="cellaflow.client"):
         CellaflowClient(target="engine.example.com:50051", api_key=KEY)
         CellaflowClient(target="engine.example.com:50051", api_key=KEY)
@@ -213,10 +279,12 @@ def test_sending_a_key_without_tls_to_another_host_warns_once(caplog: Any) -> No
         "LOCALHOST:50051",
         "localhost.:50051",
         "127.0.0.2:50051",
+        "[::ffff:127.0.0.1]:50051",
+        "ipv6:[::ffff:127.0.0.1]:50051",
     ],
 )
 def test_a_local_target_in_any_form_gets_no_warning(target: str, caplog: Any) -> None:
-    client_module._warned_plaintext.clear()
+    client_module._checked_plaintext.clear()
     with caplog.at_level(logging.WARNING, logger="cellaflow.client"):
         CellaflowClient(target=target, api_key=KEY)
     assert "without TLS" not in caplog.text
@@ -228,6 +296,8 @@ def test_a_local_target_in_any_form_gets_no_warning(target: str, caplog: Any) ->
         "ipv4:127.0.0.1:50051,10.0.0.5:50051",
         "ipv6:[::1]:50051,[2001:db8::1]:50051",
         "dns:///engine.example.com:50051",
+        "[::ffff:10.0.0.5]:50051",
+        "[fe80::1%eth0]:50051",
     ],
 )
 def test_a_target_that_can_reach_another_host_is_warned_about(
@@ -235,7 +305,7 @@ def test_a_target_that_can_reach_another_host_is_warned_about(
 ) -> None:
     """gRPC may send calls to any address in a list, so one remote address is
     enough for the key to cross the network."""
-    client_module._warned_plaintext.clear()
+    client_module._checked_plaintext.clear()
     with caplog.at_level(logging.WARNING, logger="cellaflow.client"):
         CellaflowClient(target=target, api_key=KEY)
     assert "without TLS" in caplog.text
@@ -245,4 +315,4 @@ def test_the_key_helpers_are_exported_from_the_package() -> None:
     import cellaflow
 
     assert cellaflow.resolve_api_key is resolve_api_key
-    assert cellaflow.API_KEY_ENV_VARS == ("CELLAFLOW_AUTH_TOKEN", "CELLAFLOW_API_KEY")
+    assert cellaflow.API_KEY_ENV_VAR == "CELLAFLOW_API_KEY"

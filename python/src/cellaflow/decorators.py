@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, NoReturn, Optional, Sequence, TypeVar, c
 
 import grpc
 
-from cellaflow.client import CellaflowClient
+from cellaflow.client import CellaflowClient, _check_api_key_argument
 from cellaflow.context import (
     WorkflowContext,
     set_context,
@@ -47,8 +47,10 @@ def workflow(
     session, and a run with the same `_session_id` resumes from them.
 
     `api_key` authenticates with the engine; when omitted it is read from
-    `CELLAFLOW_AUTH_TOKEN`, then `CELLAFLOW_API_KEY`. See `CellaflowClient`.
+    `CELLAFLOW_API_KEY`. A key that cannot be sent is refused here, when the
+    decorator is applied. See `CellaflowClient`.
     """
+    _check_api_key_argument(api_key)
 
     def decorator(func: F) -> F:
         @functools.wraps(func)

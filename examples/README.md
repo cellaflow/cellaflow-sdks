@@ -21,8 +21,10 @@ docker run -d --name cellaflow-demo \
 ```
 
 `CELLAFLOW_ALLOW_UNAUTHENTICATED` is not optional: the engine refuses to start
-without either it or `CELLAFLOW_AUTH_TOKEN`, and the SDKs do not send a token.
-Do not carry that setting into anything reachable.
+without either it or `CELLAFLOW_AUTH_TOKEN`. Do not carry that setting into
+anything reachable. To run the examples against a token instead, start the
+engine with `CELLAFLOW_AUTH_TOKEN` and give them the same value as
+`CELLAFLOW_API_KEY`.
 
 and the SDK: `pip install cellaflow`. `at_most_once_proof` and `crash_benchmark`
 pin their own dependencies in `requirements.txt` and run Postgres from the

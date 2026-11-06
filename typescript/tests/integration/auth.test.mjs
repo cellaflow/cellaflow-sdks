@@ -23,7 +23,6 @@ const reserveSeat = tool(async (flight) => `seat on ${flight}`, { toolName: "res
 
 beforeEach(() => {
   delete process.env.CELLAFLOW_API_KEY;
-  delete process.env.CELLAFLOW_AUTH_TOKEN;
 });
 
 test("durableTools runs with the right key", secured, async () => {

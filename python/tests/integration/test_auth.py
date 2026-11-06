@@ -16,7 +16,6 @@ import grpc
 import pytest
 
 from cellaflow import durable_tools, execution_lease, step, tool, workflow
-from cellaflow.client import API_KEY_ENV_VARS
 
 # `tool(...)` with arguments is not typed yet; the unit tests cast it instead.
 # mypy: disable-error-code="untyped-decorator"
@@ -32,10 +31,9 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture
-def secured(monkeypatch: Any) -> Iterator[Tuple[str, str]]:
-    """The secured engine and its key, with no key in the environment."""
-    for name in API_KEY_ENV_VARS:
-        monkeypatch.delenv(name, raising=False)
+def secured() -> Iterator[Tuple[str, str]]:
+    """The secured engine and its key. `tests/conftest.py` keeps the key out of
+    the environment."""
     assert AUTH_TARGET and AUTH_KEY
     yield AUTH_TARGET, AUTH_KEY
 

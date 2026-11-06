@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING, Any
 
-from cellaflow.client import API_KEY_ENV_VARS, CellaflowClient, resolve_api_key
+from cellaflow.client import API_KEY_ENV_VAR, CellaflowClient, resolve_api_key
 from cellaflow.decorators import (
     workflow,
     step,
@@ -39,7 +39,7 @@ __all__ = [
     "ReplayDivergedError",
     "FailureNotReplayableError",
     "CellaflowClient",
-    "API_KEY_ENV_VARS",
+    "API_KEY_ENV_VAR",
     "resolve_api_key",
     "workflow",
     "step",
