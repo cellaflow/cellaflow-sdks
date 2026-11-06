@@ -109,12 +109,14 @@ def test_the_variables_are_read_in_the_engines_order(monkeypatch: Any) -> None:
     assert resolve_api_key("") is None
 
 
-def test_a_blank_value_counts_as_unset_as_it_does_to_the_engine(
+def test_a_blank_variable_means_no_key_and_is_not_skipped_as_the_engine_does(
     monkeypatch: Any,
 ) -> None:
+    """The engine stops at the first variable that is set, even blank, and then
+    has no token. Reading on to the next would send a key it does not have."""
     monkeypatch.setenv("CELLAFLOW_AUTH_TOKEN", "  ")
     monkeypatch.setenv("CELLAFLOW_API_KEY", "the-key")
-    assert resolve_api_key() == "the-key"
+    assert resolve_api_key() is None
     assert resolve_api_key("   ") is None
 
 
@@ -207,6 +209,10 @@ def test_sending_a_key_without_tls_to_another_host_warns_once(caplog: Any) -> No
         "dns:///localhost:50051",
         "ipv4:127.0.0.1:50051",
         "ipv6:[::1]:50051",
+        "ipv4:127.0.0.1:50051,127.0.0.2:50051",
+        "LOCALHOST:50051",
+        "localhost.:50051",
+        "127.0.0.2:50051",
     ],
 )
 def test_a_local_target_in_any_form_gets_no_warning(target: str, caplog: Any) -> None:
@@ -214,3 +220,29 @@ def test_a_local_target_in_any_form_gets_no_warning(target: str, caplog: Any) ->
     with caplog.at_level(logging.WARNING, logger="cellaflow.client"):
         CellaflowClient(target=target, api_key=KEY)
     assert "without TLS" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "ipv4:127.0.0.1:50051,10.0.0.5:50051",
+        "ipv6:[::1]:50051,[2001:db8::1]:50051",
+        "dns:///engine.example.com:50051",
+    ],
+)
+def test_a_target_that_can_reach_another_host_is_warned_about(
+    target: str, caplog: Any
+) -> None:
+    """gRPC may send calls to any address in a list, so one remote address is
+    enough for the key to cross the network."""
+    client_module._warned_plaintext.clear()
+    with caplog.at_level(logging.WARNING, logger="cellaflow.client"):
+        CellaflowClient(target=target, api_key=KEY)
+    assert "without TLS" in caplog.text
+
+
+def test_the_key_helpers_are_exported_from_the_package() -> None:
+    import cellaflow
+
+    assert cellaflow.resolve_api_key is resolve_api_key
+    assert cellaflow.API_KEY_ENV_VARS == ("CELLAFLOW_AUTH_TOKEN", "CELLAFLOW_API_KEY")

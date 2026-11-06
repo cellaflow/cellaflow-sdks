@@ -180,8 +180,8 @@ class CellaflowSaver(_BaseSaver):
             target: gRPC target endpoint for the CellaFlow Engine.
             secure: Whether to use TLS encryption for gRPC channel communication.
             api_key: Authenticates with the engine when the client is built
-                here; when omitted it is read from `CELLAFLOW_API_KEY` or
-                `CELLAFLOW_AUTH_TOKEN`. Ignored when `client` is given.
+                here; when omitted it is read from `CELLAFLOW_AUTH_TOKEN`,
+                then `CELLAFLOW_API_KEY`. Ignored when `client` is given.
             workflow_id: CellaFlow workflow identifier tag.
             version: Workflow schema version string.
             serde: Optional custom serializer conforming to `SerializerProtocol`.

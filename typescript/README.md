@@ -57,7 +57,7 @@ await durableTools(threadId, { target: "engine.example.com:50051", secure: true,
 });
 ```
 
-- **Where it comes from:** `apiKey` if given, then `CELLAFLOW_AUTH_TOKEN`, then `CELLAFLOW_API_KEY`: the engine's own order. A blank value counts as unset, as it does to the engine. The generic `AUTH_TOKEN` and `API_KEY` are never read: a variable that generic often holds another service's secret.
+- **Where it comes from:** `apiKey` if given, then `CELLAFLOW_AUTH_TOKEN`, then `CELLAFLOW_API_KEY`: the engine's own order. As in the engine, the first variable that is set decides, and if it is blank no key is sent. The generic `AUTH_TOKEN` and `API_KEY` are never read: a variable that generic often holds another service's secret.
 - **How it's sent:** as `authorization: Bearer <key>` on every call.
 - **Without TLS:** sending a key to a host other than localhost with `secure: false` warns once per target, since anyone on the path can read it.
 

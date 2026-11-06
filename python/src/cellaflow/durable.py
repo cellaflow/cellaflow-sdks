@@ -145,6 +145,9 @@ def durable_tools(
     `config` is normally the same mapping passed to `invoke`, and only
     `configurable.thread_id` is read from it. A bare thread id string is
     accepted too, for callers who have no config to hand.
+
+    `api_key` authenticates with the engine; when omitted it is read from
+    `CELLAFLOW_AUTH_TOKEN`, then `CELLAFLOW_API_KEY`. See `CellaflowClient`.
     """
     from cellaflow.context import (
         WorkflowContext,

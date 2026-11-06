@@ -80,8 +80,10 @@ test("the variables are read in the engine's order, and a blank key means none",
   assert.equal(resolveApiKey("passed"), "passed");
   assert.equal(resolveApiKey(""), undefined);
   assert.equal(resolveApiKey("   "), undefined);
+  // The engine stops at the first variable that is set, even blank, and then has
+  // no token. Reading on to the next would send a key it does not have.
   process.env.CELLAFLOW_AUTH_TOKEN = "  ";
-  assert.equal(resolveApiKey(), "from-sdk-var");
+  assert.equal(resolveApiKey(), undefined);
 });
 
 test("generic variables are never read", () => {
@@ -140,8 +142,22 @@ test("a local target in any form gets no warning", (t) => {
   const warnings = [];
   t.mock.method(console, "warn", (message) => warnings.push(message));
   // A bare `::1` is not a URL Connect accepts, so it is not a target here.
-  for (const local of ["localhost:50051", "127.0.0.1:50051", "[::1]:50051"]) {
+  for (const local of [
+    "localhost:50051",
+    "127.0.0.1:50051",
+    "[::1]:50051",
+    "[0:0:0:0:0:0:0:1]:50051",
+    "LOCALHOST:50051",
+    "localhost.:50051",
+    "127.0.0.2:50051",
+  ]) {
     new CellaflowClient({ target: local, apiKey: KEY });
   }
   assert.deepEqual(warnings, []);
+});
+
+test("the key helpers are exported from the package", async () => {
+  const sdk = await import("../dist/index.js");
+  assert.equal(sdk.resolveApiKey, resolveApiKey);
+  assert.deepEqual([...sdk.API_KEY_ENV_VARS], ["CELLAFLOW_AUTH_TOKEN", "CELLAFLOW_API_KEY"]);
 });

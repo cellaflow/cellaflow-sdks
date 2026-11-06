@@ -1,3 +1,4 @@
+import ipaddress
 import logging
 import os
 import re
@@ -21,27 +22,32 @@ logger = logging.getLogger(__name__)
 #: would then be sent to the engine.
 API_KEY_ENV_VARS = ("CELLAFLOW_AUTH_TOKEN", "CELLAFLOW_API_KEY")
 
-_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _HEADER_SAFE = re.compile(r"[\x20-\x7e]*")
 _warned_plaintext: "set[str]" = set()
 _warned_lock = threading.Lock()
 
 
 def _api_key_and_source(api_key: Optional[str]) -> Tuple[Optional[str], str]:
-    """The API key to send and where it came from. A blank value means none,
-    as it does to the engine."""
+    """The API key to send and where it came from.
+
+    Exactly the engine's rule: the first of the variables that is set decides,
+    even if it is blank, and a blank value means no key. Skipping a blank one
+    to read the next would send a key to an engine that, reading the same
+    environment, has none.
+    """
     if api_key is not None:
         return (api_key if api_key.strip() else None), "the api_key argument"
     for name in API_KEY_ENV_VARS:
         api_key = os.environ.get(name)
-        if api_key and api_key.strip():
-            return api_key, name
+        if api_key is not None:
+            return (api_key if api_key.strip() else None), name
     return None, ""
 
 
 def resolve_api_key(api_key: Optional[str] = None) -> Optional[str]:
     """The API key to send: `api_key` if given, else the first of
-    `API_KEY_ENV_VARS` that is set. A blank value means none."""
+    `API_KEY_ENV_VARS` that is set. A blank value means none, and a blank
+    variable is not skipped for the next, as the engine does not skip it."""
     return _api_key_and_source(api_key)[0]
 
 
@@ -56,8 +62,29 @@ def _check_api_key(api_key: str, source: str) -> None:
         )
 
 
+def _host_is_local(host: str) -> bool:
+    host = host.lower().rstrip(".")
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback  # all of 127.0.0.0/8, ::1
+    except ValueError:
+        return False
+
+
+def _host_of(address: str) -> str:
+    """The host in `host:port`, `[v6]:port` or a bare IPv6 address."""
+    if address.startswith("["):
+        end = address.find("]")
+        return address[1:end] if end != -1 else address
+    if address.count(":") > 1:
+        return address
+    return address.rsplit(":", 1)[0]
+
+
 def _is_local(target: str) -> bool:
-    """Whether `target` names this machine, in any form gRPC accepts."""
+    """Whether every address `target` can reach is this machine, in any form
+    gRPC accepts."""
     if target.startswith(("unix:", "unix-abstract:")):
         return True
     rest = target
@@ -67,15 +94,9 @@ def _is_local(target: str) -> bool:
             start = rest.find("/", 2) + 1
             rest = rest[start:] if start else rest[2:]
     elif rest.startswith(("ipv4:", "ipv6:")):
-        rest = rest[5:].split(",", 1)[0]
-    if rest.startswith("["):
-        end = rest.find("]")
-        host = rest[1:end] if end != -1 else rest
-    elif rest.count(":") > 1:
-        host = rest  # a bare IPv6 address, with no port
-    else:
-        host = rest.rsplit(":", 1)[0]
-    return host in _LOCAL_HOSTS
+        # A list: gRPC may send calls to any of them.
+        return all(_host_is_local(_host_of(a)) for a in rest[5:].split(","))
+    return _host_is_local(_host_of(rest))
 
 
 class _CallDetails(

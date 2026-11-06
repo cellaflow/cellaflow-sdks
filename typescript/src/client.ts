@@ -5,6 +5,7 @@ import {
   Transport,
 } from "@connectrpc/connect";
 import { createGrpcTransport } from "@connectrpc/connect-node";
+import { isIP } from "node:net";
 import type { PartialMessage } from "@bufbuild/protobuf";
 import { WorkflowEngineService } from "./cellaflow/v1/service_connect.js";
 import type {
@@ -51,14 +52,33 @@ export interface CellaflowClientOptions {
  */
 export const API_KEY_ENV_VARS = ["CELLAFLOW_AUTH_TOKEN", "CELLAFLOW_API_KEY"] as const;
 
-/** The key to send and where it came from. A blank value means none, as it does to the engine. */
+/**
+ * The key to send and where it came from. Exactly the engine's rule: the first
+ * variable that is set decides, even if it is blank, and a blank value means no
+ * key. Skipping a blank one to read the next would send a key to an engine that,
+ * reading the same environment, has none.
+ */
 function apiKeyAndSource(apiKey?: string): [string | undefined, string] {
   if (apiKey !== undefined) return [apiKey.trim() ? apiKey : undefined, "the apiKey option"];
   for (const name of API_KEY_ENV_VARS) {
     const value = process.env[name];
-    if (value && value.trim()) return [value, name];
+    if (value !== undefined) return [value.trim() ? value : undefined, name];
   }
   return [undefined, ""];
+}
+
+/**
+ * Refuses a key that cannot be sent as a header, naming where it came from but
+ * never what it is. The same rule as the Python SDK's `_check_api_key`.
+ */
+function checkApiKey(apiKey: string, source: string): void {
+  if (apiKey !== apiKey.trim() || !/^[\x20-\x7e]*$/.test(apiKey)) {
+    throw new Error(
+      `The Cellaflow API key from ${source} cannot be sent in a header: it has ` +
+        "surrounding whitespace or a character outside printable ASCII (a " +
+        "trailing newline from a secret file, say).",
+    );
+  }
 }
 
 /** The API key to send: `apiKey` if given, else the first variable that is set. */
@@ -66,8 +86,17 @@ export function resolveApiKey(apiKey?: string): string | undefined {
   return apiKeyAndSource(apiKey)[0];
 }
 
-const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 const warnedPlaintext = new Set<string>();
+
+/** Whether `host` is this machine: `localhost`, any of 127.0.0.0/8, or `::1`. */
+function hostIsLocal(host: string): boolean {
+  const name = host.toLowerCase().replace(/\.+$/, "");
+  if (name === "localhost") return true;
+  if (isIP(name) === 4) return name.startsWith("127.");
+  // The URL parser normalises every spelling of the IPv6 loopback to `[::1]`.
+  if (isIP(name) === 6) return new URL(`http://[${name}]`).hostname === "[::1]";
+  return false;
+}
 
 /** Whether `target` (`host:port` or `[v6]:port`) names this machine. */
 function isLocal(target: string): boolean {
@@ -80,7 +109,7 @@ function isLocal(target: string): boolean {
   } else {
     host = target.includes(":") ? target.slice(0, target.lastIndexOf(":")) : target;
   }
-  return LOCAL_HOSTS.has(host);
+  return hostIsLocal(host);
 }
 
 function warnIfSentInTheClear(target: string): void {
@@ -118,13 +147,7 @@ export class CellaflowClient {
     const [apiKey, source] = apiKeyAndSource(options.apiKey);
     const interceptors: Interceptor[] = [];
     if (apiKey !== undefined) {
-      if (apiKey !== apiKey.trim() || !/^[\x20-\x7e]*$/.test(apiKey)) {
-        throw new Error(
-          `The Cellaflow API key from ${source} cannot be sent in a header: it has ` +
-            "surrounding whitespace or a character outside printable ASCII (a " +
-            "trailing newline from a secret file, say).",
-        );
-      }
+      checkApiKey(apiKey, source);
       if (!secure) warnIfSentInTheClear(target);
       interceptors.push(bearerKey(apiKey));
     }

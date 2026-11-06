@@ -222,6 +222,10 @@ def execution_lease(
         CellaFlow engine address. Defaults to ``localhost:50051``.
     secure:
         Whether to use TLS. Defaults to ``False``.
+    api_key:
+        Authenticates with the engine. When omitted it is read from
+        ``CELLAFLOW_AUTH_TOKEN``, then ``CELLAFLOW_API_KEY``. See
+        :class:`~cellaflow.client.CellaflowClient`.
     ttl_ms:
         Lease time-to-live in milliseconds, applied to the initial acquisition
         and to every renewal. After a crash, the task becomes reclaimable once
@@ -322,7 +326,7 @@ async def async_execution_lease(
 
     Parameters
     ----------
-    key, worker_id, target, secure, ttl_ms, heartbeat_interval_ms:
+    key, worker_id, target, secure, api_key, ttl_ms, heartbeat_interval_ms:
         Same as :func:`execution_lease`.
     on_lease_lost:
         Optional callback invoked when the lease is lost. This is a
@@ -444,7 +448,8 @@ def task_lease(
     key:
         The lease key, or a callable ``(*args, **kwargs) -> str`` building it
         from the call's arguments.
-    worker_id, target, secure, ttl_ms, heartbeat_interval_ms, on_lease_lost:
+    worker_id, target, secure, api_key, ttl_ms, heartbeat_interval_ms,
+    on_lease_lost:
         Same as :func:`execution_lease`.
     preempt:
         Async functions only; same as :func:`async_execution_lease`. Ignored for

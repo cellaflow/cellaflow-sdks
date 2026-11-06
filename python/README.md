@@ -577,7 +577,7 @@ Or pass it explicitly. Every entry point that talks to the engine takes `api_key
 @workflow(version="1.0.0", target="engine.example.com:50051", secure=True, api_key=key)
 ```
 
-- **Where it comes from:** `api_key` if given, then `CELLAFLOW_AUTH_TOKEN`, then `CELLAFLOW_API_KEY`: the engine's own order, so with both set the SDK sends the token the engine expects. A blank value counts as unset, as it does to the engine. The generic `AUTH_TOKEN` and `API_KEY`, which the engine also reads, are never read by the SDK: a variable that generic often holds another service's secret.
+- **Where it comes from:** `api_key` if given, then `CELLAFLOW_AUTH_TOKEN`, then `CELLAFLOW_API_KEY`: the engine's own order, so with both set the SDK sends the token the engine expects. As in the engine, the first variable that is set decides, and if it is blank no key is sent. The generic `AUTH_TOKEN` and `API_KEY`, which the engine also reads, are never read by the SDK: a variable that generic often holds another service's secret.
 - **How it's sent:** as `authorization: Bearer <key>` on every call.
 - **Kept out of sight:** the key never appears in logs, exceptions or `repr`.
 - **Without TLS:** sending a key to a host other than localhost with `secure=False` logs a warning, once per target, since anyone on the path can read it.
