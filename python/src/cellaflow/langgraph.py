@@ -181,7 +181,8 @@ class CellaflowSaver(_BaseSaver):
             secure: Whether to use TLS encryption for gRPC channel communication.
             api_key: Authenticates with the engine when the client is built
                 here; when omitted it is read from `CELLAFLOW_API_KEY`.
-                Refused with `client`, which carries its own.
+                A non-blank one is refused with `client`, which carries
+                its own.
             workflow_id: CellaFlow workflow identifier tag.
             version: Workflow schema version string.
             serde: Optional custom serializer conforming to `SerializerProtocol`.
@@ -190,7 +191,7 @@ class CellaflowSaver(_BaseSaver):
             ImportError: If `langgraph-checkpoint` is not installed in the environment.
             ValueError: If both `client` and `api_key` are given.
         """
-        if client is not None and api_key is not None:
+        if client is not None and api_key is not None and api_key.strip():
             raise ValueError(
                 "CellaflowSaver was given both a client and an api_key. The "
                 "client sends its own key, so this one would be ignored: pass "

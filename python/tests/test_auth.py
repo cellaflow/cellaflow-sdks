@@ -146,9 +146,16 @@ def test_a_decorator_refuses_a_bad_key_when_it_is_applied() -> None:
         decorators.workflow(api_key="MARKER\n")
     with pytest.raises(ValueError, match="the api_key argument"):
         task_lease("task:1", worker_id="w", api_key="MARKER\n")
+    # Nor bound for another host without TLS.
+    remote = "engine.example.com:50051"
+    with pytest.raises(ValueError, match="without TLS"):
+        decorators.workflow(target=remote, api_key=KEY)
+    with pytest.raises(ValueError, match="without TLS"):
+        task_lease("task:1", worker_id="w", target=remote, api_key=KEY)
+    decorators.workflow(target=remote, secure=True, api_key=KEY)
     # A blank key means none, so there is nothing to refuse.
     decorators.workflow(api_key="")
-    task_lease("task:1", worker_id="w", api_key="  ")
+    task_lease("task:1", worker_id="w", target=remote, api_key="  ")
 
 
 class _Built(Exception):
@@ -215,20 +222,37 @@ def test_the_saver_refuses_a_key_it_would_ignore() -> None:
     client = CellaflowClient()
     with pytest.raises(ValueError, match="both a client and an api_key"):
         langgraph.CellaflowSaver(client=client, api_key=KEY)
+    # A blank one means no key, so nothing would be ignored.
+    langgraph.CellaflowSaver(client=client, api_key="")
 
 
 def test_every_kind_of_call_gets_the_key() -> None:
-    """Streaming calls too, so one added later cannot go out without it."""
+    """Streaming calls too, so one added later cannot go out without it. Each
+    interceptor method is called as grpc calls it, and what it passes on is
+    checked; the service has no streaming method to call for real."""
     from cellaflow.client import _BearerKey
 
     interceptor = _BearerKey(KEY)
-    for kind in (
-        grpc.UnaryUnaryClientInterceptor,
-        grpc.UnaryStreamClientInterceptor,
-        grpc.StreamUnaryClientInterceptor,
-        grpc.StreamStreamClientInterceptor,
+    details = client_module._CallDetails(
+        "/cellaflow.v1.WorkflowEngineService/StartSession",
+        None,
+        [("x-trace", "1")],
+        None,
+        None,
+        None,
+    )
+    for method in (
+        interceptor.intercept_unary_unary,
+        interceptor.intercept_unary_stream,
+        interceptor.intercept_stream_unary,
+        interceptor.intercept_stream_stream,
     ):
-        assert isinstance(interceptor, kind)
+        passed_on: List[Any] = []
+        method(lambda d, r: passed_on.append(d), details, object())
+        (sent,) = passed_on
+        assert ("authorization", f"Bearer {KEY}") in sent.metadata
+        assert ("x-trace", "1") in sent.metadata
+        assert KEY not in repr(sent)  # grpc keeps it in a failed call's frame
 
 
 def test_the_key_never_appears_in_repr_logs_or_a_refusal(
@@ -237,8 +261,12 @@ def test_the_key_never_appears_in_repr_logs_or_a_refusal(
     target, recorder = engine
     recorder.expected = "the-right-key"
     with caplog.at_level(logging.DEBUG):
-        client = CellaflowClient(target="engine.example.com:50051", api_key=KEY)
+        client = CellaflowClient(
+            target="engine.example.com:50051", api_key=KEY, allow_plaintext_key=True
+        )
         local = CellaflowClient(target=target, api_key=KEY)
+        with pytest.raises(ValueError) as plaintext:
+            CellaflowClient(target="engine.example.com:50051", api_key=KEY)
         with pytest.raises(grpc.RpcError) as refused:
             local.start_session("wf", "1.0.0")
     for text in (
@@ -248,15 +276,63 @@ def test_the_key_never_appears_in_repr_logs_or_a_refusal(
         caplog.text,
         str(refused.value),
         repr(refused.value),
+        str(plaintext.value),
     ):
         assert KEY not in text
 
 
-def test_sending_a_key_without_tls_to_another_host_warns_once(caplog: Any) -> None:
-    client_module._checked_plaintext.clear()
+def test_a_key_is_not_sent_without_tls_to_another_host_unless_allowed(
+    monkeypatch: Any,
+) -> None:
+    """Forgetting TLS must not be how a key crosses the network, as forgetting
+    a token cannot be how the engine serves an open port."""
+    # No key, nothing to protect.
+    CellaflowClient(target="engine.example.com:50051")
+    opened: List[str] = []
+    monkeypatch.setattr(grpc, "insecure_channel", lambda target: opened.append(target))
+    with pytest.raises(ValueError, match="CELLAFLOW_ALLOW_PLAINTEXT_KEY") as refused:
+        CellaflowClient(target="engine.example.com:50051", api_key=KEY)
+    assert "engine.example.com:50051" in str(refused.value)
+    assert opened == []  # refused before a channel was opened
+    # The key from the environment is held to the same rule.
+    monkeypatch.setenv("CELLAFLOW_API_KEY", KEY)
+    with pytest.raises(ValueError, match="without TLS"):
+        CellaflowClient(target="engine.example.com:50051")
+    assert opened == []
+
+
+@pytest.mark.parametrize("value", ["true", "TRUE", "1", "yes", " true "])
+def test_the_variable_allows_it_the_way_the_engine_reads_its_opt_out(
+    value: str, monkeypatch: Any
+) -> None:
+    monkeypatch.setenv("CELLAFLOW_ALLOW_PLAINTEXT_KEY", value)
+    CellaflowClient(target="engine.example.com:50051", api_key=KEY)
+
+
+@pytest.mark.parametrize("value", ["", "false", "0", "no", "on"])
+def test_anything_else_in_the_variable_does_not(value: str, monkeypatch: Any) -> None:
+    monkeypatch.setenv("CELLAFLOW_ALLOW_PLAINTEXT_KEY", value)
+    with pytest.raises(ValueError, match="without TLS"):
+        CellaflowClient(target="engine.example.com:50051", api_key=KEY)
+
+
+def test_the_argument_decides_over_the_variable(monkeypatch: Any) -> None:
+    monkeypatch.setenv("CELLAFLOW_ALLOW_PLAINTEXT_KEY", "true")
+    with pytest.raises(ValueError, match="without TLS"):
+        CellaflowClient(
+            target="engine.example.com:50051", api_key=KEY, allow_plaintext_key=False
+        )
+
+
+def test_an_allowed_plaintext_key_warns_once_per_target(caplog: Any) -> None:
+    client_module._warned_plaintext.clear()
     with caplog.at_level(logging.WARNING, logger="cellaflow.client"):
-        CellaflowClient(target="engine.example.com:50051", api_key=KEY)
-        CellaflowClient(target="engine.example.com:50051", api_key=KEY)
+        for _ in range(2):
+            CellaflowClient(
+                target="engine.example.com:50051",
+                api_key=KEY,
+                allow_plaintext_key=True,
+            )
         CellaflowClient(target="localhost:50051", api_key=KEY)
         CellaflowClient(target="engine.example.com:50051", secure=True, api_key=KEY)
     assert caplog.text.count("without TLS") == 1
@@ -283,8 +359,10 @@ def test_sending_a_key_without_tls_to_another_host_warns_once(caplog: Any) -> No
         "ipv6:[::ffff:127.0.0.1]:50051",
     ],
 )
-def test_a_local_target_in_any_form_gets_no_warning(target: str, caplog: Any) -> None:
-    client_module._checked_plaintext.clear()
+def test_a_local_target_in_any_form_is_allowed_without_a_warning(
+    target: str, caplog: Any
+) -> None:
+    client_module._warned_plaintext.clear()
     with caplog.at_level(logging.WARNING, logger="cellaflow.client"):
         CellaflowClient(target=target, api_key=KEY)
     assert "without TLS" not in caplog.text
@@ -300,15 +378,11 @@ def test_a_local_target_in_any_form_gets_no_warning(target: str, caplog: Any) ->
         "[fe80::1%eth0]:50051",
     ],
 )
-def test_a_target_that_can_reach_another_host_is_warned_about(
-    target: str, caplog: Any
-) -> None:
+def test_a_target_that_can_reach_another_host_is_refused(target: str) -> None:
     """gRPC may send calls to any address in a list, so one remote address is
     enough for the key to cross the network."""
-    client_module._checked_plaintext.clear()
-    with caplog.at_level(logging.WARNING, logger="cellaflow.client"):
+    with pytest.raises(ValueError, match="without TLS"):
         CellaflowClient(target=target, api_key=KEY)
-    assert "without TLS" in caplog.text
 
 
 def test_the_key_helpers_are_exported_from_the_package() -> None:
@@ -316,3 +390,4 @@ def test_the_key_helpers_are_exported_from_the_package() -> None:
 
     assert cellaflow.resolve_api_key is resolve_api_key
     assert cellaflow.API_KEY_ENV_VAR == "CELLAFLOW_API_KEY"
+    assert cellaflow.ALLOW_PLAINTEXT_KEY_ENV_VAR == "CELLAFLOW_ALLOW_PLAINTEXT_KEY"

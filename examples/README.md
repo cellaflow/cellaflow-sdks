@@ -23,7 +23,8 @@ docker run -d --name cellaflow-demo \
 `CELLAFLOW_ALLOW_UNAUTHENTICATED` is not optional: the engine refuses to start
 without either it or a token. Do not carry that setting into anything
 reachable. To run the examples against a token instead, set `CELLAFLOW_API_KEY`
-to the same value for both the engine and the examples.
+to the same value for both the engine and the examples. That needs an SDK
+release after 0.9.0, which sends no key.
 
 and the SDK: `pip install cellaflow`. `at_most_once_proof` and `crash_benchmark`
 pin their own dependencies in `requirements.txt` and run Postgres from the

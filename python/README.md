@@ -578,11 +578,12 @@ Or pass it explicitly. Every entry point that talks to the engine takes `api_key
 ```
 
 - **Where it comes from:** `api_key` if given, else `CELLAFLOW_API_KEY`. A blank value means no key. That is the only variable the SDK reads. It never reads the engine's older name, `CELLAFLOW_AUTH_TOKEN`, or the generic `AUTH_TOKEN` and `API_KEY`: a variable that generic often holds another service's secret.
-- **On the engine:** engine releases up to 0.2.0 read their token from `CELLAFLOW_AUTH_TOKEN` first and fall back to `CELLAFLOW_API_KEY`, so if both are set on the engine, `CELLAFLOW_AUTH_TOKEN` wins. Set only `CELLAFLOW_API_KEY` there.
+- **On the engine:** the engine reads its token from `CELLAFLOW_AUTH_TOKEN` before `CELLAFLOW_API_KEY`, and a blank `CELLAFLOW_AUTH_TOKEN` counts as set: the engine then has no token at all. Leave `CELLAFLOW_AUTH_TOKEN` unset there, not blank (Compose writes a blank one for `${VAR}` when the variable is unset), and set only `CELLAFLOW_API_KEY`.
 - **How it's sent:** as `authorization: Bearer <key>` on every call.
 - **Kept out of sight:** the SDK never puts the key in a log message, an exception message or a `repr`. grpc's own stack frames do hold the outgoing header, so a tool that records a traceback's local variables (loguru's `diagnose`, Sentry's frame variables, `pytest -l`) can show it. Turn that off wherever the key matters.
 - **Refused early:** a key that cannot be sent as a header (surrounding whitespace, or a character outside printable ASCII) is refused before a connection opens, naming where it came from. A decorator given one refuses it when it is applied.
-- **Without TLS:** sending a key to a host other than localhost with `secure=False` logs a warning, once per target, since anyone on the path can read it.
+- **Without TLS:** a key is never sent in plaintext to anything but this machine unless you allow it. With `secure=False` and another host as the target, the client refuses, naming the target, so forgetting TLS cannot be how a key crosses the network. On a network you trust (a Compose network, a Kubernetes service), set `CELLAFLOW_ALLOW_PLAINTEXT_KEY=true`, or pass `allow_plaintext_key=True` to `CellaflowClient`; each target then logs a warning once.
+- **Your own CA:** `secure=True` trusts the public root certificates gRPC ships with. For an engine whose certificate comes from your own CA, or is self-signed, set `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/path/to/ca.pem`, which gRPC then trusts instead.
 
 ### `@workflow(version="1.0.0", target="localhost:50051", secure=False, api_key=None)`
 Marks the entry point for a durable workflow execution:

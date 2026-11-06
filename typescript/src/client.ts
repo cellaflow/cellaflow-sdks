@@ -5,7 +5,7 @@ import {
   Transport,
 } from "@connectrpc/connect";
 import { createGrpcTransport } from "@connectrpc/connect-node";
-import { isIP } from "node:net";
+import { apiKeyAndSource, checkApiKey, checkPlaintext } from "./apikey.js";
 import type { PartialMessage } from "@bufbuild/protobuf";
 import { WorkflowEngineService } from "./cellaflow/v1/service_connect.js";
 import type {
@@ -38,99 +38,17 @@ export interface CellaflowClientOptions {
    * is not given, it is read from `CELLAFLOW_API_KEY`; with neither, calls go
    * unauthenticated, which an engine started without a token accepts. A blank
    * string means no key, even with the variable set.
+   *
+   * A key is not sent without TLS to anything but this machine: the client
+   * refuses it unless this is `true`, or `CELLAFLOW_ALLOW_PLAINTEXT_KEY` is
+   * `true`, for a network you trust.
    */
   apiKey?: string;
+  /** Allows sending the key without TLS to another host. See `apiKey`. */
+  allowPlaintextKey?: boolean;
 }
 
-/**
- * Where an API key is read from when none is passed, and the only variable read:
- * the same one the engine reads its token from. The engine also accepts older
- * names for its token (`CELLAFLOW_AUTH_TOKEN`, and the generic `AUTH_TOKEN` and
- * `API_KEY`); the SDK reads none of them, because a variable as generic as
- * `API_KEY` often holds another service's secret, which would then be sent to
- * the engine.
- */
-export const API_KEY_ENV_VAR = "CELLAFLOW_API_KEY";
-
-/**
- * The key to send and where it came from: `apiKey` if given, else
- * `CELLAFLOW_API_KEY`. A blank value means no key.
- */
-function apiKeyAndSource(apiKey?: string): [string | undefined, string] {
-  const [value, source] =
-    apiKey !== undefined
-      ? [apiKey, "the apiKey option"]
-      : [process.env[API_KEY_ENV_VAR], API_KEY_ENV_VAR];
-  return [value?.trim() ? value : undefined, source];
-}
-
-/**
- * Refuses a key that cannot be sent as a header, naming where it came from but
- * never what it is. The same rule as the Python SDK's `_check_api_key`.
- */
-function checkApiKey(apiKey: string, source: string): void {
-  if (apiKey !== apiKey.trim() || !/^[\x20-\x7e]*$/.test(apiKey)) {
-    throw new Error(
-      `The Cellaflow API key from ${source} cannot be sent in a header: it has ` +
-        "surrounding whitespace or a character outside printable ASCII (a " +
-        "trailing newline from a secret file, say).",
-    );
-  }
-}
-
-/** The API key to send: `apiKey` if given, else `CELLAFLOW_API_KEY`. */
-export function resolveApiKey(apiKey?: string): string | undefined {
-  return apiKeyAndSource(apiKey)[0];
-}
-
-const checkedPlaintext = new Set<string>();
-
-/**
- * Whether `host` is this machine: `localhost`, any of 127.0.0.0/8, `::1`, or a
- * 127 address mapped into IPv6 (`::ffff:127.0.0.1`), as the Python SDK decides.
- */
-function hostIsLocal(host: string): boolean {
-  const name = host.toLowerCase().replace(/\.+$/, "");
-  if (name === "localhost") return true;
-  if (isIP(name) === 4) return name.startsWith("127.");
-  if (isIP(name) !== 6) return false;
-  // The URL parser writes every spelling of an IPv6 address one way: `[::1]`,
-  // and `[::ffff:7fxx:xxxx]` for a mapped 127 address. It refuses a zone
-  // (`fe80::1%eth0`), which is never loopback; Connect refuses one too, so
-  // the transport reports it rather than this check.
-  let normalised: string;
-  try {
-    normalised = new URL(`http://[${name}]`).hostname;
-  } catch {
-    return false;
-  }
-  return normalised === "[::1]" || /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(normalised);
-}
-
-/** Whether `target` (`host:port` or `[v6]:port`) names this machine. */
-function isLocal(target: string): boolean {
-  let host: string;
-  if (target.startsWith("[")) {
-    const end = target.indexOf("]");
-    host = end === -1 ? target : target.slice(1, end);
-  } else if ((target.match(/:/g) ?? []).length > 1) {
-    host = target; // a bare IPv6 address, with no port
-  } else {
-    host = target.includes(":") ? target.slice(0, target.lastIndexOf(":")) : target;
-  }
-  return hostIsLocal(host);
-}
-
-function warnIfSentInTheClear(target: string): void {
-  // Each target is looked at once, however many clients are built for it.
-  if (checkedPlaintext.has(target)) return;
-  checkedPlaintext.add(target);
-  if (isLocal(target)) return;
-  console.warn(
-    `Cellaflow: sending an API key to ${target} without TLS, so anyone on the path ` +
-      "can read it. Pass secure: true to send it encrypted.",
-  );
-}
+export { API_KEY_ENV_VAR, ALLOW_PLAINTEXT_KEY_ENV_VAR, resolveApiKey } from "./apikey.js";
 
 /** Adds `authorization: Bearer <key>` to every call, so no call site can forget it. */
 function bearerKey(apiKey: string): Interceptor {
@@ -159,7 +77,7 @@ export class CellaflowClient {
     const interceptors: Interceptor[] = [];
     if (apiKey !== undefined) {
       checkApiKey(apiKey, source);
-      if (!secure) warnIfSentInTheClear(target);
+      if (!secure) checkPlaintext(target, options.allowPlaintextKey);
       interceptors.push(bearerKey(apiKey));
     }
 

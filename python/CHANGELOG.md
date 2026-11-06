@@ -16,8 +16,10 @@ All notable changes to the CellaFlow Python SDK.
   local-variable capture in error reporting wherever the key matters. A key that cannot be a header
   (outside printable ASCII, or with surrounding whitespace) is refused before a connection is
   opened, naming where it came from, and a decorator refuses one when it is applied.
-  `CellaflowSaver` refuses an `api_key` given beside a `client`, which would have ignored it.
-  Sending a key without TLS to a host other than this machine logs a warning once per target.
+  `CellaflowSaver` refuses an `api_key` given beside a `client`, which would have ignored it. A
+  key is not sent without TLS to a host other than this machine: that is refused unless
+  `CELLAFLOW_ALLOW_PLAINTEXT_KEY=true` or `allow_plaintext_key=True` allows it, for a network you
+  trust, and an allowed one logs a warning once per target.
 
 ## 0.9.0
 

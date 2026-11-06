@@ -56,7 +56,13 @@ after(() => {
 });
 
 // Every variable a test sets, so none leaks into the next.
-const ENV = ["CELLAFLOW_API_KEY", "CELLAFLOW_AUTH_TOKEN", "AUTH_TOKEN", "API_KEY"];
+const ENV = [
+  "CELLAFLOW_API_KEY",
+  "CELLAFLOW_ALLOW_PLAINTEXT_KEY",
+  "CELLAFLOW_AUTH_TOKEN",
+  "AUTH_TOKEN",
+  "API_KEY",
+];
 beforeEach(() => {
   received.length = 0;
   expected = KEY;
@@ -145,13 +151,48 @@ test("the key never appears in a refusal or in the client's own properties", asy
   }
 });
 
-test("sending a key without TLS to another host warns once", (t) => {
+test("a key is not sent without TLS to another host unless allowed", () => {
+  // Forgetting TLS must not be how a key crosses the network, as forgetting a
+  // token cannot be how the engine serves an open port.
+  const refusal = (err) =>
+    /refused-host\.example\.com:50051 without TLS/.test(err.message) &&
+    /CELLAFLOW_ALLOW_PLAINTEXT_KEY/.test(err.message) &&
+    !err.message.includes(KEY);
+  assert.throws(() => new CellaflowClient({ target: "refused-host.example.com:50051", apiKey: KEY }), refusal);
+  // The key from the environment is held to the same rule.
+  process.env.CELLAFLOW_API_KEY = KEY;
+  assert.throws(() => new CellaflowClient({ target: "refused-host.example.com:50051" }), refusal);
+  // No key, nothing to protect; TLS, nothing to refuse.
+  delete process.env.CELLAFLOW_API_KEY;
+  new CellaflowClient({ target: "refused-host.example.com:50051" });
+  new CellaflowClient({ target: "refused-host.example.com:50051", secure: true, apiKey: KEY });
+});
+
+test("the variable allows it the way the engine reads its opt-out, and the option decides over it", (t) => {
+  t.mock.method(console, "warn", () => {});
+  for (const value of ["true", "TRUE", "1", "yes", " true "]) {
+    process.env.CELLAFLOW_ALLOW_PLAINTEXT_KEY = value;
+    new CellaflowClient({ target: "allowed.example.com:50051", apiKey: KEY });
+  }
+  for (const value of ["", "false", "0", "no", "on"]) {
+    process.env.CELLAFLOW_ALLOW_PLAINTEXT_KEY = value;
+    assert.throws(() => new CellaflowClient({ target: "allowed.example.com:50051", apiKey: KEY }), /without TLS/);
+  }
+  process.env.CELLAFLOW_ALLOW_PLAINTEXT_KEY = "true";
+  assert.throws(
+    () => new CellaflowClient({ target: "allowed.example.com:50051", apiKey: KEY, allowPlaintextKey: false }),
+    /without TLS/,
+  );
+});
+
+test("an allowed plaintext key warns once per target", (t) => {
   const warnings = [];
   t.mock.method(console, "warn", (message) => warnings.push(message));
-  // Each warning test uses its own hosts: a target is looked at once per process,
-  // and nothing resets that between tests.
-  new CellaflowClient({ target: "warns-once.example.com:50051", apiKey: KEY });
-  new CellaflowClient({ target: "warns-once.example.com:50051", apiKey: KEY });
+  // Each test uses its own hosts: a target warns once per process, and nothing
+  // resets that between tests.
+  const options = { target: "warns-once.example.com:50051", apiKey: KEY, allowPlaintextKey: true };
+  new CellaflowClient(options);
+  new CellaflowClient(options);
   new CellaflowClient({ target: "localhost:50051", apiKey: KEY });
   new CellaflowClient({ target: "tls.example.com:50051", secure: true, apiKey: KEY });
   assert.equal(warnings.length, 1);
@@ -159,7 +200,7 @@ test("sending a key without TLS to another host warns once", (t) => {
   assert.ok(!warnings[0].includes(KEY));
 });
 
-test("a local target in any form gets no warning", (t) => {
+test("a local target in any form is allowed without a warning", (t) => {
   const warnings = [];
   t.mock.method(console, "warn", (message) => warnings.push(message));
   // A bare `::1` is not a URL Connect accepts, so it is not a target here.
@@ -178,16 +219,35 @@ test("a local target in any form gets no warning", (t) => {
   assert.deepEqual(warnings, []);
 });
 
-test("another host gets a warning, in any form", (t) => {
-  const warnings = [];
-  t.mock.method(console, "warn", (message) => warnings.push(message));
-  const remote = ["[::ffff:10.0.0.5]:50051", "[2001:db8::1]:50051"];
-  for (const target of remote) new CellaflowClient({ target, apiKey: KEY });
-  assert.equal(warnings.length, remote.length);
+test("another host is refused, in any form, judged as the transport parses it", () => {
+  for (const remote of [
+    "[::ffff:10.0.0.5]:50051",
+    "[2001:db8::1]:50051",
+    // The URL's host is evil.com; `localhost:50051` is userinfo.
+    "localhost:50051@evil.com",
+    "localhost@evil.com:50051",
+  ]) {
+    assert.throws(() => new CellaflowClient({ target: remote, apiKey: KEY }), /without TLS/, remote);
+  }
+});
+
+test("taskLease refuses a key it could not send when it is made, not on the first call", () => {
+  const fn = async () => {};
+  assert.throws(() => taskLease(fn, { key: "task:1", workerId: "w", apiKey: "MARKER\n" }), /the apiKey option/);
+  assert.throws(
+    () => taskLease(fn, { key: "task:1", workerId: "w", target: "remote.example.com:50051", apiKey: KEY }),
+    /without TLS/,
+  );
+  // A blank key means none, so there is nothing to refuse.
+  taskLease(fn, { key: "task:1", workerId: "w", target: "remote.example.com:50051", apiKey: " " });
 });
 
 test("the key helpers are exported from the package", async () => {
   const sdk = await import("../dist/index.js");
   assert.equal(sdk.resolveApiKey, resolveApiKey);
   assert.equal(sdk.API_KEY_ENV_VAR, "CELLAFLOW_API_KEY");
+  assert.equal(sdk.ALLOW_PLAINTEXT_KEY_ENV_VAR, "CELLAFLOW_ALLOW_PLAINTEXT_KEY");
+  // The checks themselves are not public API.
+  assert.equal(sdk.checkApiKey, undefined);
+  assert.equal(sdk.checkApiKeyOption, undefined);
 });

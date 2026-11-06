@@ -1,7 +1,7 @@
+import functools
 import ipaddress
 import logging
 import os
-import re
 import threading
 from collections import namedtuple
 from typing import Any, Dict, List, Optional, Tuple, cast
@@ -23,9 +23,13 @@ logger = logging.getLogger(__name__)
 #: then be sent to the engine.
 API_KEY_ENV_VAR = "CELLAFLOW_API_KEY"
 
-_HEADER_SAFE = re.compile(r"[\x20-\x7e]*")
-_checked_plaintext: "set[str]" = set()
-_checked_lock = threading.Lock()
+#: Set to `true` (or `1`, `yes`) to allow sending a key without TLS to another
+#: host, on a network you trust. Without it, that is refused, as the engine
+#: refuses to serve without a token unless told to.
+ALLOW_PLAINTEXT_KEY_ENV_VAR = "CELLAFLOW_ALLOW_PLAINTEXT_KEY"
+
+_warned_plaintext: "set[str]" = set()
+_warned_lock = threading.Lock()
 
 
 def _api_key_and_source(api_key: Optional[str]) -> Tuple[Optional[str], str]:
@@ -48,7 +52,8 @@ def resolve_api_key(api_key: Optional[str] = None) -> Optional[str]:
 def _check_api_key(api_key: str, source: str) -> None:
     """Refuses a key gRPC cannot send as a header, naming where it came from
     but never what it is."""
-    if api_key != api_key.strip() or not _HEADER_SAFE.fullmatch(api_key):
+    printable_ascii = api_key.isascii() and api_key.isprintable()
+    if api_key != api_key.strip() or not printable_ascii:
         raise ValueError(
             f"The Cellaflow API key from {source} cannot be sent in a header: it "
             f"has surrounding whitespace or a character outside printable ASCII "
@@ -56,12 +61,18 @@ def _check_api_key(api_key: str, source: str) -> None:
         )
 
 
-def _check_api_key_argument(api_key: Optional[str]) -> None:
-    """Refuses an `api_key` argument gRPC cannot send. Decorators call it when
+def _check_api_key_argument(api_key: Optional[str], target: str, secure: bool) -> None:
+    """Refuses an `api_key` argument that a client would refuse: one gRPC cannot
+    send, or one bound for another host without TLS. Decorators call it when
     they are applied, so a bad key fails at import rather than on the first
     call, after whatever ran before it."""
-    if api_key is not None and api_key.strip():
-        _check_api_key(api_key, "the api_key argument")
+    if api_key is None:
+        return
+    api_key, source = _api_key_and_source(api_key)
+    if api_key is not None:
+        _check_api_key(api_key, source)
+        if not secure:
+            _check_plaintext(target, None)
 
 
 def _host_is_local(host: str) -> bool:
@@ -88,6 +99,7 @@ def _host_of(address: str) -> str:
     return address.rsplit(":", 1)[0]
 
 
+@functools.lru_cache(maxsize=256)
 def _is_local(target: str) -> bool:
     """Whether every address `target` can reach is this machine, in any form
     gRPC accepts."""
@@ -119,7 +131,11 @@ class _CallDetails(
     ),
     grpc.ClientCallDetails,  # type: ignore[misc]
 ):
-    pass
+    """The call details with the key added. grpc keeps one in a frame of every
+    failed call's traceback, so its `repr` leaves the metadata out."""
+
+    def __repr__(self) -> str:
+        return f"_CallDetails(method={self.method!r}, metadata=<not shown>)"
 
 
 class _BearerKey(
@@ -169,17 +185,35 @@ class _BearerKey(
         return continuation(self._with_key(details), requests)
 
 
-def _warn_if_sent_in_the_clear(target: str) -> None:
-    # Each target is looked at once: `@workflow` builds a client per call.
-    with _checked_lock:
-        if target in _checked_plaintext:
-            return
-        _checked_plaintext.add(target)
+def _plaintext_key_allowed(allow_plaintext_key: Optional[bool]) -> bool:
+    """`allow_plaintext_key` if given, else `CELLAFLOW_ALLOW_PLAINTEXT_KEY`,
+    read the way the engine reads `CELLAFLOW_ALLOW_UNAUTHENTICATED`."""
+    if allow_plaintext_key is not None:
+        return allow_plaintext_key
+    value = os.environ.get(ALLOW_PLAINTEXT_KEY_ENV_VAR, "")
+    return value.strip().lower() in ("1", "true", "yes")
+
+
+def _check_plaintext(target: str, allow_plaintext_key: Optional[bool]) -> None:
+    """Refuses to send a key without TLS to anything but this machine, unless
+    allowed, so forgetting TLS cannot be how a key crosses the network. When
+    allowed, warns once per target."""
     if _is_local(target):
         return
+    if not _plaintext_key_allowed(allow_plaintext_key):
+        raise ValueError(
+            f"Refusing to send the Cellaflow API key to {target} without TLS, "
+            f"where anyone on the path could read it. Pass secure=True, or, on a "
+            f"network you trust, set {ALLOW_PLAINTEXT_KEY_ENV_VAR}=true or pass "
+            f"allow_plaintext_key=True to CellaflowClient."
+        )
+    with _warned_lock:
+        if target in _warned_plaintext:
+            return
+        _warned_plaintext.add(target)
     logger.warning(
-        "Cellaflow: sending an API key to %s without TLS, so anyone on the path "
-        "can read it. Pass secure=True to send it encrypted.",
+        "Cellaflow: sending an API key to %s without TLS, as allowed, so anyone "
+        "on the path can read it.",
         target,
     )
 
@@ -194,6 +228,10 @@ class CellaflowClient:
     When it is not given, it is read from `CELLAFLOW_API_KEY`; with neither,
     calls go unauthenticated, which an engine started without a token accepts.
 
+    A key is not sent without TLS to anything but this machine: the client
+    refuses it unless `allow_plaintext_key=True` is passed or
+    `CELLAFLOW_ALLOW_PLAINTEXT_KEY` is `true`, for a network you trust.
+
     The SDK never puts the key in a log message, an exception message or a
     `repr`. grpc's own stack frames do hold the outgoing header, though, so a
     tool that records a traceback's local variables (loguru's `diagnose`,
@@ -206,6 +244,7 @@ class CellaflowClient:
         target: str = "localhost:50051",
         secure: bool = False,
         api_key: Optional[str] = None,
+        allow_plaintext_key: Optional[bool] = None,
     ) -> None:
         # Checked before a channel is opened, so a refused key leaves none behind.
         # Held here only in a variable named `api_key`, which error reporters
@@ -215,7 +254,7 @@ class CellaflowClient:
         if api_key is not None:
             _check_api_key(api_key, source)
             if not secure:
-                _warn_if_sent_in_the_clear(target)
+                _check_plaintext(target, allow_plaintext_key)
         if secure:
             channel = grpc.secure_channel(target, grpc.ssl_channel_credentials())
         else:

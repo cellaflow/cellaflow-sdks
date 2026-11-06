@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { checkApiKeyOption } from "./apikey.js";
 import { CellaflowClient } from "./client.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { LeaseHeartbeat } from "./lease.js";
@@ -322,12 +323,17 @@ export async function executionLease<T>(
  *   { workerId: "worker-1", key: (orderId) => `order:${orderId}` },
  * );
  * ```
+ *
+ * An `apiKey` that cannot be sent, or would go to another host without TLS, is
+ * refused here, when the wrapper is made, not on its first call.
  */
 export function taskLease<A extends unknown[], R>(
   fn: (...args: A) => Promise<R>,
   options: ExecutionLeaseOptions & { key: string | ((...args: A) => string) },
 ): (...args: A) => Promise<R> {
   const { key, ...leaseOptions } = options;
+  // A key that cannot be sent fails here, not on the first call.
+  checkApiKeyOption(leaseOptions);
   return async function leasedTask(...args: A): Promise<R> {
     const resolved = typeof key === "function" ? key(...args) : key;
     return executionLease(resolved, leaseOptions, () => fn(...args));

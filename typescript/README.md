@@ -58,10 +58,11 @@ await durableTools(threadId, { target: "engine.example.com:50051", secure: true,
 ```
 
 - **Where it comes from:** `apiKey` if given, else `CELLAFLOW_API_KEY`. A blank value means no key. That is the only variable the SDK reads. It never reads the engine's older name, `CELLAFLOW_AUTH_TOKEN`, or the generic `AUTH_TOKEN` and `API_KEY`: a variable that generic often holds another service's secret.
-- **On the engine:** engine releases up to 0.2.0 read their token from `CELLAFLOW_AUTH_TOKEN` first and fall back to `CELLAFLOW_API_KEY`, so if both are set on the engine, `CELLAFLOW_AUTH_TOKEN` wins. Set only `CELLAFLOW_API_KEY` there.
+- **On the engine:** the engine reads its token from `CELLAFLOW_AUTH_TOKEN` before `CELLAFLOW_API_KEY`, and a blank `CELLAFLOW_AUTH_TOKEN` counts as set: the engine then has no token at all. Leave `CELLAFLOW_AUTH_TOKEN` unset there, not blank (Compose writes a blank one for `${VAR}` when the variable is unset), and set only `CELLAFLOW_API_KEY`.
 - **Refused early:** a key that cannot be sent as a header (surrounding whitespace, or a character outside printable ASCII) is refused when the client is built, naming where it came from.
 - **How it's sent:** as `authorization: Bearer <key>` on every call.
-- **Without TLS:** sending a key to a host other than localhost with `secure: false` warns once per target, since anyone on the path can read it.
+- **Without TLS:** a key is never sent in plaintext to anything but this machine unless you allow it. With `secure: false` and another host as the target, the client refuses, naming the target, so forgetting TLS cannot be how a key crosses the network. On a network you trust (a Compose network, a Kubernetes service), set `CELLAFLOW_ALLOW_PLAINTEXT_KEY=true`, or pass `allowPlaintextKey: true` to `CellaflowClient`; each target then warns once.
+- **Your own CA:** `secure: true` trusts Node's root certificates. For an engine whose certificate comes from your own CA, or is self-signed, start Node with `NODE_EXTRA_CA_CERTS=/path/to/ca.pem`, which adds it to them.
 
 ## Coordinating agents across sessions
 
