@@ -2,6 +2,20 @@
 
 All notable changes to the CellaFlow TypeScript SDK.
 
+## Unreleased
+
+### Added
+
+- **An API key, for an engine that requires a token.** `CellaflowClient`, `durableTools`,
+  `executionLease` and `taskLease` take `apiKey`, sent as `authorization: Bearer <key>` on every
+  call. Without it, the key is read from `CELLAFLOW_API_KEY`, so existing code works against a
+  secured engine with no change; a blank value means no key, and no other variable is read. Before
+  this, the SDK could only talk to an engine running unauthenticated. The SDK never puts the key in
+  an error message. A key that cannot be a header is refused, naming where it came from, and
+  `taskLease` refuses one when it is made. A key is not sent without TLS to a host other than this
+  machine: that is refused unless `CELLAFLOW_ALLOW_PLAINTEXT_KEY=true` or `allowPlaintextKey: true`
+  allows it, for a network you trust, and an allowed one warns once per target.
+
 ## 0.9.0
 
 0.8.1 was prepared but never published; its changes are part of 0.9.0.

@@ -64,7 +64,7 @@ import logging
 import warnings
 from typing import Any, AsyncIterator, Callable, Iterator, Optional, Union
 
-from cellaflow.client import CellaflowClient
+from cellaflow.client import CellaflowClient, _check_api_key_argument
 from cellaflow.lease import LeaseHeartbeat
 from cellaflow.v1 import idempotency_pb2
 
@@ -189,6 +189,7 @@ def execution_lease(
     worker_id: str,
     target: str = "localhost:50051",
     secure: bool = False,
+    api_key: Optional[str] = None,
     ttl_ms: int = _DEFAULT_TTL_MS,
     heartbeat_interval_ms: int = _DEFAULT_HEARTBEAT_INTERVAL_MS,
     on_lease_lost: Optional[Callable[[], None]] = None,
@@ -221,6 +222,9 @@ def execution_lease(
         CellaFlow engine address. Defaults to ``localhost:50051``.
     secure:
         Whether to use TLS. Defaults to ``False``.
+    api_key:
+        Authenticates with the engine. When omitted it is read from
+        ``CELLAFLOW_API_KEY``. See :class:`~cellaflow.client.CellaflowClient`.
     ttl_ms:
         Lease time-to-live in milliseconds, applied to the initial acquisition
         and to every renewal. After a crash, the task becomes reclaimable once
@@ -239,7 +243,7 @@ def execution_lease(
     LeaseNotAcquired
         If the lease cannot be acquired.
     """
-    client = CellaflowClient(target=target, secure=secure)
+    client = CellaflowClient(target=target, secure=secure, api_key=api_key)
     try:
         resp = _acquire(client, key, worker_id, ttl_ms)
         token = resp.fencing_token
@@ -303,6 +307,7 @@ async def async_execution_lease(
     worker_id: str,
     target: str = "localhost:50051",
     secure: bool = False,
+    api_key: Optional[str] = None,
     ttl_ms: int = _DEFAULT_TTL_MS,
     heartbeat_interval_ms: int = _DEFAULT_HEARTBEAT_INTERVAL_MS,
     on_lease_lost: Optional[Callable[[], None]] = None,
@@ -320,7 +325,7 @@ async def async_execution_lease(
 
     Parameters
     ----------
-    key, worker_id, target, secure, ttl_ms, heartbeat_interval_ms:
+    key, worker_id, target, secure, api_key, ttl_ms, heartbeat_interval_ms:
         Same as :func:`execution_lease`.
     on_lease_lost:
         Optional callback invoked when the lease is lost. This is a
@@ -339,7 +344,7 @@ async def async_execution_lease(
     asyncio.CancelledError
         If the lease is lost mid-execution and ``preempt`` is ``True``.
     """
-    client = CellaflowClient(target=target, secure=secure)
+    client = CellaflowClient(target=target, secure=secure, api_key=api_key)
     try:
         # Offload sync gRPC call to a thread
         resp = await asyncio.to_thread(_acquire, client, key, worker_id, ttl_ms)
@@ -414,6 +419,7 @@ def task_lease(
     worker_id: str,
     target: str = "localhost:50051",
     secure: bool = False,
+    api_key: Optional[str] = None,
     ttl_ms: int = _DEFAULT_TTL_MS,
     heartbeat_interval_ms: int = _DEFAULT_HEARTBEAT_INTERVAL_MS,
     on_lease_lost: Optional[Callable[[], None]] = None,
@@ -441,8 +447,11 @@ def task_lease(
     key:
         The lease key, or a callable ``(*args, **kwargs) -> str`` building it
         from the call's arguments.
-    worker_id, target, secure, ttl_ms, heartbeat_interval_ms, on_lease_lost:
-        Same as :func:`execution_lease`.
+    worker_id, target, secure, api_key, ttl_ms, heartbeat_interval_ms,
+    on_lease_lost:
+        Same as :func:`execution_lease`. A key that cannot be sent, or would go
+        to another host without TLS, is refused here, when the decorator is
+        applied.
     preempt:
         Async functions only; same as :func:`async_execution_lease`. Ignored for
         synchronous functions, which cannot be preempted.
@@ -452,6 +461,8 @@ def task_lease(
     LeaseNotAcquired
         If the lease cannot be acquired, raised in place of calling the function.
     """
+
+    _check_api_key_argument(api_key, target, secure)
 
     def _key_for(args: Any, kwargs: Any) -> str:
         if callable(key):
@@ -468,6 +479,7 @@ def task_lease(
                     worker_id=worker_id,
                     target=target,
                     secure=secure,
+                    api_key=api_key,
                     ttl_ms=ttl_ms,
                     heartbeat_interval_ms=heartbeat_interval_ms,
                     on_lease_lost=on_lease_lost,
@@ -484,6 +496,7 @@ def task_lease(
                 worker_id=worker_id,
                 target=target,
                 secure=secure,
+                api_key=api_key,
                 ttl_ms=ttl_ms,
                 heartbeat_interval_ms=heartbeat_interval_ms,
                 on_lease_lost=on_lease_lost,

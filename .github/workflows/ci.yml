@@ -123,21 +123,35 @@ jobs:
     env:
       ENGINE_IMAGE: ghcr.io/cellaflow/cellaflow:0.2.0
       CELLAFLOW_TARGET: localhost:50051
+      # A second engine that requires a token, for the API key tests. The token
+      # guards a throwaway container on the runner, nothing else.
+      CELLAFLOW_AUTH_TARGET: localhost:50052
+      CELLAFLOW_AUTH_TEST_KEY: integration-test-key
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Start the engine
+      - name: Start the engines
         run: |
           docker run -d --name engine -p 50051:50051 \
             -e CELLAFLOW_ALLOW_UNAUTHENTICATED=true "$ENGINE_IMAGE"
-          for i in $(seq 1 60); do
-            if nc -z localhost 50051; then exit 0; fi
-            sleep 1
+          docker run -d --name engine-auth -p 50052:50051 \
+            -e CELLAFLOW_API_KEY="$CELLAFLOW_AUTH_TEST_KEY" "$ENGINE_IMAGE"
+          # An open port only means Docker's proxy is listening. The image's own
+          # healthcheck polls /health/ready, so wait for that, and stop at once
+          # with the engine's log if it exits instead.
+          for name in engine engine-auth; do
+            for i in $(seq 1 60); do
+              state=$(docker inspect -f '{{.State.Status}} {{.State.Health.Status}}' "$name")
+              case "$state" in
+                "running healthy") break ;;
+                exited*|dead*) docker logs "$name"; exit 1 ;;
+              esac
+              if [ "$i" = 60 ]; then docker logs "$name"; exit 1; fi
+              sleep 2
+            done
           done
-          docker logs engine
-          exit 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -171,4 +185,7 @@ jobs:
 
       - name: Engine logs
         if: failure()
-        run: docker logs engine
+        run: |
+          # Each on its own, so one missing container does not hide the other's log.
+          docker logs engine || true
+          docker logs engine-auth || true
