@@ -3,8 +3,10 @@ it must never appear."""
 
 import asyncio
 import logging
+import socket
+import threading
 from concurrent import futures
-from typing import Any, Iterator, List, Tuple
+from typing import Any, Iterator, List, Optional, Tuple
 
 import grpc
 import pytest
@@ -41,9 +43,7 @@ class Recorder:
         )
 
 
-@pytest.fixture
-def engine() -> Iterator[Tuple[str, Recorder]]:
-    recorder = Recorder()
+def _serve(address: str, recorder: Recorder) -> Tuple[Any, int]:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     handler = grpc.method_handlers_generic_handler(
         "cellaflow.v1.WorkflowEngineService",
@@ -56,8 +56,15 @@ def engine() -> Iterator[Tuple[str, Recorder]]:
         },
     )
     server.add_generic_rpc_handlers((handler,))
-    port = server.add_insecure_port("localhost:0")
+    port = server.add_insecure_port(address)
     server.start()
+    return server, port
+
+
+@pytest.fixture
+def engine() -> Iterator[Tuple[str, Recorder]]:
+    recorder = Recorder()
+    server, port = _serve("localhost:0", recorder)
     try:
         yield f"localhost:{port}", recorder
     finally:
@@ -146,13 +153,12 @@ def test_a_decorator_refuses_a_bad_key_when_it_is_applied() -> None:
         decorators.workflow(api_key="MARKER\n")
     with pytest.raises(ValueError, match="the api_key argument"):
         task_lease("task:1", worker_id="w", api_key="MARKER\n")
-    # Nor bound for another host without TLS.
+    # Whether a key may go without TLS depends on the environment when the
+    # client is built (an opt-in set by load_dotenv after import, say), so
+    # that is not decided at import.
     remote = "engine.example.com:50051"
-    with pytest.raises(ValueError, match="without TLS"):
-        decorators.workflow(target=remote, api_key=KEY)
-    with pytest.raises(ValueError, match="without TLS"):
-        task_lease("task:1", worker_id="w", target=remote, api_key=KEY)
-    decorators.workflow(target=remote, secure=True, api_key=KEY)
+    decorators.workflow(target=remote, api_key=KEY)
+    task_lease("task:1", worker_id="w", target=remote, api_key=KEY)
     # A blank key means none, so there is nothing to refuse.
     decorators.workflow(api_key="")
     task_lease("task:1", worker_id="w", target=remote, api_key="  ")
@@ -255,7 +261,27 @@ def test_every_kind_of_call_gets_the_key() -> None:
         assert KEY not in repr(sent)  # grpc keeps it in a failed call's frame
 
 
-def test_the_key_never_appears_in_repr_logs_or_a_refusal(
+def test_the_key_replaces_an_authorization_the_caller_set() -> None:
+    """The engine reads only the first `authorization`, so one the caller set
+    would otherwise win over the key."""
+    from cellaflow.client import _BearerKey
+
+    details = client_module._CallDetails(
+        "/m",
+        None,
+        [("Authorization", "Bearer other"), ("x-trace", "1")],
+        None,
+        None,
+        None,
+    )
+    sent = _BearerKey(KEY)._with_key(details)
+    assert [v for k, v in sent.metadata if k.lower() == "authorization"] == [
+        f"Bearer {KEY}"
+    ]
+    assert ("x-trace", "1") in sent.metadata
+
+
+def test_the_key_never_appears_in_our_reprs_logs_or_refusals(
     engine: Tuple[str, Recorder], caplog: Any
 ) -> None:
     target, recorder = engine
@@ -271,8 +297,7 @@ def test_the_key_never_appears_in_repr_logs_or_a_refusal(
             local.start_session("wf", "1.0.0")
     for text in (
         repr(client),
-        repr(vars(client)),
-        repr(vars(local)),
+        repr(local.channel._interceptor),  # the object that holds the key
         caplog.text,
         str(refused.value),
         repr(refused.value),
@@ -357,6 +382,9 @@ def test_an_allowed_plaintext_key_warns_once_per_target(caplog: Any) -> None:
         "127.0.0.2:50051",
         "[::ffff:127.0.0.1]:50051",
         "ipv6:[::ffff:127.0.0.1]:50051",
+        "ipv4:///127.0.0.1:50051",
+        "DNS:///localhost:50051",
+        "unix-abstract:cellaflow",
     ],
 )
 def test_a_local_target_in_any_form_is_allowed_without_a_warning(
@@ -383,6 +411,87 @@ def test_a_target_that_can_reach_another_host_is_refused(target: str) -> None:
     enough for the key to cross the network."""
     with pytest.raises(ValueError, match="without TLS"):
         CellaflowClient(target=target, api_key=KEY)
+
+
+def test_a_key_to_a_local_target_bypasses_a_proxy(
+    engine: Tuple[str, Recorder], monkeypatch: Any
+) -> None:
+    """gRPC sends even `localhost` through `https_proxy`, which would put the
+    key on the network in plaintext."""
+    target, recorder = engine
+    proxy = socket.socket()
+    proxy.bind(("127.0.0.1", 0))
+    proxy.listen(1)
+    proxy.settimeout(5)
+    reached: List[bytes] = []
+
+    def accept() -> None:
+        try:
+            connection, _ = proxy.accept()
+            reached.append(connection.recv(200))
+            connection.close()
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=accept, daemon=True)
+    thread.start()
+    monkeypatch.setenv("https_proxy", f"http://127.0.0.1:{proxy.getsockname()[1]}")
+    monkeypatch.setenv("grpc_proxy", f"http://127.0.0.1:{proxy.getsockname()[1]}")
+    try:
+        CellaflowClient(target=target, api_key=KEY).start_session("wf", "1.0.0")
+    finally:
+        proxy.close()
+        thread.join(timeout=5)
+    assert ("authorization", f"Bearer {KEY}") in recorder.metadata[0]
+    assert reached == []
+
+
+def _lan_address() -> Optional[str]:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("10.255.255.255", 1))
+            address = str(probe.getsockname()[0])
+    except OSError:
+        return None
+    return None if address.startswith("127.") else address
+
+
+def test_a_target_that_only_looks_local_fails_to_connect_and_sends_nothing(
+    monkeypatch: Any,
+) -> None:
+    """The name is only a first answer; gRPC checks the real peer. A target
+    judged local that is not (a resolver answering for `localhost` with another
+    host, say) must not get the key."""
+    lan = _lan_address()
+    if lan is None:
+        pytest.skip("needs a non-loopback address on this machine")
+    recorder = Recorder()
+    server, port = _serve("0.0.0.0:0", recorder)
+    try:
+        monkeypatch.setattr(client_module, "_is_local", lambda target: True)
+        client = CellaflowClient(target=f"{lan}:{port}", api_key=KEY)
+        with pytest.raises(grpc.RpcError) as refused:
+            client.stub.StartSession(
+                service_pb2.StartSessionRequest(workflow_id="wf", version="1"),
+                timeout=5,
+            )
+    finally:
+        server.stop(None)
+    assert refused.value.code() == grpc.StatusCode.UNAVAILABLE
+    assert recorder.metadata == []
+
+
+def test_the_refusal_names_the_variable_every_entry_point_reads(
+    monkeypatch: Any,
+) -> None:
+    """Only CellaflowClient takes the argument; the variable works everywhere."""
+    with pytest.raises(ValueError) as refused:
+        CellaflowClient(target="engine.example.com:50051", api_key=KEY)
+    message = str(refused.value)
+    assert message.index("CELLAFLOW_ALLOW_PLAINTEXT_KEY=true") < message.index(
+        "allow_plaintext_key=True"
+    )
+    assert "building a CellaflowClient yourself" in message
 
 
 def test_the_key_helpers_are_exported_from_the_package() -> None:

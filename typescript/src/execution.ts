@@ -130,7 +130,7 @@ export interface ExecutionLeaseOptions {
   target?: string;
   secure?: boolean;
   /** Authenticates with the engine. See {@link CellaflowClientOptions.apiKey}. */
-  apiKey?: string;
+  apiKey?: string | null;
   /**
    * How long the lease lasts without a renewal. Each renewal extends it by the
    * same amount. Defaults to 30 000.
@@ -324,8 +324,9 @@ export async function executionLease<T>(
  * );
  * ```
  *
- * An `apiKey` that cannot be sent, or would go to another host without TLS, is
- * refused here, when the wrapper is made, not on its first call.
+ * An `apiKey` that cannot be sent as a header is refused here, when the wrapper
+ * is made, not on its first call. Whether a key may go without TLS is decided
+ * when each call builds its client.
  */
 export function taskLease<A extends unknown[], R>(
   fn: (...args: A) => Promise<R>,

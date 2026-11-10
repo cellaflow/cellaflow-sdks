@@ -449,9 +449,8 @@ def task_lease(
         from the call's arguments.
     worker_id, target, secure, api_key, ttl_ms, heartbeat_interval_ms,
     on_lease_lost:
-        Same as :func:`execution_lease`. A key that cannot be sent, or would go
-        to another host without TLS, is refused here, when the decorator is
-        applied.
+        Same as :func:`execution_lease`. An ``api_key`` that cannot be sent as
+        a header is refused here, when the decorator is applied.
     preempt:
         Async functions only; same as :func:`async_execution_lease`. Ignored for
         synchronous functions, which cannot be preempted.
@@ -462,7 +461,7 @@ def task_lease(
         If the lease cannot be acquired, raised in place of calling the function.
     """
 
-    _check_api_key_argument(api_key, target, secure)
+    _check_api_key_argument(api_key)
 
     def _key_for(args: Any, kwargs: Any) -> str:
         if callable(key):

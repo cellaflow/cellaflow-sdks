@@ -24,16 +24,18 @@ export const ALLOW_PLAINTEXT_KEY_ENV_VAR = "CELLAFLOW_ALLOW_PLAINTEXT_KEY";
  * The key to send and where it came from: `apiKey` if given, else
  * `CELLAFLOW_API_KEY`. A blank value means no key.
  */
-export function apiKeyAndSource(apiKey?: string): [string | undefined, string] {
+export function apiKeyAndSource(apiKey?: string | null): [string | undefined, string] {
+  // `null` reads the variable too, as `None` does in Python: a caller passing
+  // `config.apiKey ?? null` means "no key of my own", not "no key at all".
   const [value, source] =
-    apiKey !== undefined
+    apiKey != null
       ? [apiKey, "the apiKey option"]
       : [process.env[API_KEY_ENV_VAR], API_KEY_ENV_VAR];
   return [value?.trim() ? value : undefined, source];
 }
 
 /** The API key to send: `apiKey` if given, else `CELLAFLOW_API_KEY`. */
-export function resolveApiKey(apiKey?: string): string | undefined {
+export function resolveApiKey(apiKey?: string | null): string | undefined {
   return apiKeyAndSource(apiKey)[0];
 }
 
@@ -52,33 +54,25 @@ export function checkApiKey(apiKey: string, source: string): void {
 }
 
 /**
- * Whether `host` is this machine: `localhost`, any of 127.0.0.0/8, `::1`, or a
- * 127 address mapped into IPv6 (`::ffff:127.0.0.1`), as the Python SDK decides.
- */
-function hostIsLocal(host: string): boolean {
-  const name = host.toLowerCase().replace(/\.+$/, "");
-  if (name === "localhost") return true;
-  if (isIP(name) === 4) return name.startsWith("127.");
-  if (isIP(name) !== 6) return false;
-  // The URL parser writes every spelling of an IPv6 address one way: `[::1]`,
-  // and `[::ffff:7fxx:xxxx]` for a mapped 127 address.
-  const normalised = new URL(`http://[${name}]`).hostname;
-  return normalised === "[::1]" || /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(normalised);
-}
-
-/**
- * Whether `target` names this machine. Parsed exactly as the transport parses
- * it, as the host of `http://<target>`, so URL syntax such as
- * `localhost:50051@evil.com` is judged by the host the key would go to.
+ * Whether `target` names this machine: `localhost`, any of 127.0.0.0/8, `::1`,
+ * or a 127 address mapped into IPv6 (`::ffff:127.0.0.1`), as the Python SDK
+ * decides. Parsed once, exactly as the transport parses it, as the host of
+ * `http://<target>`, so URL syntax such as `localhost:50051@evil.com` is judged
+ * by the host the key would go to. The parser lowercases the host, writes
+ * every IPv4 spelling as four decimals, and every IPv6 one in brackets the same
+ * way (`[::1]`, `[::ffff:7fxx:xxxx]`). Node's HTTP/2 client uses no proxy, so
+ * the host is where the connection goes.
  */
 function isLocal(target: string): boolean {
   let host: string;
   try {
-    host = new URL(`http://${target}`).hostname;
+    host = new URL(`http://${target}`).hostname.replace(/\.+$/, "");
   } catch {
     return false; // the transport refuses it too
   }
-  return hostIsLocal(host.startsWith("[") ? host.slice(1, -1) : host);
+  if (host === "localhost") return true;
+  if (isIP(host) === 4) return host.startsWith("127.");
+  return host === "[::1]" || /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(host);
 }
 
 function plaintextKeyAllowed(allowPlaintextKey?: boolean): boolean {
@@ -100,8 +94,8 @@ export function checkPlaintext(target: string, allowPlaintextKey?: boolean): voi
     throw new Error(
       `Refusing to send the Cellaflow API key to ${target} without TLS, where ` +
         "anyone on the path could read it. Pass secure: true, or, on a network " +
-        `you trust, set ${ALLOW_PLAINTEXT_KEY_ENV_VAR}=true or pass ` +
-        "allowPlaintextKey: true to CellaflowClient.",
+        `you trust, set ${ALLOW_PLAINTEXT_KEY_ENV_VAR}=true (or, building a ` +
+        "CellaflowClient yourself, pass allowPlaintextKey: true).",
     );
   }
   if (warnedPlaintext.has(target)) return;
@@ -113,17 +107,21 @@ export function checkPlaintext(target: string, allowPlaintextKey?: boolean): voi
 }
 
 /**
- * Refuses an `apiKey` option that a client would refuse, for wrappers that
- * build their client later, so a bad key fails when the wrapper is made.
+ * The key to send, refusing one that cannot be a header: the one place both
+ * rules are applied, for clients and wrappers alike.
  */
-export function checkApiKeyOption(options: {
-  apiKey?: string;
-  target?: string;
-  secure?: boolean;
-}): void {
-  if (options.apiKey === undefined) return;
-  const [apiKey, source] = apiKeyAndSource(options.apiKey);
-  if (apiKey === undefined) return;
-  checkApiKey(apiKey, source);
-  if (!options.secure) checkPlaintext(options.target ?? "localhost:50051");
+export function checkedApiKey(apiKey?: string | null): string | undefined {
+  const [value, source] = apiKeyAndSource(apiKey);
+  if (value !== undefined) checkApiKey(value, source);
+  return value;
+}
+
+/**
+ * Refuses an `apiKey` option that cannot be a header, for wrappers that build
+ * their client later, so a bad key fails when the wrapper is made. Whether a
+ * key may go without TLS depends on the environment when the client is built,
+ * so that is checked then.
+ */
+export function checkApiKeyOption(options: { apiKey?: string | null }): void {
+  if (options.apiKey != null) checkedApiKey(options.apiKey);
 }

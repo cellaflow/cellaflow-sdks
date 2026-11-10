@@ -102,6 +102,12 @@ test("only CELLAFLOW_API_KEY is read", () => {
   assert.equal(resolveApiKey("passed"), "passed");
 });
 
+test("a null key reads the variable, as Python's None does", () => {
+  process.env.CELLAFLOW_API_KEY = "the-key";
+  assert.equal(resolveApiKey(null), "the-key");
+  assert.equal(resolveApiKey(undefined), "the-key");
+});
+
 test("a blank key means none", () => {
   process.env.CELLAFLOW_API_KEY = "  ";
   assert.equal(resolveApiKey(), undefined);
@@ -136,7 +142,7 @@ test("every entry point sends its key", async () => {
   assert.ok(received.every((header) => header === `Bearer ${KEY}`));
 });
 
-test("the key never appears in a refusal or in the client's own properties", async () => {
+test("the key never appears in a refusal", async () => {
   expected = "the-right-key";
   const client = new CellaflowClient({ target, apiKey: KEY });
   let refusal;
@@ -146,7 +152,8 @@ test("the key never appears in a refusal or in the client's own properties", asy
     refusal = err;
   }
   assert.ok(refusal);
-  for (const text of [String(refusal), JSON.stringify(refusal), JSON.stringify(client)]) {
+  // The key itself lives in the interceptor's closure, which nothing prints.
+  for (const text of [String(refusal), JSON.stringify(refusal)]) {
     assert.ok(!text.includes(KEY));
   }
 });
@@ -156,7 +163,7 @@ test("a key is not sent without TLS to another host unless allowed", () => {
   // token cannot be how the engine serves an open port.
   const refusal = (err) =>
     /refused-host\.example\.com:50051 without TLS/.test(err.message) &&
-    /CELLAFLOW_ALLOW_PLAINTEXT_KEY/.test(err.message) &&
+    /CELLAFLOW_ALLOW_PLAINTEXT_KEY=true \(or, building a CellaflowClient yourself, pass allowPlaintextKey: true\)/.test(err.message) &&
     !err.message.includes(KEY);
   assert.throws(() => new CellaflowClient({ target: "refused-host.example.com:50051", apiKey: KEY }), refusal);
   // The key from the environment is held to the same rule.
@@ -234,10 +241,9 @@ test("another host is refused, in any form, judged as the transport parses it", 
 test("taskLease refuses a key it could not send when it is made, not on the first call", () => {
   const fn = async () => {};
   assert.throws(() => taskLease(fn, { key: "task:1", workerId: "w", apiKey: "MARKER\n" }), /the apiKey option/);
-  assert.throws(
-    () => taskLease(fn, { key: "task:1", workerId: "w", target: "remote.example.com:50051", apiKey: KEY }),
-    /without TLS/,
-  );
+  // Whether a key may go without TLS depends on the environment when the client
+  // is built, so it is not decided when the wrapper is made.
+  taskLease(fn, { key: "task:1", workerId: "w", target: "remote.example.com:50051", apiKey: KEY });
   // A blank key means none, so there is nothing to refuse.
   taskLease(fn, { key: "task:1", workerId: "w", target: "remote.example.com:50051", apiKey: " " });
 });

@@ -5,7 +5,7 @@ import {
   Transport,
 } from "@connectrpc/connect";
 import { createGrpcTransport } from "@connectrpc/connect-node";
-import { apiKeyAndSource, checkApiKey, checkPlaintext } from "./apikey.js";
+import { checkedApiKey, checkPlaintext } from "./apikey.js";
 import type { PartialMessage } from "@bufbuild/protobuf";
 import { WorkflowEngineService } from "./cellaflow/v1/service_connect.js";
 import type {
@@ -37,13 +37,14 @@ export interface CellaflowClientOptions {
    * Authenticates every call, sent as `authorization: Bearer <apiKey>`. When it
    * is not given, it is read from `CELLAFLOW_API_KEY`; with neither, calls go
    * unauthenticated, which an engine started without a token accepts. A blank
-   * string means no key, even with the variable set.
+   * string means no key, even with the variable set; `null` means the same as
+   * leaving it out.
    *
    * A key is not sent without TLS to anything but this machine: the client
    * refuses it unless this is `true`, or `CELLAFLOW_ALLOW_PLAINTEXT_KEY` is
    * `true`, for a network you trust.
    */
-  apiKey?: string;
+  apiKey?: string | null;
   /** Allows sending the key without TLS to another host. See `apiKey`. */
   allowPlaintextKey?: boolean;
 }
@@ -73,10 +74,9 @@ export class CellaflowClient {
     // Use http/https based on the secure flag
     const baseUrl = secure ? `https://${target}` : `http://${target}`;
 
-    const [apiKey, source] = apiKeyAndSource(options.apiKey);
+    const apiKey = checkedApiKey(options.apiKey);
     const interceptors: Interceptor[] = [];
     if (apiKey !== undefined) {
-      checkApiKey(apiKey, source);
       if (!secure) checkPlaintext(target, options.allowPlaintextKey);
       interceptors.push(bearerKey(apiKey));
     }

@@ -61,18 +61,23 @@ def _check_api_key(api_key: str, source: str) -> None:
         )
 
 
-def _check_api_key_argument(api_key: Optional[str], target: str, secure: bool) -> None:
-    """Refuses an `api_key` argument that a client would refuse: one gRPC cannot
-    send, or one bound for another host without TLS. Decorators call it when
-    they are applied, so a bad key fails at import rather than on the first
-    call, after whatever ran before it."""
-    if api_key is None:
-        return
+def _checked_api_key(api_key: Optional[str]) -> Optional[str]:
+    """The key to send, refusing one gRPC cannot send: the one place both rules
+    are applied, for clients and decorators alike."""
     api_key, source = _api_key_and_source(api_key)
     if api_key is not None:
         _check_api_key(api_key, source)
-        if not secure:
-            _check_plaintext(target, None)
+    return api_key
+
+
+def _check_api_key_argument(api_key: Optional[str]) -> None:
+    """Refuses an `api_key` argument gRPC cannot send. Decorators call it when
+    they are applied, so a bad key fails at import rather than on the first
+    call, after whatever ran before it. Whether a key may go without TLS
+    depends on the environment when the client is built, so that is checked
+    then, not at import."""
+    if api_key is not None:
+        _checked_api_key(api_key)
 
 
 def _host_is_local(host: str) -> bool:
@@ -99,22 +104,39 @@ def _host_of(address: str) -> str:
     return address.rsplit(":", 1)[0]
 
 
+def _without_authority(rest: str) -> str:
+    """What follows a scheme, without a `//authority/` part."""
+    if rest.startswith("//"):
+        start = rest.find("/", 2) + 1
+        return rest[start:] if start else rest[2:]
+    return rest
+
+
+def _is_unix(target: str) -> bool:
+    return target.lower().startswith(("unix:", "unix-abstract:"))
+
+
 @functools.lru_cache(maxsize=256)
 def _is_local(target: str) -> bool:
-    """Whether every address `target` can reach is this machine, in any form
-    gRPC accepts."""
-    if target.startswith(("unix:", "unix-abstract:")):
+    """Whether `target` names only this machine, in any form gRPC accepts.
+
+    A judgement from the name alone, so it is only the first, readable answer.
+    A name can look local and not be: gRPC sends even `localhost` through
+    `https_proxy`, and `dns://<server>/localhost` asks that server where
+    `localhost` is. A key sent on this judgement therefore goes on a channel
+    that checks the real peer; see `_plaintext_channel_for_key`.
+    """
+    if _is_unix(target):
         return True
-    rest = target
-    if rest.startswith("dns:"):
-        rest = rest[4:]
-        if rest.startswith("//"):  # dns://[authority]/host:port
-            start = rest.find("/", 2) + 1
-            rest = rest[start:] if start else rest[2:]
-    elif rest.startswith(("ipv4:", "ipv6:")):
+    scheme, sep, rest = target.partition(":")
+    scheme = scheme.lower()
+    if sep and scheme in ("ipv4", "ipv6"):
         # A list: gRPC may send calls to any of them.
-        return all(_host_is_local(_host_of(a)) for a in rest[5:].split(","))
-    return _host_is_local(_host_of(rest))
+        addresses = _without_authority(rest).split(",")
+        return all(_host_is_local(_host_of(a)) for a in addresses)
+    if sep and scheme == "dns":
+        return _host_is_local(_host_of(_without_authority(rest)))
+    return _host_is_local(_host_of(target))
 
 
 class _CallDetails(
@@ -154,7 +176,13 @@ class _BearerKey(
         return "<API key: not shown>"
 
     def _with_key(self, details: Any) -> Any:
-        metadata = list(details.metadata or []) + [self._header]
+        # Replaces any `authorization` the caller set: the engine reads only the
+        # first one, which would otherwise win over the key.
+        metadata = [
+            (name, value)
+            for name, value in details.metadata or []
+            if name.lower() != "authorization"
+        ] + [self._header]
         return _CallDetails(
             details.method,
             details.timeout,
@@ -194,28 +222,49 @@ def _plaintext_key_allowed(allow_plaintext_key: Optional[bool]) -> bool:
     return value.strip().lower() in ("1", "true", "yes")
 
 
-def _check_plaintext(target: str, allow_plaintext_key: Optional[bool]) -> None:
-    """Refuses to send a key without TLS to anything but this machine, unless
-    allowed, so forgetting TLS cannot be how a key crosses the network. When
-    allowed, warns once per target."""
+def _plaintext_channel_for_key(
+    target: str, allow_plaintext_key: Optional[bool]
+) -> grpc.Channel:
+    """A channel to send a key on without TLS, or a refusal.
+
+    A target that names this machine gets gRPC's local credentials, which
+    refuse the connection unless the peer really is this machine, and no proxy.
+    gRPC otherwise sends even `localhost` through `https_proxy`, putting the key
+    on the network in plaintext. A name that only looks local (a proxy, a
+    resolver that answers with another host) then fails to connect, and the key
+    is never sent.
+
+    Any other target is refused unless allowed, so forgetting TLS cannot be how
+    a key crosses the network. An allowed one warns once per target.
+    """
     if _is_local(target):
-        return
+        kind = (
+            grpc.LocalConnectionType.UDS
+            if _is_unix(target)
+            else grpc.LocalConnectionType.LOCAL_TCP
+        )
+        return grpc.secure_channel(
+            target,
+            grpc.local_channel_credentials(kind),
+            options=[("grpc.enable_http_proxy", 0)],
+        )
     if not _plaintext_key_allowed(allow_plaintext_key):
         raise ValueError(
             f"Refusing to send the Cellaflow API key to {target} without TLS, "
             f"where anyone on the path could read it. Pass secure=True, or, on a "
-            f"network you trust, set {ALLOW_PLAINTEXT_KEY_ENV_VAR}=true or pass "
-            f"allow_plaintext_key=True to CellaflowClient."
+            f"network you trust, set {ALLOW_PLAINTEXT_KEY_ENV_VAR}=true (or, "
+            f"building a CellaflowClient yourself, pass allow_plaintext_key=True)."
         )
     with _warned_lock:
-        if target in _warned_plaintext:
-            return
+        first = target not in _warned_plaintext
         _warned_plaintext.add(target)
-    logger.warning(
-        "Cellaflow: sending an API key to %s without TLS, as allowed, so anyone "
-        "on the path can read it.",
-        target,
-    )
+    if first:
+        logger.warning(
+            "Cellaflow: sending an API key to %s without TLS, as allowed, so "
+            "anyone on the path can read it.",
+            target,
+        )
+    return grpc.insecure_channel(target)
 
 
 class CellaflowClient:
@@ -230,7 +279,9 @@ class CellaflowClient:
 
     A key is not sent without TLS to anything but this machine: the client
     refuses it unless `allow_plaintext_key=True` is passed or
-    `CELLAFLOW_ALLOW_PLAINTEXT_KEY` is `true`, for a network you trust.
+    `CELLAFLOW_ALLOW_PLAINTEXT_KEY` is `true`, for a network you trust. To this
+    machine, gRPC checks the connection really is local, and bypasses any
+    proxy; one that is not fails to connect rather than send the key.
 
     The SDK never puts the key in a log message, an exception message or a
     `repr`. grpc's own stack frames do hold the outgoing header, though, so a
@@ -250,15 +301,13 @@ class CellaflowClient:
         # Held here only in a variable named `api_key`, which error reporters
         # that record a frame's locals scrub by name. grpc's frames hold the
         # header itself; see the class docstring.
-        api_key, source = _api_key_and_source(api_key)
-        if api_key is not None:
-            _check_api_key(api_key, source)
-            if not secure:
-                _check_plaintext(target, allow_plaintext_key)
+        api_key = _checked_api_key(api_key)
         if secure:
             channel = grpc.secure_channel(target, grpc.ssl_channel_credentials())
-        else:
+        elif api_key is None:
             channel = grpc.insecure_channel(target)
+        else:
+            channel = _plaintext_channel_for_key(target, allow_plaintext_key)
         if api_key is not None:
             channel = grpc.intercept_channel(channel, _BearerKey(api_key))
         self.channel = channel

@@ -47,11 +47,11 @@ def workflow(
     session, and a run with the same `_session_id` resumes from them.
 
     `api_key` authenticates with the engine; when omitted it is read from
-    `CELLAFLOW_API_KEY`. A key that cannot be sent, or would go to another host
-    without TLS, is refused here, when the decorator is applied. See
-    `CellaflowClient`.
+    `CELLAFLOW_API_KEY`. An `api_key` that cannot be sent as a header is refused
+    here, when the decorator is applied; whether a key may go without TLS is
+    decided when each call builds its client. See `CellaflowClient`.
     """
-    _check_api_key_argument(api_key, target, secure)
+    _check_api_key_argument(api_key)
 
     def decorator(func: F) -> F:
         @functools.wraps(func)

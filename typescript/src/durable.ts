@@ -76,7 +76,7 @@ export interface DurableToolsOptions {
   target?: string;
   secure?: boolean;
   /** Authenticates with the engine. See {@link CellaflowClientOptions.apiKey}. */
-  apiKey?: string;
+  apiKey?: string | null;
   /**
    * Names the work several agents are collaborating on: a ticket, a task, a
    * tenant. Sent to the engine, which stores it as the session's default and

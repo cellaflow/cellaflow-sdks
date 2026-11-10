@@ -36,7 +36,7 @@ from typing import (
 )
 
 import grpc
-from cellaflow.client import CellaflowClient
+from cellaflow.client import CellaflowClient, resolve_api_key
 from cellaflow.history import iter_session_steps, latest_session_sequence
 from cellaflow.v1 import common_pb2
 
@@ -191,7 +191,7 @@ class CellaflowSaver(_BaseSaver):
             ImportError: If `langgraph-checkpoint` is not installed in the environment.
             ValueError: If both `client` and `api_key` are given.
         """
-        if client is not None and api_key is not None and api_key.strip():
+        if client is not None and api_key is not None and resolve_api_key(api_key):
             raise ValueError(
                 "CellaflowSaver was given both a client and an api_key. The "
                 "client sends its own key, so this one would be ignored: pass "
