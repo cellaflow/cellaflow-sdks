@@ -133,7 +133,12 @@ def test_a_key_that_cannot_be_a_header_is_refused_without_showing_it(
     """Including a tab, DEL or NUL, which gRPC would otherwise refuse on every
     call with an unhelpful "Invalid metadata"."""
     opened: List[str] = []
+    # Both kinds: a key to this machine goes on a secure_channel with local
+    # credentials, and anything else on an insecure one.
     monkeypatch.setattr(grpc, "insecure_channel", lambda target: opened.append(target))
+    monkeypatch.setattr(
+        grpc, "secure_channel", lambda target, *a, **k: opened.append(target)
+    )
     with pytest.raises(ValueError) as refused:
         CellaflowClient(api_key=bad)
     assert "MAR" not in str(refused.value)
@@ -314,7 +319,12 @@ def test_a_key_is_not_sent_without_tls_to_another_host_unless_allowed(
     # No key, nothing to protect.
     CellaflowClient(target="engine.example.com:50051")
     opened: List[str] = []
+    # Both kinds: a key to this machine goes on a secure_channel with local
+    # credentials, and anything else on an insecure one.
     monkeypatch.setattr(grpc, "insecure_channel", lambda target: opened.append(target))
+    monkeypatch.setattr(
+        grpc, "secure_channel", lambda target, *a, **k: opened.append(target)
+    )
     with pytest.raises(ValueError, match="CELLAFLOW_ALLOW_PLAINTEXT_KEY") as refused:
         CellaflowClient(target="engine.example.com:50051", api_key=KEY)
     assert "engine.example.com:50051" in str(refused.value)
@@ -424,11 +434,13 @@ def test_a_key_to_a_local_target_bypasses_a_proxy(
     proxy.listen(1)
     proxy.settimeout(5)
     reached: List[bytes] = []
+    finished = threading.Event()
 
     def accept() -> None:
         try:
             connection, _ = proxy.accept()
-            reached.append(connection.recv(200))
+            if not finished.is_set():  # not the connection that wakes it
+                reached.append(connection.recv(200))
             connection.close()
         except OSError:
             pass
@@ -440,8 +452,12 @@ def test_a_key_to_a_local_target_bypasses_a_proxy(
     try:
         CellaflowClient(target=target, api_key=KEY).start_session("wf", "1.0.0")
     finally:
-        proxy.close()
+        # Closing the socket does not wake accept(); a connection of our own
+        # does, so a passing run does not wait out the timeout.
+        finished.set()
+        socket.create_connection(proxy.getsockname(), timeout=1).close()
         thread.join(timeout=5)
+        proxy.close()
     assert ("authorization", f"Bearer {KEY}") in recorder.metadata[0]
     assert reached == []
 

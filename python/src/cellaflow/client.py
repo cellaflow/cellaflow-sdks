@@ -243,6 +243,9 @@ def _plaintext_channel_for_key(
             if _is_unix(target)
             else grpc.LocalConnectionType.LOCAL_TCP
         )
+        # `local_channel_credentials` is marked experimental in grpcio. It has
+        # behaved the same from 1.60 to 1.85; if a release changes it, every
+        # keyed plaintext call to this machine breaks, and the auth tests say so.
         return grpc.secure_channel(
             target,
             grpc.local_channel_credentials(kind),

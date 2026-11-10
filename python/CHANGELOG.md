@@ -19,8 +19,9 @@ All notable changes to the CellaFlow Python SDK.
   `CellaflowSaver` refuses an `api_key` given beside a `client`, which would have ignored it. A
   key is not sent without TLS to a host other than this machine: that is refused unless
   `CELLAFLOW_ALLOW_PLAINTEXT_KEY=true` or `allow_plaintext_key=True` allows it, for a network you
-  trust, and an allowed one logs a warning once per target. A key to this machine goes on a channel
-  that bypasses `https_proxy` and on which gRPC checks the peer really is this machine.
+  trust, and an allowed one logs a warning once per target. A key sent without TLS to this machine goes
+  on a channel that bypasses `https_proxy` and on which gRPC checks the peer really is this
+  machine.
 
 ## 0.9.0
 
