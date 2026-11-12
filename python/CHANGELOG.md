@@ -4,6 +4,13 @@ All notable changes to the CellaFlow Python SDK.
 
 ## Unreleased
 
+### Fixed
+
+- **The package declared `grpcio>=1.60.0`, but needs 1.71.0.** The generated code checks the
+  installed grpcio at import, so with anything from 1.60 to 1.70 the install succeeded and
+  `import cellaflow` then failed. The floor is now 1.71.0, and CI runs the tests at the lowest
+  grpcio and protobuf the package declares.
+
 ### Added
 
 - **An API key, for an engine that requires a token.** `CellaflowClient`, `@workflow`,

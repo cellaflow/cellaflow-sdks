@@ -23,10 +23,10 @@ keywords = [
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "grpcio>=1.60.0",
-    # Floor must match the gencode version the pinned grpcio-tools emits --
-    # the generated stubs assert it at import, so a lower runtime does not fail
-    # at first use, it fails at `import cellaflow`. See the dev pin below.
+    # Both floors must match what the pinned grpcio-tools (below) generates for:
+    # the generated stubs check the runtime at import, so a lower one installs
+    # cleanly and then fails at `import cellaflow`. CI runs the tests at both.
+    "grpcio>=1.71.0",
     "protobuf>=5.29.0",
     "msgpack>=1.0.7",
     "rfc8785>=0.1.4",
