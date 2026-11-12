@@ -3,7 +3,7 @@
 Skipped unless `CELLAFLOW_TARGET` names one, for example:
 
     docker run -d -p 50051:50051 -e CELLAFLOW_ALLOW_UNAUTHENTICATED=true \\
-        ghcr.io/cellaflow/cellaflow:0.2.0
+        ghcr.io/cellaflow/cellaflow:0.3.0
     CELLAFLOW_TARGET=localhost:50051 pytest tests/integration
 
 These check what a stubbed engine cannot: that the engine accepts the records

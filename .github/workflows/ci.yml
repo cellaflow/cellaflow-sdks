@@ -148,9 +148,11 @@ jobs:
       contents: read
 
     # Pinned, so a test fails because the SDK changed, not because the engine
-    # moved under it. Raise it when an SDK change needs a newer engine.
+    # moved under it. Raise it when an SDK change needs a newer engine. Engine
+    # version tags are written once from 0.3.0 on; `:0.2.0` was rewritten by
+    # later merges, so it no longer named one engine.
     env:
-      ENGINE_IMAGE: ghcr.io/cellaflow/cellaflow:0.2.0
+      ENGINE_IMAGE: ghcr.io/cellaflow/cellaflow:0.3.0
       CELLAFLOW_TARGET: localhost:50051
       # A second engine that requires a token, for the API key tests. The token
       # guards a throwaway container on the runner, nothing else.
