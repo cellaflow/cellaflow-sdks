@@ -45,10 +45,14 @@ const server = http2.createServer(
 // destroyed too, which also ends the clients' side of them.
 const sessions = new Set();
 server.on("session", (session) => {
+  // Unreferenced too, as is the server below, so the process can exit on a
+  // Node whose runner never calls a file's top-level after() (18.14).
+  session.unref();
   sessions.add(session);
   session.on("close", () => sessions.delete(session));
 });
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+server.unref();
 const target = `127.0.0.1:${server.address().port}`;
 after(() => {
   for (const session of sessions) session.destroy();
@@ -118,7 +122,10 @@ test("a blank key means none", () => {
 });
 
 for (const bad of ["MARKER\n", "MAR\tKER", "MAR\x7fKER", "MARKER\x00", "MARKÉR"]) {
-  test(`a key that cannot be a header is refused without showing it (${JSON.stringify(bad)})`, () => {
+  // Escaped by hand: JSON.stringify leaves DEL raw, and Node 18.14's test runner
+  // cannot parse a title containing it.
+  const shown = bad.replace(/[^\x20-\x7e]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`);
+  test(`a key that cannot be a header is refused without showing it (${shown})`, () => {
     assert.throws(
       () => new CellaflowClient({ target, apiKey: bad }),
       (err) => !String(err.message).includes("MAR") && String(err.message).includes("the apiKey option"),

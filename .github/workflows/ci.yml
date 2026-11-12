@@ -92,8 +92,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # The lowest Node the package supports (engines: >=18), and the version the
-      # publish job builds with.
+      # Builds and tests on Node 18. The compiler itself needs a newer 18 than
+      # the package does, so the floor is tested in its own step below. The
+      # publish job builds with 24.x.
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -110,6 +111,20 @@ jobs:
       - name: Build and test
         working-directory: ./typescript
         run: npm test
+
+      # Exactly the lowest Node the package supports (engines: >=18.14.1, which
+      # Connect 2 requires), running what the step above built, so a dependency
+      # that needs a newer Node fails here rather than for users on it.
+      - name: Set up the lowest supported Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18.14.1"
+
+      - name: Test on the lowest supported Node.js
+        working-directory: ./typescript
+        run: |
+          node --version
+          node --test tests/*.test.mjs
 
   integration:
     name: Integration Tests (real engine)

@@ -10,12 +10,22 @@ Code written against 0.9.0 can see these:
 
 - **The exported protobuf messages are types, not classes.** The SDK now uses Connect 2 and
   protobuf-es 2. `StepResult`, `CheckCacheResponse`, `RenewLeaseResponse` and the other exported
-  messages are plain object types, each with a `...Schema` export beside it. Code that called
-  `new StepResult(...)`, tested `instanceof`, or called `toJson()` or `toBinary()` on a response
-  builds and converts them with `create`, `toJson` and `toBinary` from `@bufbuild/protobuf`, passing
-  the schema. Field names and types are unchanged, so code that only reads fields from what the
-  client returns is unaffected. The enums (`StepStatus`, `CacheStatus` and the others) are
-  unchanged.
+  messages are plain object types, each with a `...Schema` export beside it.
+  `StartSessionResponse` and `CommitStepResponse`, which `startSession` and `commitStep` return,
+  are now exported with their schemas too. Code that called `new StepResult(...)`, tested
+  `instanceof`, or called `toJson()` or `toBinary()` on a response builds and converts them with
+  `create`, `toJson` and `toBinary` from `@bufbuild/protobuf`, passing the schema, as in
+  `toJson(CommitStepResponseSchema, response)`. Those come from **version 2** of
+  `@bufbuild/protobuf`: add `@bufbuild/protobuf@^2` to your own dependencies to import them, since
+  an app that depends on version 1 gets that version's module, which has none of them. Field names
+  and types are unchanged, so code that only reads fields from what the client returns is
+  unaffected. The enums (`StepStatus`, `CacheStatus` and the others) are unchanged.
+- **`JSON.stringify` on a response throws.** Responses with 64-bit fields (sequence numbers,
+  fencing tokens) hold them as `bigint`, which `JSON.stringify` refuses with `TypeError: Do not
+  know how to serialize a BigInt`; Connect 1's messages converted themselves. A line that logs a
+  response this way now throws after the call succeeded. Use `toJson(<Schema>, response)` instead.
+  Responses also carry a `$typeName` field, which shows up in `Object.keys`, spreads and
+  deep-equality checks.
 - **Node.js 18.14.1 or later,** up from 18.0.0, which Connect 2 requires.
 
 ### Added
