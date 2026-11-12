@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { checkApiKeyOption } from "./apikey.js";
 import { CellaflowClient } from "./client.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { LeaseHeartbeat } from "./lease.js";
@@ -128,6 +129,8 @@ export interface ExecutionLeaseOptions {
   workerId: string;
   target?: string;
   secure?: boolean;
+  /** Authenticates with the engine. See {@link CellaflowClientOptions.apiKey}. */
+  apiKey?: string | null;
   /**
    * How long the lease lasts without a renewal. Each renewal extends it by the
    * same amount. Defaults to 30 000.
@@ -188,7 +191,7 @@ export async function executionLease<T>(
     waitMs = 0,
   } = options;
 
-  const client = new CellaflowClient({ target, secure });
+  const client = new CellaflowClient({ target, secure, apiKey: options.apiKey });
   let hb: LeaseHeartbeat | undefined;
   let handle: LeaseHandle | undefined;
   let fencingToken = 0;
@@ -320,12 +323,18 @@ export async function executionLease<T>(
  *   { workerId: "worker-1", key: (orderId) => `order:${orderId}` },
  * );
  * ```
+ *
+ * An `apiKey` that cannot be sent as a header is refused here, when the wrapper
+ * is made, not on its first call. Whether a key may go without TLS is decided
+ * when each call builds its client.
  */
 export function taskLease<A extends unknown[], R>(
   fn: (...args: A) => Promise<R>,
   options: ExecutionLeaseOptions & { key: string | ((...args: A) => string) },
 ): (...args: A) => Promise<R> {
   const { key, ...leaseOptions } = options;
+  // A key that cannot be sent fails here, not on the first call.
+  checkApiKeyOption(leaseOptions);
   return async function leasedTask(...args: A): Promise<R> {
     const resolved = typeof key === "function" ? key(...args) : key;
     return executionLease(resolved, leaseOptions, () => fn(...args));

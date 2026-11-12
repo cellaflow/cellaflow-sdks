@@ -563,7 +563,29 @@ flowchart TD
 
 ## Core Concepts
 
-### `@workflow(version="1.0.0", target="localhost:50051", secure=False)`
+### Authenticating with the engine
+
+An engine started with a token refuses calls without it. Start the engine with the token in `CELLAFLOW_API_KEY`, set the same variable in the SDK's environment, and every call sends it, with no code change:
+
+```bash
+export CELLAFLOW_API_KEY=your-engine-token
+```
+
+Or pass it explicitly. Every entry point that talks to the engine takes `api_key`: `@workflow`, `durable_tools`, `execution_lease`, `async_execution_lease`, `task_lease`, `CellaflowSaver` and `CellaflowClient`.
+
+```python
+@workflow(version="1.0.0", target="engine.example.com:50051", secure=True, api_key=key)
+```
+
+- **Where it comes from:** `api_key` if given, else `CELLAFLOW_API_KEY`. A blank value means no key. That is the only variable the SDK reads. It never reads the engine's older name, `CELLAFLOW_AUTH_TOKEN`, or the generic `AUTH_TOKEN` and `API_KEY`: a variable that generic often holds another service's secret.
+- **On the engine:** the engine reads its token from `CELLAFLOW_AUTH_TOKEN` before `CELLAFLOW_API_KEY`, and a blank `CELLAFLOW_AUTH_TOKEN` counts as set: the engine then has no token at all. Leave `CELLAFLOW_AUTH_TOKEN` unset there, not blank (Compose writes a blank one for `${VAR}` when the variable is unset), and set only `CELLAFLOW_API_KEY`.
+- **How it's sent:** as `authorization: Bearer <key>` on every call.
+- **Kept out of sight:** the SDK never puts the key in a log message, an exception message or a `repr`. grpc's own stack frames do hold the outgoing header, so a tool that records a traceback's local variables (loguru's `diagnose`, Sentry's frame variables, `pytest -l`) can show it. Turn that off wherever the key matters.
+- **Refused early:** a key that cannot be sent as a header (surrounding whitespace, or a character outside printable ASCII) is refused before a connection opens, naming where it came from. A decorator given one refuses it when it is applied; whether a key may go without TLS is decided when each call builds its client, so an opt-in set after import still counts.
+- **Without TLS:** a key is never sent in plaintext to anything but this machine unless you allow it. With `secure=False` and another host as the target, the client refuses, naming the target, so forgetting TLS cannot be how a key crosses the network. On a network you trust (a Compose network, a Kubernetes service), set `CELLAFLOW_ALLOW_PLAINTEXT_KEY=true` (or, building a `CellaflowClient` yourself, pass `allow_plaintext_key=True`); each target then logs a warning once. A target on this machine is checked by gRPC as well as by name: the channel bypasses any `https_proxy`, and refuses a connection whose peer is not this machine, so a name that only looks local fails to connect rather than send the key. That failure is gRPC's UNAVAILABLE, "Endpoint is neither UDS or TCP loopback address": the name resolved somewhere other than this machine, and the opt-in does not override it. Use the machine's real address, or TLS. An allowed remote target still goes through `https_proxy` if one is set, so the key crosses the proxy too; add the engine's host to `no_proxy` (or `no_grpc_proxy`) if that matters.
+- **Your own CA:** `secure=True` trusts the public root certificates gRPC ships with. For an engine whose certificate comes from your own CA, or is self-signed, set `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/path/to/ca.pem`, which gRPC then trusts instead.
+
+### `@workflow(version="1.0.0", target="localhost:50051", secure=False, api_key=None)`
 Marks the entry point for a durable workflow execution:
 - **Automatic Client Management**: Transparently initializes the underlying gRPC client and session state.
 - **Context Isolation**: Uses Python's `contextvars` to manage session context safely across async event loops and threads.
@@ -639,7 +661,7 @@ For advanced use cases requiring manual session management, graph inspection, or
 from cellaflow import CellaflowClient
 from cellaflow.v1.common_pb2 import STEP_STATUS_SUCCESS
 
-# Initialize client
+# Initialize client (api_key, or CELLAFLOW_API_KEY, for an engine that requires a token)
 client = CellaflowClient(target="localhost:50051", secure=False)
 
 # 1. Start or resume a session

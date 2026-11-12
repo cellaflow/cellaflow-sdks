@@ -75,6 +75,8 @@ export interface DurableToolsOptions {
   version?: string;
   target?: string;
   secure?: boolean;
+  /** Authenticates with the engine. See {@link CellaflowClientOptions.apiKey}. */
+  apiKey?: string | null;
   /**
    * Names the work several agents are collaborating on: a ticket, a task, a
    * tenant. Sent to the engine, which stores it as the session's default and
@@ -171,7 +173,7 @@ export async function durableTools<T>(
   const threadId = threadIdFrom(config);
   const sessionId = toolSessionId(threadId);
 
-  const client = new CellaflowClient({ target, secure });
+  const client = new CellaflowClient({ target, secure, apiKey: options.apiKey });
   // A resume naming a different coordination id than the stored one is refused
   // here, before the callback runs.
   const resp = await client.startSession(workflowId, version, sessionId, coordinationId);

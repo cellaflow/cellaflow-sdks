@@ -36,7 +36,7 @@ from typing import (
 )
 
 import grpc
-from cellaflow.client import CellaflowClient
+from cellaflow.client import CellaflowClient, resolve_api_key
 from cellaflow.history import iter_session_steps, latest_session_sequence
 from cellaflow.v1 import common_pb2
 
@@ -169,6 +169,7 @@ class CellaflowSaver(_BaseSaver):
         version: str = "v1",
         *,
         serde: Optional[SerializerProtocol] = None,
+        api_key: Optional[str] = None,
     ) -> None:
         """
         Initializes the CellaflowSaver checkpointer.
@@ -178,13 +179,24 @@ class CellaflowSaver(_BaseSaver):
                 a client is automatically constructed using `target` and `secure`.
             target: gRPC target endpoint for the CellaFlow Engine.
             secure: Whether to use TLS encryption for gRPC channel communication.
+            api_key: Authenticates with the engine when the client is built
+                here; when omitted it is read from `CELLAFLOW_API_KEY`.
+                A non-blank one is refused with `client`, which carries
+                its own.
             workflow_id: CellaFlow workflow identifier tag.
             version: Workflow schema version string.
             serde: Optional custom serializer conforming to `SerializerProtocol`.
 
         Raises:
             ImportError: If `langgraph-checkpoint` is not installed in the environment.
+            ValueError: If both `client` and `api_key` are given.
         """
+        if client is not None and api_key is not None and resolve_api_key(api_key):
+            raise ValueError(
+                "CellaflowSaver was given both a client and an api_key. The "
+                "client sends its own key, so this one would be ignored: pass "
+                "it to CellaflowClient instead."
+            )
         if not HAS_LANGGRAPH:
             raise ImportError(
                 "langgraph-checkpoint is required to use CellaflowSaver. "
@@ -195,7 +207,7 @@ class CellaflowSaver(_BaseSaver):
         self.client = (
             client
             if client is not None
-            else CellaflowClient(target=target, secure=secure)
+            else CellaflowClient(target=target, secure=secure, api_key=api_key)
         )
         self.workflow_id = workflow_id
         self.version = version

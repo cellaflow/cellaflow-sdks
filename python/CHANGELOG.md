@@ -2,6 +2,27 @@
 
 All notable changes to the CellaFlow Python SDK.
 
+## Unreleased
+
+### Added
+
+- **An API key, for an engine that requires a token.** `CellaflowClient`, `@workflow`,
+  `durable_tools`, `execution_lease`, `async_execution_lease`, `task_lease` and `CellaflowSaver`
+  take `api_key`, sent as `authorization: Bearer <key>` on every call, streaming calls included.
+  Without it, the key is read from `CELLAFLOW_API_KEY`, so existing code works against a secured
+  engine with no change; a blank value means no key, and no other variable is read. Before this,
+  the SDK could only talk to an engine running unauthenticated. The SDK never puts the key in a log
+  message, an exception message or a `repr`; grpc's own stack frames hold the header, so turn off
+  local-variable capture in error reporting wherever the key matters. A key that cannot be a header
+  (outside printable ASCII, or with surrounding whitespace) is refused before a connection is
+  opened, naming where it came from, and a decorator refuses one when it is applied.
+  `CellaflowSaver` refuses an `api_key` given beside a `client`, which would have ignored it. A
+  key is not sent without TLS to a host other than this machine: that is refused unless
+  `CELLAFLOW_ALLOW_PLAINTEXT_KEY=true` or `allow_plaintext_key=True` allows it, for a network you
+  trust, and an allowed one logs a warning once per target. A key sent without TLS to this machine goes
+  on a channel that bypasses `https_proxy` and on which gRPC checks the peer really is this
+  machine.
+
 ## 0.9.0
 
 ### Behaviour changes
