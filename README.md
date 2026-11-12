@@ -12,10 +12,12 @@ Official client SDKs and protocol definitions for the [CellaFlow Engine](https:/
 
 ## 📦 Available SDKs
 
-| Language | Package | Status | Documentation |
+| Language | Package | Latest release | Documentation |
 | :--- | :--- | :--- | :--- |
-| **Python** | [`cellaflow`](https://pypi.org/project/cellaflow/) | ✅ **v0.8.0** (Released) | [Python SDK Guide](python/README.md) |
-| **TypeScript** | [`@cellaflow/sdk`](https://www.npmjs.com/package/@cellaflow/sdk) | ✅ **v0.8.0** (Released) | [TypeScript SDK Guide](typescript/README.md) |
+| **Python** | [`cellaflow`](https://pypi.org/project/cellaflow/) | [![PyPI](https://img.shields.io/pypi/v/cellaflow?label=PyPI&color=blue)](https://pypi.org/project/cellaflow/) | [Python SDK Guide](python/README.md) |
+| **TypeScript** | [`@cellaflow/sdk`](https://www.npmjs.com/package/@cellaflow/sdk) | [![npm](https://img.shields.io/npm/v/@cellaflow/sdk?label=npm&color=blue)](https://www.npmjs.com/package/@cellaflow/sdk) | [TypeScript SDK Guide](typescript/README.md) |
+
+Both SDKs are released together under one version number. See [RELEASING.md](RELEASING.md).
 
 ---
 
