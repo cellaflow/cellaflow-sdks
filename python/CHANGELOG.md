@@ -1,8 +1,14 @@
 # Changelog
 
-All notable changes to the CellaFlow Python SDK.
+All notable changes to the Cellaflow Python SDK.
 
-## Unreleased
+## 0.10.0
+
+### Compatibility
+
+- Works with engine 0.2.0 and later. CI's integration tests run against `ghcr.io/cellaflow/cellaflow:0.2.0`,
+  an engine started both without a key and with one.
+- Requires grpcio 1.71.0 or later (see Fixed).
 
 ### Fixed
 
