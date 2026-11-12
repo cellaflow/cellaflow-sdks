@@ -122,7 +122,7 @@ from cellaflow import workflow, tool, IdempotencyScope
 @tool(tool_name="publish_release_notes", scope=IdempotencyScope.SCOPE_SHARED,
       shared_on=["version"])
 def publish(version: str) -> dict:
-    return notes_service.publish(version)   # runs exactly once
+    return notes_service.publish(version)   # runs once, however many agents call it
 
 @workflow(version="1.0.0")
 def coder_agent(version: str) -> dict:

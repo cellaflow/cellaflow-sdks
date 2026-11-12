@@ -1,8 +1,8 @@
 # Changelog
 
-All notable changes to the CellaFlow TypeScript SDK.
+All notable changes to the Cellaflow TypeScript SDK.
 
-## Unreleased
+## 0.10.0
 
 ### Behaviour changes
 
@@ -27,6 +27,12 @@ Code written against 0.9.0 can see these:
   Responses also carry a `$typeName` field, which shows up in `Object.keys`, spreads and
   deep-equality checks.
 - **Node.js 18.14.1 or later,** up from 18.0.0, which Connect 2 requires.
+
+### Compatibility
+
+- Works with engine 0.2.0 and later. CI's integration tests run against `ghcr.io/cellaflow/cellaflow:0.2.0`,
+  an engine started both without a key and with one. CI also runs the tests on Node.js 18.14.1, the
+  lowest version supported.
 
 ### Added
 
