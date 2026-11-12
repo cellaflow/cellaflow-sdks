@@ -63,6 +63,20 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
           exit $status
 
+      # The lowest grpcio and protobuf the package declares, read from
+      # pyproject.toml so the check cannot drift from it. The generated stubs
+      # check the runtime at import, so a floor below what they were generated
+      # for installs cleanly and then fails at `import cellaflow`.
+      - name: Test against the lowest supported grpcio and protobuf
+        working-directory: ./python
+        run: |
+          grpcio=$(sed -n 's/^ *"grpcio>=\([0-9.]*\)",.*/\1/p' pyproject.toml)
+          protobuf=$(sed -n 's/^ *"protobuf>=\([0-9.]*\)",.*/\1/p' pyproject.toml)
+          test -n "$grpcio" && test -n "$protobuf"
+          python -m pip install "grpcio==$grpcio" "protobuf==$protobuf"
+          python -c "import grpc, google.protobuf, cellaflow; print('grpcio', grpc.__version__, 'protobuf', google.protobuf.__version__)"
+          pytest -q -p no:cacheprovider --no-cov
+
       - name: Generate Coverage Badge
         working-directory: ./python
         run: |
