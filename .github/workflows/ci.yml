@@ -7,6 +7,47 @@ on:
     branches: [main]
 
 jobs:
+  # The Python and TypeScript SDKs are released together under one version.
+  # Every place a version is written by hand must agree, so a release cannot
+  # bump one file and miss another. The root README shows the published
+  # versions through PyPI and npm badges, so it carries no version to forget.
+  versions:
+    name: SDK versions in lockstep
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check every version agrees
+        run: |
+          python3 - <<'PY'
+          import json, re, sys
+          from pathlib import Path
+
+          found = {
+              "python/pyproject.toml": re.search(r'^version = "([^"]+)"', Path("python/pyproject.toml").read_text(), re.M).group(1),
+              "typescript/package.json": json.loads(Path("typescript/package.json").read_text())["version"],
+          }
+          lock = json.loads(Path("typescript/package-lock.json").read_text())
+          found["typescript/package-lock.json (top)"] = lock["version"]
+          found['typescript/package-lock.json (packages[""])'] = lock["packages"][""]["version"]
+          for where, version in found.items():
+              print(f"{version:>10}  {where}")
+          if len(set(found.values())) != 1:
+              print("::error::The SDK versions disagree. Bump them together; see RELEASING.md.")
+              sys.exit(1)
+
+          # The README's table shows versions through badges. A version typed
+          # into it goes stale at the next release, as v0.8.0 did.
+          table = [l for l in Path("README.md").read_text().splitlines() if l.startswith("| **")]
+          stale = [l for l in table if re.search(r"\bv?\d+\.\d+\.\d+\b", l)]
+          if stale:
+              print("::error::README.md's SDK table names a version. Use the PyPI and npm badges instead.")
+              sys.exit(1)
+          PY
+
   python-ci:
     name: Python SDK Tests & Coverage
     runs-on: ubuntu-latest
