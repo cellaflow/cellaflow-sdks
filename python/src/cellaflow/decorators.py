@@ -23,7 +23,7 @@ from cellaflow.idempotency import (
     normalize_coordination_id,
     IdempotencyScope,
 )
-from cellaflow.lease import LeaseHeartbeat
+from cellaflow.lease import LeaseHeartbeat, check_lease_ttl_ms
 from cellaflow.serialization import deserialize
 from cellaflow.v1.common_pb2 import STEP_STATUS_FAILED, STEP_STATUS_SUCCESS
 from cellaflow.v1.idempotency_pb2 import (
@@ -437,6 +437,7 @@ def _note_failure(
     failed_at: float,
     unreleased: Optional[Dict[str, Any]] = None,
     is_async: bool = True,
+    lease_ttl_ms: Optional[int] = None,
 ) -> None:
     """Holds a live step's failure or cancellation to be recorded at its position.
 
@@ -465,6 +466,7 @@ def _note_failure(
                 step_key=ikey or "",
                 source=exc,
                 unreleased=unreleased,
+                lease_ttl_ms=lease_ttl_ms,
             )
             return
         if not isinstance(exc, (Exception, asyncio.CancelledError)):
@@ -478,6 +480,7 @@ def _note_failure(
             agent_id=agent_id,
             step_key=ikey or "",
             unreleased=unreleased,
+            lease_ttl_ms=lease_ttl_ms,
         )
     except Exception:
         # Noting the failure must never replace the step's own exception, which
@@ -499,6 +502,7 @@ def _take_hit(
     call_coordination: Optional[str],
     agent_id: str,
     ikey: str,
+    lease_ttl_ms: Optional[int] = None,
 ) -> Any:
     """Returns a cache hit's result and keeps this session's history in step.
 
@@ -519,6 +523,7 @@ def _take_hit(
             call_coordination,
             agent_id=agent_id,
             received_key=ikey,
+            lease_ttl_ms=lease_ttl_ms,
         )
     return payload.get("result")
 
@@ -584,7 +589,22 @@ def step(
     tool_name: Optional[str] = None,
     scope: IdempotencyScope = IdempotencyScope.SCOPE_SESSION_WIDE,
     shared_on: Optional[Sequence[str]] = None,
+    lease_ttl_ms: Optional[int] = None,
 ) -> Any:
+    """Records a function's result as a step of the running workflow.
+
+    `lease_ttl_ms` is how long the call's lease lasts without a renewal, in
+    milliseconds, and so how soon another caller can take the call over if this
+    process crashes or freezes: one TTL after the last renewal, plus up to a
+    second for the waiting caller to ask again. Renewals come every quarter of
+    it. None takes the session's (`durable_tools(..., lease_ttl_ms=...)`), or
+    else the engine's default, 20 s on current engines. A holder that stops
+    renewing for one TTL while its body still runs is taken over too, so set it
+    well above the longest pause a call can see. At least `MIN_LEASE_TTL_MS`
+    (1000), at most `MAX_LEASE_TTL_MS` (2^53 - 1) and an `int`, or the decorator
+    raises `ValueError` (or `TypeError`); the engine's maximum lease lifetime
+    caps it.
+    """
     if func is None:
         return functools.partial(
             step,
@@ -593,10 +613,26 @@ def step(
             tool_name=tool_name,
             scope=scope,
             shared_on=shared_on,
+            lease_ttl_ms=lease_ttl_ms,
         )
 
     actual_tool_name = tool_name or func.__name__
     _validate_shared_scope(func, scope, shared_on, idempotency_key)
+    # Checked here rather than above, so the decorator form names the step too.
+    lease_ttl_ms = check_lease_ttl_ms(lease_ttl_ms, f"step {actual_tool_name!r}")
+
+    def _ttl_for(ctx: WorkflowContext) -> Optional[int]:
+        """The step's own TTL, or else the session's."""
+        return lease_ttl_ms if lease_ttl_ms is not None else ctx.lease_ttl_ms
+
+    def _interval_for(resp: Any, ttl_ms: Optional[int]) -> int:
+        """How often to renew: what the engine suggests, but at least every
+        quarter of the TTL the renewals extend by, so the lease cannot lapse
+        between them. Released engines suggest exactly that."""
+        interval_ms: int = resp.heartbeat_interval_ms or 5000
+        if ttl_ms is not None:
+            interval_ms = min(interval_ms, max(1, ttl_ms // 4))
+        return interval_ms
 
     @functools.wraps(func)
     async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -668,12 +704,14 @@ def step(
 
             fencing_token = 0
             hb: Optional[LeaseHeartbeat] = None
+            ttl_ms = _ttl_for(ctx)
 
             while True:
                 try:
                     resp = ctx.client.check_idempotency_cache(
                         agent_id=agent_id,
                         idempotency_key=ikey,
+                        lease_ttl_ms=ttl_ms,
                         session_id=ctx.session_id,
                         # Tell the engine where this call intends to write,
                         # so a lease at an already-committed position is refused
@@ -696,6 +734,7 @@ def step(
                         call_coordination,
                         agent_id,
                         ikey,
+                        ttl_ms,
                     )
                 elif resp.status == CACHE_STATUS_IN_PROGRESS:
                     retry_ms = resp.retry_after_ms or 1000
@@ -707,13 +746,14 @@ def step(
                     await asyncio.sleep(retry_ms / 1000.0)
                 elif resp.status == CACHE_STATUS_ACQUIRED:
                     fencing_token = resp.fencing_token or 0
-                    interval_ms = resp.heartbeat_interval_ms or 5000
                     hb = LeaseHeartbeat(
                         client=ctx.client,
                         agent_id=agent_id,
                         idempotency_key=ikey,
                         fencing_token=fencing_token,
-                        heartbeat_interval_ms=interval_ms,
+                        heartbeat_interval_ms=_interval_for(resp, ttl_ms),
+                        # None infers the engine's TTL from its interval.
+                        lease_ttl_ms=ttl_ms,
                     )
                     hb.start_async()
                     break
@@ -768,6 +808,7 @@ def step(
                     started,
                     failed_at or time.monotonic(),
                     unreleased,
+                    lease_ttl_ms=_ttl_for(ctx),
                 )
             raise
         finally:
@@ -843,12 +884,14 @@ def step(
 
             fencing_token = 0
             hb: Optional[LeaseHeartbeat] = None
+            ttl_ms = _ttl_for(ctx)
 
             while True:
                 try:
                     resp = ctx.client.check_idempotency_cache(
                         agent_id=agent_id,
                         idempotency_key=ikey,
+                        lease_ttl_ms=ttl_ms,
                         session_id=ctx.session_id,
                         # Tell the engine where this call intends to write,
                         # so a lease at an already-committed position is refused
@@ -871,6 +914,7 @@ def step(
                         call_coordination,
                         agent_id,
                         ikey,
+                        ttl_ms,
                     )
                 elif resp.status == CACHE_STATUS_IN_PROGRESS:
                     retry_ms = resp.retry_after_ms or 1000
@@ -882,13 +926,14 @@ def step(
                     time.sleep(retry_ms / 1000.0)
                 elif resp.status == CACHE_STATUS_ACQUIRED:
                     fencing_token = resp.fencing_token or 0
-                    interval_ms = resp.heartbeat_interval_ms or 5000
                     hb = LeaseHeartbeat(
                         client=ctx.client,
                         agent_id=agent_id,
                         idempotency_key=ikey,
                         fencing_token=fencing_token,
-                        heartbeat_interval_ms=interval_ms,
+                        heartbeat_interval_ms=_interval_for(resp, ttl_ms),
+                        # None infers the engine's TTL from its interval.
+                        lease_ttl_ms=ttl_ms,
                     )
                     hb.start_sync()
                     break
@@ -940,6 +985,7 @@ def step(
                     failed_at or time.monotonic(),
                     unreleased,
                     is_async=False,
+                    lease_ttl_ms=_ttl_for(ctx),
                 )
             raise
         finally:
@@ -958,11 +1004,27 @@ def tool(
     tool_name: Optional[str] = None,
     scope: IdempotencyScope = IdempotencyScope.SCOPE_SESSION_WIDE,
     shared_on: Optional[Sequence[str]] = None,
+    lease_ttl_ms: Optional[int] = None,
 ) -> Any:
     """
     Decorator for tool steps that require idempotency tracking.
     Functionally identical to @step for now, but semantically distinct.
+    `lease_ttl_ms` is as for `step`.
     """
+    if func is None:
+        return functools.partial(
+            tool,
+            idempotency_key=idempotency_key,
+            agent_id=agent_id,
+            tool_name=tool_name,
+            scope=scope,
+            shared_on=shared_on,
+            lease_ttl_ms=lease_ttl_ms,
+        )
+    # Checked here too, so a refusal names a tool as a tool, and in the order
+    # `step` checks them.
+    _validate_shared_scope(func, scope, shared_on, idempotency_key)
+    check_lease_ttl_ms(lease_ttl_ms, f"tool {tool_name or func.__name__!r}")
     return step(
         func=func,
         idempotency_key=idempotency_key,
@@ -970,4 +1032,5 @@ def tool(
         tool_name=tool_name,
         scope=scope,
         shared_on=shared_on,
+        lease_ttl_ms=lease_ttl_ms,
     )
