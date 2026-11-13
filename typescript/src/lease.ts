@@ -19,6 +19,41 @@ function renewFailureDetail(reason: RenewFailureReason | undefined): string {
   }
 }
 
+/**
+ * The shortest lease TTL the SDK asks the engine for, in milliseconds.
+ *
+ * The engine asks a holder to renew every quarter of the TTL, so below a second
+ * renewals come every 250 ms or faster and one slow round trip costs the lease.
+ * Under 4 ms the engine's suggested interval is zero.
+ */
+export const MIN_LEASE_TTL_MS = 1000;
+
+/**
+ * Refuses a lease TTL the SDK will not ask for, naming where it was given. A
+ * missing value (or `null`) means the default and passes through as undefined.
+ */
+export function checkLeaseTtlMs(
+  ttlMs: number | null | undefined,
+  where: string,
+  field = "ttlMs",
+): number | undefined {
+  if (ttlMs === undefined || ttlMs === null) return undefined;
+  if (!Number.isSafeInteger(ttlMs) || ttlMs < MIN_LEASE_TTL_MS) {
+    throw new RangeError(
+      `${where}: ${field} must be a whole number of milliseconds, at least ${MIN_LEASE_TTL_MS}; ` +
+        `got ${typeof ttlMs === "number" ? String(ttlMs) : `${typeof ttlMs} ${JSON.stringify(String(ttlMs))}`}.`,
+    );
+  }
+  return ttlMs;
+}
+
+/**
+ * The longest delay `setTimeout` and `setInterval` honour. A longer one fires
+ * almost at once, so an interval derived from a very long TTL would renew in a
+ * tight loop.
+ */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
 export interface LeaseHeartbeatOptions {
   client: CellaflowClient;
   agentId: string;
@@ -149,7 +184,9 @@ export class LeaseHeartbeat {
   }
 
   constructor(options: LeaseHeartbeatOptions) {
-    const intervalMs = options.heartbeatIntervalMs;
+    // Clamped to what timers honour: renewing every 24 days instead of every
+    // quarter of a longer TTL still keeps the lease.
+    const intervalMs = Math.min(options.heartbeatIntervalMs, MAX_TIMER_MS);
     this.opts = {
       ...options,
       heartbeatIntervalMs: intervalMs,

@@ -3,7 +3,7 @@ import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { getContext, type UnreleasedLease, type WorkflowContext } from "./context.js";
 import { IdempotencyScope, deriveIdempotencyKey, normalizeCoordinationId } from "./idempotency.js";
-import { LeaseHeartbeat } from "./lease.js";
+import { LeaseHeartbeat, checkLeaseTtlMs } from "./lease.js";
 import { deserialize } from "./serialization.js";
 
 /**
@@ -40,6 +40,22 @@ export interface ToolOptions {
    * object, because JavaScript has no named arguments to select from.
    */
   sharedOn?: readonly string[];
+  /**
+   * How long a call's lease lasts without a renewal, in milliseconds. A holder
+   * renews it while the body runs; if the holder crashes or freezes, another
+   * caller can take the call over this long after its last renewal.
+   *
+   * A holder that stops renewing for one TTL while its body still runs (a
+   * blocked event loop, a long garbage-collection pause, a lost connection to
+   * the engine) is taken over too, so set it well above the longest pause a
+   * call can see.
+   *
+   * Overrides the `ttlMs` of the enclosing {@link durableTools} block. With
+   * neither, the engine's default applies (20 000 on current engines). At least
+   * 1000 (`MIN_LEASE_TTL_MS`). The engine's maximum lease lifetime caps every
+   * lease, whatever is asked for here.
+   */
+  ttlMs?: number;
 }
 
 /**
@@ -119,6 +135,7 @@ export function tool<A extends unknown[], R>(
         "key is already the identity of the work.",
     );
   }
+  const ttlMs = checkLeaseTtlMs(options.ttlMs, `tool '${toolName}'`);
 
   /**
    * Runs one call. `callCoordination` is this call's own coordination id, already
@@ -130,6 +147,8 @@ export function tool<A extends unknown[], R>(
     // must be the same: keying on the session's id while recording the override
     // would deduplicate the call in one domain and record it in another.
     const coordinationId = callCoordination ?? ctx.coordinationId;
+    // The tool's own TTL, else the block's. Undefined asks for the engine's.
+    const leaseTtlMs = ttlMs ?? ctx.leaseTtlMs;
 
     // A cache hit may have left this counter ahead of the engine's, or left a
     // result to record at its position. Both are settled before claiming the next
@@ -152,7 +171,7 @@ export function tool<A extends unknown[], R>(
     const seq = ctx.claimPosition();
     const known: { key?: string; unreleased?: UnreleasedLease } = {};
     try {
-      return await runAt(ctx, seq, args, callCoordination, coordinationId, known);
+      return await runAt(ctx, seq, args, callCoordination, coordinationId, leaseTtlMs, known);
     } catch (err) {
       // A failed call leaves its position empty; record the failure there so the
       // next call does not land past the gap. Not for a refused lease: another
@@ -166,6 +185,7 @@ export function tool<A extends unknown[], R>(
           agentId,
           known.key ?? "",
           known.unreleased,
+          leaseTtlMs,
         );
       }
       throw err;
@@ -181,6 +201,7 @@ export function tool<A extends unknown[], R>(
     args: A,
     callCoordination: string | undefined,
     coordinationId: string | undefined,
+    leaseTtlMs: number | undefined,
     known: { key?: string; unreleased?: UnreleasedLease },
   ): Promise<R> {
 
@@ -227,7 +248,7 @@ export function tool<A extends unknown[], R>(
           agentId,
           ikey,
           0,
-          undefined,
+          leaseTtlMs,
           ctx.sessionId,
           // Tell the engine where this call intends to write, so a lease at an
           // already-committed position is refused before the body runs rather
@@ -262,6 +283,7 @@ export function tool<A extends unknown[], R>(
             callCoordination,
             agentId,
             ikey,
+            leaseTtlMs,
           );
         }
         return envelope?.result as R;
@@ -274,13 +296,26 @@ export function tool<A extends unknown[], R>(
 
       if (resp.status === CacheStatus.ACQUIRED) {
         fencingToken = Number(resp.fencingToken ?? 0n);
-        intervalMs = Number(resp.heartbeatIntervalMs ?? 5000n);
+        const engineInterval = Number(resp.heartbeatIntervalMs ?? 0n);
+        const suggested = engineInterval > 0 ? engineInterval : 5000;
+        // Renew at least every quarter of the TTL the renewals extend by, so the
+        // lease cannot lapse between them. Released engines suggest exactly that;
+        // the shorter of the two covers one that suggests otherwise, and an
+        // engine that suggests no interval gets the old 5 s default.
+        intervalMs =
+          leaseTtlMs !== undefined
+            ? Math.min(suggested, Math.max(1, Math.floor(leaseTtlMs / 4)))
+            : suggested;
         hb = new LeaseHeartbeat({
           client: ctx.client,
           agentId,
           idempotencyKey: ikey,
           fencingToken,
           heartbeatIntervalMs: intervalMs,
+          // Each renewal asks for the TTL the lease was taken with. Without one,
+          // the heartbeat infers the engine's default from its interval.
+          extendMs: leaseTtlMs,
+          leaseTtlMs,
           acquiredSentAt,
           acquiredSentWallAt,
         });
