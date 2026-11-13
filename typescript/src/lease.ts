@@ -54,6 +54,14 @@ export function checkLeaseTtlMs(
  */
 const MAX_TIMER_MS = 2 ** 31 - 1;
 
+/**
+ * The longest a renewal may take before it is abandoned. A renewal that has not
+ * answered by then is not coming back, and `stop()` waits for the one in
+ * flight, so a long TTL would otherwise hold a tool's return for half an
+ * interval: 7.5 minutes for an hour-long lease.
+ */
+const MAX_RENEWAL_WAIT_MS = 10_000;
+
 export interface LeaseHeartbeatOptions {
   client: CellaflowClient;
   agentId: string;
@@ -382,10 +390,14 @@ export class LeaseHeartbeat {
         // Bound the RPC to half an interval, so a renewal that hangs gives up
         // before the next tick is due. Short TTLs get up to a second, never
         // more than half the TTL: a renewal is a synced write, and one that
-        // takes longer than a short interval still keeps the lease.
-        Math.max(
-          Math.floor(this.opts.heartbeatIntervalMs / 2),
-          Math.min(1000, Math.floor(this.opts.extendMs / 2)),
+        // takes longer than a short interval still keeps the lease. Long ones
+        // get at most MAX_RENEWAL_WAIT_MS, which stop() then waits at most.
+        Math.min(
+          MAX_RENEWAL_WAIT_MS,
+          Math.max(
+            Math.floor(this.opts.heartbeatIntervalMs / 2),
+            Math.min(1000, Math.floor(this.opts.extendMs / 2)),
+          ),
         ) / 1000,
       );
       if (this.stopped) return false;

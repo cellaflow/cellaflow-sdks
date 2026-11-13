@@ -25,6 +25,10 @@ All notable changes to the Cellaflow TypeScript SDK.
 - **An `executionLease` TTL above about 99 days made its heartbeat renew in a tight loop:** the
   renewal interval, a quarter of the TTL, overflowed Node's timers, which fire at once for anything
   over 2^31 - 1 ms. The heartbeat now caps the interval, so a tool's `ttlMs` gets the same cap.
+- **A renewal that hung could hold up the return of a tool or an `executionLease` block for half a
+  renewal interval** (7.5 minutes for an hour-long TTL), because stopping the heartbeat waits for
+  the renewal in flight. A renewal
+  is now abandoned after at most 10 s, as in the Python SDK.
 
 ## 0.10.0
 
