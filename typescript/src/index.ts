@@ -37,4 +37,5 @@ export {
 } from "./execution.js";
 export type { ExecutionLeaseOptions } from "./execution.js";
 export type { LeaseEvent } from "./lease.js";
+export { MIN_LEASE_TTL_MS } from "./lease.js";
 export { WorkflowContext } from "./context.js";

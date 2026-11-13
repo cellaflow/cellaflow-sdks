@@ -8,6 +8,7 @@ import {
   runWithContext,
 } from "./context.js";
 import { normalizeCoordinationId } from "./idempotency.js";
+import { checkLeaseTtlMs } from "./lease.js";
 
 /**
  * Appended to a caller's thread id to derive the tool session, keeping it
@@ -87,6 +88,12 @@ export interface DurableToolsOptions {
    * keys would otherwise change underneath it.
    */
   coordinationId?: string;
+  /**
+   * The lease TTL, in milliseconds, for every {@link tool} called in the block
+   * that does not set its own `ttlMs`. With neither, the engine's default
+   * applies. At least 1000. See the `ttlMs` option of {@link tool}.
+   */
+  ttlMs?: number;
 }
 
 /**
@@ -169,6 +176,7 @@ export async function durableTools<T>(
   // Checked before anything is opened, so an invalid id fails here rather than
   // at the engine.
   const coordinationId = normalizeCoordinationId(options.coordinationId);
+  const leaseTtlMs = checkLeaseTtlMs(options.ttlMs, "durableTools");
 
   const threadId = threadIdFrom(config);
   const sessionId = toolSessionId(threadId);
@@ -193,6 +201,7 @@ export async function durableTools<T>(
     // the cache. Its position is read before that claim, not here, so a resume
     // whose calls are all cache hits reads nothing. See `ensurePosition`.
     positionKnown: !resp.isRecovered,
+    leaseTtlMs,
   });
 
   const session: DurableSession = {

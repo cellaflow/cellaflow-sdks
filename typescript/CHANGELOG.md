@@ -2,6 +2,30 @@
 
 All notable changes to the Cellaflow TypeScript SDK.
 
+## Unreleased
+
+### Added
+
+- **A lease TTL for tools.** `tool(fn, { ttlMs })`, and `durableTools(thread, { ttlMs })` as the
+  default for every tool in the block, set how long a call's lease lasts without a renewal, and so
+  how soon another caller can take over a call whose process crashed or froze: one TTL after the
+  holder's last renewal, plus up to a second for the waiting caller to ask again. A tool's own
+  `ttlMs` overrides the block's, and `step` takes it too. Renewals ask for the same TTL, and the
+  lease that records a call's shared result or failure in the session uses the TTL of that call.
+  That lease is not renewed, so the TTL also bounds how long the record's write may take. Without
+  `ttlMs` nothing changes: the engine's default applies, 20 s on current engines. A holder that
+  stops renewing for one TTL while its body still runs is taken over too, so set it well above the
+  longest pause a call can see. `ttlMs` must be a whole number of milliseconds, at least 1000
+  (`MIN_LEASE_TTL_MS`, exported): otherwise `tool` throws a `RangeError` when the tool is created,
+  and `durableTools` rejects with one before it connects. The engine's maximum lease lifetime still
+  caps every lease.
+
+### Fixed
+
+- **An `executionLease` TTL above about 99 days made its heartbeat renew in a tight loop:** the
+  renewal interval, a quarter of the TTL, overflowed Node's timers, which fire at once for anything
+  over 2^31 - 1 ms. The heartbeat now caps the interval, so a tool's `ttlMs` gets the same cap.
+
 ## 0.10.0
 
 ### Behaviour changes

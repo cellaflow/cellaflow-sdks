@@ -96,6 +96,22 @@ await durableTools("ticket-4417", { coordinationId: "ticket-4417" }, async () =>
 
 **Rules.** A coordination id may not contain colons, may not have leading or trailing whitespace, and may not exceed 256 bytes; an empty string means none. Invalid values throw before anything runs, and are never trimmed. `normalizeCoordinationId` applies the same check.
 
+## How long a tool's lease lasts
+
+While a tool's body runs, the call holds a lease, renewed every quarter of its TTL. If the process crashes or freezes, another caller can take the call over once the lease lapses: within one TTL of the holder's last renewal. By default that is the engine's TTL, 20 s on current engines. Set `ttlMs` to change it, for every tool in a `durableTools` block or for one tool:
+
+```typescript
+const charge = tool(chargeCard, { toolName: "charge_card", ttlMs: 6_000 });
+const sendReceipt = tool(emailReceipt, { toolName: "send_receipt" });
+
+await durableTools("ticket-4417", { ttlMs: 10_000 }, async () => {
+  await charge(order);      // 6 s: the tool's own ttlMs wins
+  await sendReceipt(order); // 10 s: the block's
+});
+```
+
+A shorter TTL means a faster takeover, and more renewals while a call runs. A holder that stops renewing for one TTL while its body still runs (a blocked event loop, a long garbage-collection pause, a lost connection to the engine) is taken over too, so set the TTL well above the longest pause a call can see. The lease that records a call's shared result or failure in the session is not renewed, so the TTL also bounds how long that one write may take. The TTL that decides a takeover is the holder's: a waiting caller's own `ttlMs` does not shorten it. A waiting caller asks again about once a second, so it takes over up to a second after the lease lapses. `ttlMs` must be a whole number of milliseconds, at least 1000 (`MIN_LEASE_TTL_MS`); anything else makes `tool` throw a `RangeError` when the tool is created, and makes `durableTools` reject with one before it connects. The engine's maximum lease lifetime (`CELLAFLOW_MAX_LEASE_LIFETIME_MS`, an hour by default) caps every lease, whatever is asked for.
+
 ## Execution leases
 
 `executionLease` runs a block while holding a lock on a key, renewed by a heartbeat. One worker holds it at a time; if that worker dies, the lease stops being renewed and the next worker gets it once the TTL runs out, with a higher fencing token.

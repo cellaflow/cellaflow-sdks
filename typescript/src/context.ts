@@ -3,6 +3,7 @@ import type { CellaflowClient } from "./client.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { failureIdempotencyKey, recordIdempotencyKey } from "./idempotency.js";
+import { checkLeaseTtlMs } from "./lease.js";
 import {
   errorCode,
   hasStatusCode,
@@ -30,6 +31,8 @@ interface PendingHit {
    * It lives and goes with the record. See {@link WorkflowContext.writeRecord}.
    */
   unreleased?: UnreleasedLease;
+  /** The TTL the recorded call's lease was taken with, for the record's own lease. */
+  leaseTtlMs?: number;
 }
 
 /** A failed call's lease that could not be released. */
@@ -109,6 +112,12 @@ export class WorkflowContext {
   readonly coordinationId?: string;
 
   /**
+   * The lease TTL every tool in the session asks for, unless the tool sets its
+   * own. Undefined asks for the engine's default.
+   */
+  readonly leaseTtlMs?: number;
+
+  /**
    * The session position the engine last reported, held from a cache hit until
    * the next step consumes it. See {@link reconcileSequence}.
    */
@@ -148,12 +157,14 @@ export class WorkflowContext {
     coordinationId?: string;
     historyKnown?: boolean;
     positionKnown?: boolean;
+    leaseTtlMs?: number;
   }) {
     this.client = init.client;
     this.sessionId = init.sessionId;
     this.workflowVersion = init.workflowVersion;
     this.sequence = init.sequence ?? 0;
     this.coordinationId = init.coordinationId;
+    this.leaseTtlMs = checkLeaseTtlMs(init.leaseTtlMs, "WorkflowContext", "leaseTtlMs");
     // Opt-in: a context built for a session whose history it never read must not
     // record into it.
     this.historyKnown = init.historyKnown ?? false;
@@ -192,6 +203,7 @@ export class WorkflowContext {
     coordinationId?: string,
     agentId = "default",
     receivedKey = "",
+    leaseTtlMs?: number,
   ): void {
     this.pendingHit = {
       kind: "result",
@@ -202,6 +214,7 @@ export class WorkflowContext {
       coordinationId,
       agentId,
       receivedKey,
+      leaseTtlMs,
     };
   }
 
@@ -225,6 +238,7 @@ export class WorkflowContext {
     agentId = "default",
     stepKey = "",
     unreleased?: UnreleasedLease,
+    leaseTtlMs?: number,
   ): void {
     // As for a hit: a run that does not know everything the session holds (a
     // resumed `durableTools` session) would record at a position already filled.
@@ -250,6 +264,7 @@ export class WorkflowContext {
       agentId,
       receivedKey: stepKey,
       unreleased: lease,
+      leaseTtlMs,
     };
   }
 
@@ -289,13 +304,14 @@ export class WorkflowContext {
     coordinationId?: string,
     agentId = "default",
     receivedKey = "",
+    leaseTtlMs?: number,
   ): void {
     // No other call is in flight now, and none claimed a later position while this
     // one waited: one that did and then failed without committing leaves the
     // counter past `sequence`.
     const alone = this.inFlight === 1 && this.sequence === sequence;
     if (alone && this.historyKnown && reported === sequence - 1) {
-      this.deferHitRecord(sequence, name, payload, coordinationId, agentId, receivedKey);
+      this.deferHitRecord(sequence, name, payload, coordinationId, agentId, receivedKey, leaseTtlMs);
       return;
     }
     // The run can no longer tell what the session holds.
@@ -422,7 +438,8 @@ export class WorkflowContext {
           pending.agentId,
           key,
           undefined,
-          undefined,
+          // The same TTL as the call it records.
+          pending.leaseTtlMs,
           this.sessionId,
           pending.sequence,
         );
