@@ -14,6 +14,7 @@ import {
 } from "../dist/index.js";
 import { serialize } from "../dist/serialization.js";
 import { runWithContext } from "../dist/context.js";
+import { LeaseHeartbeat } from "../dist/lease.js";
 
 /**
  * Records every acquisition and renewal. Acquisitions are answered from
@@ -250,4 +251,34 @@ test("an engine that suggests no interval gets renewals every quarter of the TTL
   await runWithContext(session(client), () => charge());
   const n = client.renewals.length;
   assert.ok(n >= 2 && n <= 3, `renewed ${n} times in 700 ms`);
+});
+
+test("a renewal is abandoned after at most 10 s, however long the TTL", async () => {
+  // stop() waits for the renewal in flight, so a hung one would otherwise hold a
+  // tool's return for half an interval: 7.5 minutes for an hour-long lease.
+  const timeouts = [];
+  const client = {
+    async renewLease(agentId, key, fencingToken, extendMs, timeoutSec) {
+      timeouts.push(timeoutSec);
+      return { renewed: true };
+    },
+  };
+  const make = (ttl) =>
+    new LeaseHeartbeat({
+      client,
+      agentId: "a",
+      idempotencyKey: "k",
+      fencingToken: 1,
+      heartbeatIntervalMs: ttl / 4,
+      extendMs: ttl,
+      leaseTtlMs: ttl,
+    });
+  for (const ttl of [3_600_000, 20_000, 1000]) {
+    const hb = make(ttl);
+    await hb.renewNow();
+    await hb.stop();
+  }
+  // An hour: capped. The 20 s default: half its 5 s interval, as before. One
+  // second: half the TTL, as before.
+  assert.deepEqual(timeouts, [10, 2.5, 0.5]);
 });

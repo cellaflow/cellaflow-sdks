@@ -2,6 +2,41 @@
 
 All notable changes to the Cellaflow Python SDK.
 
+## Unreleased
+
+### Added
+
+- **A lease TTL for steps and tools.** `@tool(lease_ttl_ms=...)` and `@step(lease_ttl_ms=...)`,
+  and `durable_tools(..., lease_ttl_ms=...)` as the default for every call in the block, set how
+  long a call's lease lasts without a renewal, and so how soon another caller can take over a call
+  whose process crashed or froze: one TTL after the holder's last renewal, plus up to a second for
+  the waiting caller to ask again. A step's own value overrides the block's. Renewals ask for the
+  same TTL and come at least every quarter of it, and the lease that records a call's shared result
+  or failure in the session uses the TTL of that call. That lease is not renewed, so the TTL also
+  bounds how long the record's write may take. Without `lease_ttl_ms` nothing changes: the engine's
+  default applies, 20 s on current engines. A holder that stops renewing for one TTL while its body
+  still runs is taken over too, so set it well above the longest pause a call can see. It must be a
+  whole number of milliseconds, from 1000 to 2^53 - 1 (`MIN_LEASE_TTL_MS` and `MAX_LEASE_TTL_MS`,
+  exported), the same range as the TypeScript SDK's `ttlMs`: otherwise the decorator or
+  `durable_tools` raises `ValueError`, or `TypeError` for a value that is not an `int`, before
+  anything connects. The engine's maximum lease lifetime still caps every lease.
+
+### Fixed
+
+- **A lease heartbeat whose renewal interval was too long for Python's timers stopped with
+  `OverflowError`,** so the lease was never renewed: from a TTL of about 199 days on Windows, and
+  over a thousand years elsewhere. The heartbeat now caps its interval at 2^31 - 1 ms, as the
+  TypeScript SDK does.
+- **A renewal that hung could hold up a step's return for up to a quarter of a long TTL** (15
+  minutes for an hour-long `execution_lease`). A renewal is now abandoned after at most 10 s.
+- **With a long `lease_ttl_ms`, an engine outage could hold up a workflow's return for as long as
+  the TTL.** A workflow that caught a step's failure and returned waits to record the failure, and
+  when the step's lease could not be released, it waited for that lease to lapse even while the
+  engine was unreachable. It still waits out a lease the engine reports holding the position, but
+  gives up after 30 s of errors in a row (a hung call counts), drops the record with a warning, and
+  returns, so a re-run runs the step again. At the engine's default TTL the wait is about 27 s, so
+  nothing changes there.
+
 ## 0.10.0
 
 ### Compatibility

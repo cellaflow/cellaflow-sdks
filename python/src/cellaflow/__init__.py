@@ -29,6 +29,7 @@ from cellaflow.execution import (
     LeaseNotAcquired,
     LeaseLostError,
 )
+from cellaflow.lease import MAX_LEASE_TTL_MS, MIN_LEASE_TTL_MS
 
 if TYPE_CHECKING:
     # Imported for type checkers only. At runtime `__getattr__` below loads it
@@ -59,6 +60,8 @@ __all__ = [
     "LeaseHandle",
     "LeaseNotAcquired",
     "LeaseLostError",
+    "MIN_LEASE_TTL_MS",
+    "MAX_LEASE_TTL_MS",
 ]
 
 

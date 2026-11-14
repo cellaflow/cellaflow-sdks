@@ -24,6 +24,7 @@ from cellaflow.failures import (
     unrecorded,
 )
 from cellaflow.idempotency import failure_idempotency_key, record_idempotency_key
+from cellaflow.lease import check_lease_ttl_ms
 from cellaflow.v1 import common_pb2, idempotency_pb2, service_pb2
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,11 @@ _REFUSAL_COPY = "_cellaflow_refusal_copy"
 #: unreleased lease is not what holds it up: for someone else's lease on its
 #: position, or for an engine error that may pass.
 _FINAL_HELD_WAIT_S = 5.0
+#: How long the last failure record keeps retrying errors that may pass, in a
+#: row, before it is dropped. Longer than the default lease lapses it may wait
+#: for (about 27 s at the engine's 20 s TTL), so those runs wait as they always
+#: have, while a long `lease_ttl_ms` cannot hold the return through an outage.
+_FINAL_ERROR_WAIT_S = 30.0
 #: Between tries of the last failure record after an error that may pass.
 _FINAL_RETRY_S = 0.5
 #: How long after its estimated lapse a failed step's unreleased lease is still
@@ -119,6 +125,10 @@ class WorkflowContext:
     # call reads the session's position, unless a cache hit has reported it by
     # then. See `_ensure_position`.
     position_known: bool = True
+    # How long the leases of this session's steps last without a renewal, in
+    # milliseconds, unless a step sets its own. None asks for the engine's
+    # default. See `step`'s `lease_ttl_ms`.
+    lease_ttl_ms: Optional[int] = None
     # A cache hit's result, waiting to be recorded at its position in this
     # session. Written when the next step starts. See `defer_hit_record`.
     _pending_hit: Optional[Dict[str, Any]] = None
@@ -156,6 +166,9 @@ class WorkflowContext:
     _lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
     )
+
+    def __post_init__(self) -> None:
+        check_lease_ttl_ms(self.lease_ttl_ms, "WorkflowContext")
 
     def begin_call(self) -> int:
         """Counts a step as in flight and claims the next position for it.
@@ -299,6 +312,7 @@ class WorkflowContext:
         coordination_id: Optional[str],
         agent_id: str = "default",
         received_key: str = "",
+        lease_ttl_ms: Optional[int] = None,
     ) -> None:
         """Decides what a cache hit at `sequence` leaves in this session.
 
@@ -319,7 +333,13 @@ class WorkflowContext:
             alone = self._in_flight == 1 and self.sequence == sequence
             if alone and self.history_known and behind_by_one:
                 self.defer_hit_record(
-                    sequence, name, payload, coordination_id, agent_id, received_key
+                    sequence,
+                    name,
+                    payload,
+                    coordination_id,
+                    agent_id,
+                    received_key,
+                    lease_ttl_ms,
                 )
                 return
             # The run can no longer tell what the session holds.
@@ -344,6 +364,7 @@ class WorkflowContext:
         coordination_id: Optional[str],
         agent_id: str = "default",
         received_key: str = "",
+        lease_ttl_ms: Optional[int] = None,
     ) -> None:
         """Holds a cache hit's result to be recorded at `sequence` in this session.
 
@@ -359,7 +380,8 @@ class WorkflowContext:
 
         `received_key` is the idempotency key the hit answered, and `agent_id`
         the agent that asked. The record is leased by `agent_id`, under its own
-        key derived from the session, `sequence` and `received_key`. See
+        key derived from the session, `sequence` and `received_key`, for
+        `lease_ttl_ms`: the TTL of the call it records. See
         `record_idempotency_key`.
         """
         self._pending_hit = {
@@ -371,6 +393,7 @@ class WorkflowContext:
             "coordination_id": coordination_id,
             "agent_id": agent_id,
             "received_key": received_key,
+            "lease_ttl_ms": lease_ttl_ms,
         }
 
     def defer_failure_record(
@@ -382,6 +405,7 @@ class WorkflowContext:
         agent_id: str = "default",
         step_key: str = "",
         unreleased: Optional[Dict[str, Any]] = None,
+        lease_ttl_ms: Optional[int] = None,
     ) -> None:
         """Holds a step's failure to be recorded at `sequence` in this session.
 
@@ -419,6 +443,7 @@ class WorkflowContext:
             step_key,
             source=exc,
             unreleased=unreleased,
+            lease_ttl_ms=lease_ttl_ms,
         )
 
     def defer_cancellation_record(
@@ -431,6 +456,7 @@ class WorkflowContext:
         step_key: str = "",
         source: Optional[BaseException] = None,
         unreleased: Optional[Dict[str, Any]] = None,
+        lease_ttl_ms: Optional[int] = None,
     ) -> None:
         """Holds a step's cancellation to be recorded at `sequence`.
 
@@ -451,6 +477,7 @@ class WorkflowContext:
             step_key,
             source=source,
             unreleased=unreleased,
+            lease_ttl_ms=lease_ttl_ms,
         )
 
     def _hold_failure(
@@ -463,6 +490,7 @@ class WorkflowContext:
         step_key: str,
         source: Optional[BaseException] = None,
         unreleased: Optional[Dict[str, Any]] = None,
+        lease_ttl_ms: Optional[int] = None,
     ) -> None:
         """Holds a failure-kind record, if nothing claimed a later position.
 
@@ -495,6 +523,7 @@ class WorkflowContext:
                 "coordination_id": coordination_id,
                 "agent_id": agent_id,
                 "received_key": step_key,
+                "lease_ttl_ms": lease_ttl_ms,
             }
 
     def _can_hold(self, sequence: int) -> bool:
@@ -738,10 +767,12 @@ class WorkflowContext:
         async workflow the write runs on a worker thread; if the caller cancels
         the workflow meanwhile, the write still finishes there.
 
-        Errors that may pass are retried, and a lease holding the position is
-        waited out, until the failed step's own unreleased lease lapses or for
-        `_FINAL_HELD_WAIT_S`, whichever is later. Every engine call is bounded
-        by what is left of that time. A record that still cannot be written,
+        A lease holding the position is waited out, until the failed step's own
+        unreleased lease lapses or for `_FINAL_HELD_WAIT_S`, whichever is later.
+        Errors that may pass are retried for at most `_FINAL_ERROR_WAIT_S` in a
+        row, so an engine that is down does not hold the return for as long as
+        a long lease TTL. Every engine call is bounded by what is left of the
+        time, and of the error budget. A record that still cannot be written,
         or that the engine refuses, is dropped with a warning, and a re-run
         runs the step again, as before failures were recorded.
         """
@@ -752,13 +783,24 @@ class WorkflowContext:
         unreleased = pending.get("unreleased")
         if unreleased is not None:
             deadline = max(deadline, unreleased["lapses_at"] + _LAPSE_GRACE_S)
-        self._rpc_deadline = deadline
+        # When the run of errors that may pass began, if one is under way.
+        failing_since: Optional[float] = None
         try:
             last_try = False
             while self._pending_hit is pending:
+                tried_at = time.monotonic()
+                # A call that hangs counts against the error budget it would
+                # start, so a stalled engine is dropped on time too.
+                budget_from = failing_since if failing_since is not None else tried_at
+                self._rpc_deadline = min(deadline, budget_from + _FINAL_ERROR_WAIT_S)
                 try:
                     wait = self._settle_pending()
                     reason = "a lease still holds its position"
+                    limit = deadline
+                    if failing_since is not None:
+                        # An answer ends the run of errors, and the last try
+                        # it was given.
+                        failing_since, last_try = None, False
                 except Exception as exc:
                     code = exc.code() if isinstance(exc, grpc.RpcError) else None
                     if code is None or code not in _RETRYABLE_CODES:
@@ -769,9 +811,12 @@ class WorkflowContext:
                     # It may have landed despite the error (a deadline that
                     # passed after the commit): the next try finds it written.
                     wait, reason = _FINAL_RETRY_S, f"{code.name}: {exc}"
+                    if failing_since is None:
+                        failing_since = tried_at
+                    limit = min(deadline, failing_since + _FINAL_ERROR_WAIT_S)
                 if not wait:
                     return  # written, or refused and dropped by the write itself
-                remaining = deadline - time.monotonic()
+                remaining = limit - time.monotonic()
                 if last_try or remaining <= 0:
                     self._drop_final_record(pending, reason)
                     return
@@ -932,6 +977,9 @@ class WorkflowContext:
             resp = self.client.check_idempotency_cache(
                 agent_id=agent_id,
                 idempotency_key=key,
+                # The TTL of the call the record is for. The record's lease is
+                # not renewed, so this also bounds how long the write may take.
+                lease_ttl_ms=pending.get("lease_ttl_ms"),
                 session_id=self.session_id,
                 sequence=pending["sequence"],
                 timeout=self._rpc_timeout(),

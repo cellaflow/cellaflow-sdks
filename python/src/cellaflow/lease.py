@@ -8,6 +8,52 @@ from cellaflow.client import CellaflowClient
 
 logger = logging.getLogger(__name__)
 
+#: The shortest lease TTL a step or tool may ask for, in milliseconds. Shorter
+#: leases leave too little time between renewals for a holder that is merely
+#: slow, rather than gone, to keep its lease.
+MIN_LEASE_TTL_MS = 1000
+
+#: The longest renewal interval the heartbeat waits, in milliseconds: 2^31 - 1,
+#: as in the TypeScript SDK. A longer wait gains nothing, since the engine's
+#: maximum lease lifetime ends the lease long before, and a wait past what
+#: `threading.Event.wait` accepts would stop the heartbeat with an error.
+_MAX_INTERVAL_MS = 2**31 - 1
+
+#: The longest TTL the SDK asks for, in milliseconds: 2^53 - 1, the largest
+#: TypeScript can send exactly, so both SDKs accept the same values. The engine's
+#: maximum lease lifetime caps far below it.
+MAX_LEASE_TTL_MS = 2**53 - 1
+
+#: The longest a renewal may take before it is abandoned, in seconds. A renewal
+#: that has not answered by then is not coming back, and a long TTL would
+#: otherwise make a step's return wait up to a quarter of it for a hung one.
+_MAX_RENEWAL_WAIT_S = 10.0
+
+
+def check_lease_ttl_ms(
+    lease_ttl_ms: Optional[int], where: str, field: str = "lease_ttl_ms"
+) -> Optional[int]:
+    """Refuses a lease TTL the SDK will not ask for, naming where it was given.
+
+    None means the default (the engine's) and passes through. Anything else must
+    be a whole number of milliseconds, from `MIN_LEASE_TTL_MS` to
+    `MAX_LEASE_TTL_MS`.
+    """
+    if lease_ttl_ms is None:
+        return None
+    if not isinstance(lease_ttl_ms, int) or isinstance(lease_ttl_ms, bool):
+        raise TypeError(
+            f"{where}: {field} must be a whole number of milliseconds, from "
+            f"{MIN_LEASE_TTL_MS} to {MAX_LEASE_TTL_MS}; got "
+            f"{type(lease_ttl_ms).__name__} {lease_ttl_ms!r}."
+        )
+    if not MIN_LEASE_TTL_MS <= lease_ttl_ms <= MAX_LEASE_TTL_MS:
+        raise ValueError(
+            f"{where}: {field} must be a whole number of milliseconds, from "
+            f"{MIN_LEASE_TTL_MS} to {MAX_LEASE_TTL_MS}; got {lease_ttl_ms}."
+        )
+    return lease_ttl_ms
+
 
 def _renew_failure_detail(reason: int) -> str:
     """Explains a renewal denial in terms of what the holder should do."""
@@ -58,8 +104,11 @@ class LeaseHeartbeat:
         self.idempotency_key = idempotency_key
         self.fencing_token = fencing_token
         self.on_lease_lost = on_lease_lost
-        # Renew slightly before expiration
-        self.interval_sec = max(0.1, (heartbeat_interval_ms - 100) / 1000.0)
+        # Renew slightly before expiration. Capped, so a very long TTL does not
+        # ask for a wait the timers cannot hold.
+        self.interval_sec = max(
+            0.1, (min(heartbeat_interval_ms, _MAX_INTERVAL_MS) - 100) / 1000.0
+        )
         # Renewals extend by the real TTL. Deriving `extend_ms` from the
         # interval instead would silently override a caller's `ttl_ms` on the
         # first heartbeat — a 60s lease renewed for 20s because the interval
@@ -71,9 +120,12 @@ class LeaseHeartbeat:
         self.extend_ms = self.lease_ttl_ms
         # A renewal must not outlive the lease it is renewing, and must not
         # outlive the interval either — otherwise renewals queue up behind a
-        # stalled connection. Floored so a short test interval stays workable.
+        # stalled connection. Capped, so a long TTL does not make a step's
+        # return wait on a hung renewal, and floored so a short test interval
+        # stays workable.
         self.rpc_timeout_sec = max(
-            1.0, min(self.interval_sec, self.lease_ttl_ms / 1000.0)
+            1.0,
+            min(self.interval_sec, self.lease_ttl_ms / 1000.0, _MAX_RENEWAL_WAIT_S),
         )
         # How long a shutdown waits for an in-flight renewal before giving up on
         # the thread. Bounded by construction: the RPC carries a deadline.

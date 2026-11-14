@@ -600,6 +600,8 @@ Decorators for atomic units of execution within a workflow:
     agent_id: str = "default",
     tool_name: Optional[str] = None,
     scope: IdempotencyScope = IdempotencyScope.SCOPE_SESSION_WIDE,
+    shared_on: Optional[Sequence[str]] = None,
+    lease_ttl_ms: Optional[int] = None,
 )
 ```
 - **Idempotency Key Derivation**: Automatically builds a deterministic key using:
@@ -611,6 +613,7 @@ Decorators for atomic units of execution within a workflow:
 - **Replay Interception**: If a step was already completed in the session history, immediately returns the cached output without re-running the function body.
 - **Lease Heartbeating**: Automatically runs background heartbeats (`RenewLease`) via daemon threads (sync) or asyncio tasks (async) to keep engine locks refreshed.
 - **Lock Release on Failure**: If an unhandled exception occurs, automatically releases the lease with `reason="TOOL_ERROR"`.
+- **Lease TTL**: `lease_ttl_ms` sets how long the call's lease lasts without a renewal. See [How long a step's lease lasts](#how-long-a-steps-lease-lasts).
 
 > **A lease is only as durable as its session.** The key is derived from the session id, and
 > `@workflow` generates a fresh session per call unless you pass `_session_id` — so without a
@@ -618,7 +621,27 @@ Decorators for atomic units of execution within a workflow:
 > resumed run to reuse a side effect's result rather than repeat it, pass a stable
 > `_session_id`. Inside LangGraph, use `durable_tools`, which derives one from the thread.
 
-### `durable_tools(config, *, workflow_id="langgraph", version="1.0.0", target=..., secure=False, coordination_id=None)`
+### How long a step's lease lasts
+
+While a step's body runs, the call holds a lease, renewed every quarter of its TTL. If the process crashes or freezes, another caller can take the call over once the lease lapses: one TTL after the holder's last renewal. By default that is the engine's TTL, 20 s on current engines. Set `lease_ttl_ms` to change it, for every `@tool` and `@step` in a `durable_tools` block or for one of them:
+
+```python
+@tool(lease_ttl_ms=6_000)
+def charge_card(order): ...
+
+@tool
+def send_receipt(order): ...
+
+with durable_tools(config, lease_ttl_ms=10_000):
+    charge_card(order)   # 6 s: the tool's own lease_ttl_ms wins
+    send_receipt(order)  # 10 s: the block's
+```
+
+A shorter TTL means a faster takeover, and more renewals while a call runs. A holder that stops renewing for one TTL while its body still runs (a long garbage-collection pause, a process stopped by the OS, a lost connection to the engine) is taken over too, so set the TTL well above the longest pause a call can see. The TTL that decides a takeover is the holder's: a waiting caller's own `lease_ttl_ms` does not shorten it. A waiting caller asks again about once a second, so it takes over up to a second after the lease lapses. The lease that records a call's shared result or failure in the session uses the TTL of that call, and is not renewed, so the TTL also bounds how long that one write may take.
+
+`lease_ttl_ms` must be a whole number of milliseconds, from 1000 (`MIN_LEASE_TTL_MS`) to 2^53 - 1 (`MAX_LEASE_TTL_MS`): a number outside that makes the decorator or `durable_tools` raise `ValueError`, and anything that is not an `int` raises `TypeError`, before anything connects. The engine's maximum lease lifetime (`CELLAFLOW_MAX_LEASE_LIFETIME_MS`, an hour by default) caps every lease, whatever is asked for. The TypeScript SDK's `ttlMs` works the same way, so agents in both languages can be configured alike.
+
+### `durable_tools(config, *, workflow_id="langgraph", version="1.0.0", target=..., secure=False, coordination_id=None, api_key=None, lease_ttl_ms=None)`
 Context manager that makes `@tool` work inside LangGraph node bodies, where there is no
 `@workflow` frame to resolve. Derives a session from the graph's `thread_id`, establishes the
 context around the invocation, and loads previously committed steps so a resumed run replays them
@@ -636,6 +659,9 @@ mapping for inspection. See [Leased Tool Calls Inside LangGraph Nodes](#6-leased
 
 `coordination_id` sets the session's default coordination domain, as `_coordination_id` does for
 `@workflow`. A later block for the same thread may omit it and adopts the stored value.
+
+`lease_ttl_ms` is the lease TTL of every `@tool` and `@step` call in the block that does not set
+its own. See [How long a step's lease lasts](#how-long-a-steps-lease-lasts).
 
 `config` is the same mapping you pass to `invoke` — only `configurable.thread_id` is read from it,
 and a bare thread id string is accepted too. Leasing is independent of where checkpoints are

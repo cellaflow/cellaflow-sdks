@@ -19,6 +19,7 @@ from typing import Any, Iterator, Optional, cast
 
 from cellaflow.client import CellaflowClient
 from cellaflow.idempotency import normalize_coordination_id
+from cellaflow.lease import check_lease_ttl_ms
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,7 @@ def durable_tools(
     secure: bool = False,
     coordination_id: Optional[str] = None,
     api_key: Optional[str] = None,
+    lease_ttl_ms: Optional[int] = None,
 ) -> Iterator[Any]:
     """Leases the `@tool` calls made inside this block.
 
@@ -148,6 +150,9 @@ def durable_tools(
 
     `api_key` authenticates with the engine; when omitted it is read from
     `CELLAFLOW_API_KEY`. See `CellaflowClient`.
+
+    `lease_ttl_ms` is the lease TTL of every `@tool` and `@step` call in the
+    block that does not set its own. See `step`. Checked before connecting.
     """
     from cellaflow.context import (
         WorkflowContext,
@@ -158,6 +163,7 @@ def durable_tools(
         _deregister_session,
     )
 
+    lease_ttl_ms = check_lease_ttl_ms(lease_ttl_ms, "durable_tools")
     thread_id = _thread_id_from(config)
     session_id = tool_session_id(thread_id)
     coordination_id = normalize_coordination_id(coordination_id)
@@ -210,6 +216,7 @@ def durable_tools(
         # A resumed thread re-runs only its pending node, so this run never sees
         # what the session already holds, and must not record cache hits into it.
         history_known=not resp.is_recovered,
+        lease_ttl_ms=lease_ttl_ms,
     )
     # Registered as well as set: the ContextVar covers frameworks that dispatch
     # tools on the calling context, and the registry covers those that do not.
