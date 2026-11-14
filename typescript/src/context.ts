@@ -286,6 +286,24 @@ export class WorkflowContext {
   }
 
   /**
+   * Hands back the position a call claimed and left unwritten, so the next call
+   * claims it instead of landing one past an empty one. For a call another
+   * worker took over: its outcome belongs to that worker, so nothing is recorded
+   * there in its name, and calling the tool again finds that worker's result.
+   * Only while no later position was claimed meanwhile: the call then holds the
+   * top position, so handing it back defers no write, even with lower calls
+   * still in flight. Otherwise the position stays empty and the run stops
+   * recording, for the reason a failure record does.
+   */
+  giveBackPosition(sequence: number): void {
+    if (this.sequence === sequence) {
+      this.sequence = sequence - 1;
+      return;
+    }
+    this.historyKnown = false;
+  }
+
+  /**
    * Decides what a cache hit at `sequence` leaves in this session.
    *
    * The hit is recorded at its position only when nothing else could have moved
