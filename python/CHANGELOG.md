@@ -28,6 +28,14 @@ All notable changes to the Cellaflow Python SDK.
   raises `LeaseLostError` in their place. See "Checking the lease inside a step" in the README. The
   clock only tells the body to stop; whether the call's result is recorded is still the engine's
   decision.
+- **A step body can send its call's idempotency key to the destination.** `current_lease().key` is
+  the key the call's lease was taken under, the same on every attempt at the same call, and
+  `key_digest` its SHA-256 (64 lowercase hex characters). `idempotency_headers()` returns an
+  `Idempotency-Key` header carrying the digest (or the key, with `raw=True`) to merge into a request,
+  so a destination that deduplicates applies a request repeated after a crash once.
+  `key_digest_for(part)` and `idempotency_headers(part=...)` give each of several requests its own
+  key, the same as the TypeScript SDK's. Execution-lease handles carry their key too. See "Sending
+  the call's key to the destination" in the README.
 
 ### Changed
 
@@ -39,7 +47,8 @@ All notable changes to the Cellaflow Python SDK.
   refused.
 - **A step body nested in `execution_lease` or `@task_lease` now gets the step call's lease from
   `current_lease()`**, not the enclosing one. Code that passes `current_lease().fencing_token` to a
-  downstream fence from inside a step should read the enclosing lease before calling the step.
+  downstream fence from inside a step should read the enclosing lease before calling the step. A
+  body the SDK runs without a lease of its own sees no lease at all.
 - **A step whose commit the engine refuses because another worker holds the call now ends with
   `LeaseLostError`** (the body's return value on its `result`, the refusal as its `__cause__`)
   instead of the engine's FAILED_PRECONDITION. The failure is recorded at the step's position as
