@@ -59,12 +59,14 @@ import asyncio
 import contextlib
 import contextvars
 import functools
+import hashlib
 import inspect
 import logging
+import re
 import threading
 import time
 import warnings
-from typing import Any, AsyncIterator, Callable, Iterator, List, Optional, Union
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Union
 
 from cellaflow.client import CellaflowClient, _check_api_key_argument
 from cellaflow.lease import LeaseHeartbeat
@@ -94,6 +96,12 @@ class LeaseNotAcquired(RuntimeError):
 
 
 _NO_RESULT: Any = object()
+_NO_PART: Any = object()
+
+#: A header name (an RFC 9110 token), and a header value this SDK will send
+#: as it is: printable ASCII, with no space at either end.
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+_HEADER_VALUE = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
 
 #: How often `cancel_on_loss` asks whether the lease has passed its deadline.
 _CANCEL_POLL_S = 0.05
@@ -124,8 +132,11 @@ class LeaseLostError(RuntimeError):
 class LeaseHandle:
     """Handle to an active execution lease.
 
-    Provides access to the fencing token, a check() method for cooperative
-    cancellation in synchronous code, and `cancel_on_loss()` for asyncio code.
+    Provides access to the fencing token, the idempotency key the lease is
+    held under (`key`, `key_digest`, `key_digest_for()`, `idempotency_headers()`),
+    a check() method
+    for cooperative cancellation in synchronous code, and `cancel_on_loss()`
+    for asyncio code.
 
     Loss is judged on the clock whenever it is asked about, when the handle has
     a `probe`: a holder resumed past its lease's deadline (a stopped process, a
@@ -133,15 +144,137 @@ class LeaseHandle:
     """
 
     def __init__(
-        self, fencing_token: int, probe: Optional[Callable[[], bool]] = None
+        self,
+        fencing_token: int,
+        probe: Optional[Callable[[], bool]] = None,
+        key: str = "",
     ) -> None:
         self.fencing_token = fencing_token
+        self._key = key
         self._lost = False
         self._released = False
         self._checked_after_loss = False
         self._probe = probe
         self._listeners: List[Callable[[], None]] = []
         self._lock = threading.Lock()
+
+    @property
+    def key(self) -> str:
+        """The idempotency key the lease is held under: the key a `@tool` /
+        `@step` call derived (or was given), or the `execution_lease` key.
+
+        A step call's key is the same on every attempt at the same call, as long
+        as its arguments are the same, so it can be forwarded to a destination
+        that deduplicates on it; see `idempotency_headers`. Under
+        `SCOPE_STEP_LOCAL` the key includes the call's position, which calling
+        the step again after a failure, or a resumed `durable_tools` thread,
+        can change, so prefer the session-wide or shared scopes, or an explicit
+        key, for forwarding.
+
+        An `execution_lease` key names a lock, which is released when the block
+        ends and taken again by the next run: forward it only when it names
+        exactly one operation (a task id), or add a run id of your own.
+
+        A derived key carries the ids it is made of (the session or thread id,
+        or the coordination id, the agent id and the step's name, by scope), so
+        `idempotency_headers` sends `key_digest` unless asked for the key.
+        """
+        return self._key
+
+    @property
+    def key_digest(self) -> str:
+        """SHA-256 of the UTF-8 `key`, as 64 lowercase hex characters: the same
+        on every attempt, like the key, ASCII and within the length destinations
+        allow (Stripe takes up to 255), and without the ids the key is made of
+        in readable form. It is not a secret: anyone who can guess the inputs of
+        a key can compute its digest."""
+        return hashlib.sha256(self._require_key().encode("utf-8")).hexdigest()
+
+    def key_digest_for(self, part: str) -> str:
+        """A digest for one of several requests a body sends under this lease:
+        the SHA-256 of `key_digest` followed by `part` (UTF-8), as 64 lowercase
+        hex characters, the same on every attempt, and different for each
+        `part`, which must be a non-empty string of whole characters (no
+        unpaired surrogates). A destination that
+        deduplicates refuses (Stripe) or answers from its first request
+        (others) a key reused for a different request, so each request needs
+        its own::
+
+            customer = lease.key_digest_for("customer")
+            payment = lease.key_digest_for("payment")
+            stripe.Customer.create(..., idempotency_key=customer)
+            stripe.PaymentIntent.create(..., idempotency_key=payment)
+
+        The same value as the TypeScript SDK's `keyDigestFor(part)`.
+        """
+        if not isinstance(part, str):
+            raise TypeError(
+                "key_digest_for: part must be a non-empty string, so requests "
+                "without one do not all share the call's key."
+            )
+        if not part:
+            raise ValueError(
+                "key_digest_for: part must be a non-empty string, so requests "
+                "without one do not all share the call's key."
+            )
+        try:
+            encoded = (self.key_digest + part).encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError(
+                "key_digest_for: part must be a string of whole characters."
+            ) from None
+        # The digest is fixed-length, so no key and part can run into another's.
+        return hashlib.sha256(encoded).hexdigest()
+
+    def idempotency_headers(
+        self,
+        *,
+        part: str = _NO_PART,
+        raw: bool = False,
+        header: str = "Idempotency-Key",
+    ) -> Dict[str, str]:
+        """Returns `{header: key_digest}` to merge into a request's headers, so
+        a destination that deduplicates on it applies a request repeated after
+        a crash once::
+
+            httpx.post(url, json=body, headers=current_lease().idempotency_headers())
+
+        `part` names one of several requests the body sends, and the header then
+        carries `key_digest_for(part)`. `raw=True` sends the key itself, which
+        must then be printable ASCII with no space at either end to go in a
+        header, and cannot be combined with `part`. `header` names another
+        header (PayPal: `PayPal-Request-Id`).
+
+        Merging into a plain dict is case-sensitive: drop any other spelling of
+        the header from your own headers first, or the request carries both.
+        """
+        if not _HEADER_NAME.fullmatch(header):
+            raise ValueError(f"{header!r} is not a valid header name.")
+        # `part=None` given explicitly is refused, not taken for the call's own
+        # key: requests without a part would all share it.
+        if part is not _NO_PART:
+            if raw:
+                raise TypeError(
+                    "part sends a digest, so it cannot be combined with raw."
+                )
+            return {header: self.key_digest_for(part)}
+        if not raw:
+            return {header: self.key_digest}
+        key = self._require_key()
+        if not _HEADER_VALUE.fullmatch(key):
+            raise ValueError(
+                "This lease's key contains characters a header cannot carry as "
+                "they are. Send its digest instead (the default)."
+            )
+        return {header: key}
+
+    def _require_key(self) -> str:
+        if not self._key:
+            raise ValueError(
+                "This lease has no idempotency key to send: a handle made "
+                "without one would make unrelated operations look like repeats."
+            )
+        return self._key
 
     @property
     def is_lost(self) -> bool:
@@ -437,7 +570,7 @@ def execution_lease(
         resp = _acquire(client, key, worker_id, ttl_ms)
         token = resp.fencing_token
         interval_ms = _resolve_interval(resp, heartbeat_interval_ms)
-        handle = LeaseHandle(token, probe=lambda: hb.past_deadline())
+        handle = LeaseHandle(token, probe=lambda: hb.past_deadline(), key=key)
 
         def _on_lost() -> None:
             # Reported after the block ended: the lease was let go, not lost.
@@ -557,7 +690,7 @@ async def async_execution_lease(
 
     token = resp.fencing_token
     interval_ms = _resolve_interval(resp, heartbeat_interval_ms)
-    handle = LeaseHandle(token, probe=lambda: hb.past_deadline())
+    handle = LeaseHandle(token, probe=lambda: hb.past_deadline(), key=key)
     caller_task = asyncio.current_task()
     caller_loop = asyncio.get_running_loop()
 
