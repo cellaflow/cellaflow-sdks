@@ -641,6 +641,34 @@ A shorter TTL means a faster takeover, and more renewals while a call runs. A ho
 
 `lease_ttl_ms` must be a whole number of milliseconds, from 1000 (`MIN_LEASE_TTL_MS`) to 2^53 - 1 (`MAX_LEASE_TTL_MS`): a number outside that makes the decorator or `durable_tools` raise `ValueError`, and anything that is not an `int` raises `TypeError`, before anything connects. The engine's maximum lease lifetime (`CELLAFLOW_MAX_LEASE_LIFETIME_MS`, an hour by default) caps every lease, whatever is asked for. The TypeScript SDK's `ttlMs` works the same way, so agents in both languages can be configured alike.
 
+### Checking the lease inside a step
+
+A `@tool` or `@step` body can reach its call's lease through `current_lease()`, the same handle `execution_lease` and `@task_lease` give. Check it right before anything irreversible. In async code, wrap the request in `cancel_on_loss()`:
+
+```python
+from cellaflow import IdempotencyScope, current_lease, tool
+
+@tool(scope=IdempotencyScope.SCOPE_SHARED, shared_on=["order"])
+async def refund(order: str, amount: int) -> str:
+    lease = current_lease()
+    lease.check()  # raises LeaseLostError if the lease is gone
+    async with lease.cancel_on_loss():
+        return await payments.refund(order, amount)
+```
+
+This is what stops a holder that froze (a long garbage-collection pause, a stopped process, a suspended laptop or VM) and woke up after another caller took the call over. The lease is judged on the clock: `check()` raises as soon as the holder resumes past its lease's deadline, before any renewal has to answer, so the request never leaves. `cancel_on_loss()` cancels the awaits inside it when the lease is lost meanwhile, including when its deadline passes with no renewal answered, and raises `LeaseLostError` in their place. It is opt-in: without it, a body keeps running until it checks.
+
+The clock only tells the body to stop. What happens to the call is up to the engine, which accepts a commit only while the lease is still this call's, that is, unless another worker has taken it over:
+
+- **The body returns:** its result is committed. If another worker holds the call now (in another session, or before it has committed), the engine refuses it, and the caller gets `LeaseLostError` with the body's return value on its `result`, for logging. If nobody took over, the commit stands, so a body that finished just as its deadline passed is recorded, not run again. A commit that gets no answer is sent once more before the lease is released, and again if the engine then refuses the release; only a refusal about the call's key counts as a takeover. `result` is for logging only: it is not kept in the session's history, so a resumed run that replays the failure raises `LeaseLostError` with `has_result` false.
+- **The body raises** (including `LeaseLostError` from `check()`): the lease is released, and the failure is recorded at the call's position, as for any failing step, whether or not another worker took the call over. A resumed `@workflow` replays by position, so it finds the failure where the run saw it. Calling the same step again lands one position on and, under a scope whose key does not include the position, finds the other worker's result or waits for it; if nobody took over, or under `SCOPE_STEP_LOCAL`, it runs the body again.
+
+The check covers a request that has not left. A request already on its way when the holder froze can still arrive, and so can one whose effect landed just before a crash, ahead of the commit. For those, give the destination a way to recognise a repeat, such as an idempotency key it deduplicates on.
+
+The clock can only judge what it can see: keep `lease_ttl_ms` below the engine's maximum lease lifetime (`CELLAFLOW_MAX_LEASE_LIFETIME_MS`), or a holder frozen past that limit can still pass `check()` when it wakes.
+
+Inside a step body, `current_lease()` is the step call's lease, even when the step is called from inside an `execution_lease` block or a `@task_lease` function. To pass the enclosing lease's fencing token downstream from a step, read it before calling the step. A cache hit or a replayed step never runs the body, so it never sees a lease; outside any lease, `current_lease()` raises `LookupError`, as before.
+
 ### `durable_tools(config, *, workflow_id="langgraph", version="1.0.0", target=..., secure=False, coordination_id=None, api_key=None, lease_ttl_ms=None)`
 Context manager that makes `@tool` work inside LangGraph node bodies, where there is no
 `@workflow` frame to resolve. Derives a session from the graph's `thread_id`, establishes the

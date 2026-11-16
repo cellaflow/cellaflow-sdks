@@ -288,6 +288,16 @@ def _small_enough(encoded: Any, limit: int = _MAX_VALUE_BYTES) -> bool:
         return False
 
 
+def _recordable(exc: BaseException, fields: Dict[str, Any]) -> Dict[str, Any]:
+    """Leaves out the attributes an exception class marks as not recorded, in
+    `_cellaflow_not_recorded`: values kept for the run that raised it, which a
+    resumed run reads from the class's defaults instead."""
+    skip = getattr(type(exc), "_cellaflow_not_recorded", ())
+    if isinstance(skip, str):
+        skip = (skip,)
+    return {k: v for k, v in fields.items() if k not in skip}
+
+
 def _builtin_fields(exc: BaseException) -> Dict[str, Any]:
     """Fields kept outside `args` and `__dict__`.
 
@@ -390,7 +400,7 @@ def _capture(exc: BaseException, depth: int) -> Dict[str, Any]:
                 unavailable_args.append(i)
                 arg_texts[str(i)] = _texts(arg)
 
-    fields = {**_builtin_fields(exc), **dict(vars(exc))}
+    fields = _recordable(exc, {**_builtin_fields(exc), **dict(vars(exc))})
     if "group" in recorded:
         for name in ("message", "exceptions"):
             fields.pop(name, None)
@@ -475,7 +485,7 @@ def _minimal(exc: BaseException, depth: int) -> Dict[str, Any]:
         if not ok:
             member["unavailable_args"].append(i)
     try:
-        fields = {**_builtin_fields(exc), **dict(vars(exc))}
+        fields = _recordable(exc, {**_builtin_fields(exc), **dict(vars(exc))})
     except Exception:
         fields = {}
     member["unavailable_attrs"] = sorted(n for n in fields if not n.startswith("__"))

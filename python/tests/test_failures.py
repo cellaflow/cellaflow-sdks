@@ -1387,7 +1387,7 @@ def test_a_release_that_failed_is_tried_again_before_the_failure_is_recorded(
     def release(req: Any, **kwargs: Any) -> Any:
         if releases:
             raise releases.pop()
-        return idempotency_pb2.ReleaseLeaseResponse()
+        return idempotency_pb2.ReleaseLeaseResponse(released=True)
 
     mock_stub.ReleaseLease.side_effect = release
     assert _failure_then_next(mock_stub, "sess-release")() == "notified"
@@ -1843,7 +1843,7 @@ def test_a_cancellation_records_how_long_the_step_ran_not_its_cleanup(
 
     def slow_release(req: Any, **kwargs: Any) -> Any:
         time.sleep(0.4)
-        return idempotency_pb2.ReleaseLeaseResponse()
+        return idempotency_pb2.ReleaseLeaseResponse(released=True)
 
     mock_stub.ReleaseLease.side_effect = slow_release
 
@@ -2158,8 +2158,9 @@ def test_an_unreleased_lease_allows_for_a_renewal_still_on_its_way() -> None:
     ctx = MagicMock()
     ctx.client.release_lease.side_effect = Unavailable()
     hb = MagicMock(lease_ttl_ms=20_000, rpc_timeout_sec=5.0)
-    lease = _release_after_failure(ctx, "agent", "key", 7, "charge", hb)
+    lease, released = _release_after_failure(ctx, "agent", "key", 7, "charge", hb)
     assert lease is not None and lease["lapses_in_s"] == 26.0
+    assert released is None
 
 
 def _refused_then(then: Callable[[], Any]) -> Callable[..., Any]:
@@ -2336,7 +2337,7 @@ def test_a_failed_steps_heartbeat_is_stopped_before_its_lease_is_released(
 
     def release(req: Any, **kwargs: Any) -> Any:
         order.append("lease released")
-        return idempotency_pb2.ReleaseLeaseResponse()
+        return idempotency_pb2.ReleaseLeaseResponse(released=True)
 
     mock_stub.ReleaseLease.side_effect = release
     _fresh(mock_stub, "sess-order")
