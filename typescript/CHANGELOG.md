@@ -9,15 +9,18 @@ All notable changes to the Cellaflow TypeScript SDK.
 - **A tool call waits for another agent's lease in the engine, not by polling.** A call that finds
   the key held asks the engine to wait (up to 10 s per request, asking again until it has an
   answer). It gets the holder's result the moment the holder commits, or the lease the moment it is
-  released or lapses, instead of up to a second later. All the callers waiting on one key share a
-  single watcher in the engine, so waiting no longer costs one request per caller per second. The
-  same applies to the lease that records a shared result in the session. An engine that answers at
-  once without waiting is asked again after its `retryAfterMs`, as before.
+  released or lapses, instead of up to a second later. The engine checks the holder every 100 ms
+  for all the callers waiting on one key, and each asks again at most every 10 s, instead of once a
+  second. The same applies to the lease that records a shared result or failure in the session. A
+  waiting request that gets no answer within 15 s fails the call, so a lost connection to the
+  engine is noticed. An engine that answers at once without waiting is asked again after its
+  `retryAfterMs`, as before.
 - **A lease granted after a wait is counted from when it was granted.** The lease can be much younger
   than the request that won it, so the call sends a renewal before the body starts and counts the
   lease from that, as `executionLease` already did with `waitMs`. A grant answered at once costs no
   extra request. If no renewal confirms the lease and the time counted from the request has already
-  passed, the body does not start under it: the call hands the lease back and asks again.
+  passed, the body does not start under it: the call hands the lease back and asks again. After
+  three such leases the call fails, saying why, instead of asking forever.
 
 ## 0.11.0
 

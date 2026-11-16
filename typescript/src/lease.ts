@@ -403,6 +403,9 @@ export class LeaseHeartbeat {
     const windowEnd = performance.now() + this.opts.leaseTtlMs - this.marginMs;
     for (let attempt = 0; attempt < 3 && !this.lost; attempt++) {
       if (await this.renewNow()) return;
+      // No pause after the last attempt: it would only delay the body, or
+      // the hand-back, while the lease runs down.
+      if (attempt === 2) return;
       const pause = Math.min(100 * 2 ** attempt, windowEnd - performance.now());
       if (pause <= 0) return;
       await new Promise((resolve) => setTimeout(resolve, pause));

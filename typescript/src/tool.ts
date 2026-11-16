@@ -6,7 +6,14 @@ import { IdempotencyScope, deriveIdempotencyKey, normalizeCoordinationId } from 
 import { LeaseHandle, LeaseLostError, runUnderLease, runWithoutLease } from "./execution.js";
 import { LeaseHeartbeat, checkLeaseTtlMs } from "./lease.js";
 import { deserialize, serialize } from "./serialization.js";
-import { ENGINE_WAIT_MS, afterInProgress } from "./wait.js";
+import { ENGINE_WAIT_DEADLINE_SECS, ENGINE_WAIT_MS, afterInProgress } from "./wait.js";
+
+/**
+ * How many granted leases a call hands back, unconfirmed, before it fails
+ * rather than asking again. A healthy engine needs none: a lease released at
+ * once is granted again at once, so the next grant is not late.
+ */
+const MAX_HAND_BACKS = 3;
 
 /**
  * Raised when the engine refuses a lease because another agent already owns the
@@ -260,6 +267,7 @@ export function tool<A extends unknown[], R>(
 
     // Arbitrate. Loop because IN_PROGRESS means another worker holds it and the
     // right move is to wait for their result rather than to act.
+    let handedBack = 0;
     for (;;) {
       let resp;
       const acquiredSentAt = performance.now();
@@ -279,6 +287,7 @@ export function tool<A extends unknown[], R>(
           // already-committed position is refused before the body runs rather
           // than after.
           seq,
+          ENGINE_WAIT_DEADLINE_SECS,
         );
       } catch (err) {
         if (isFailedPrecondition(err)) {
@@ -292,6 +301,8 @@ export function tool<A extends unknown[], R>(
       }
 
       if (resp.status === CacheStatus.HIT) {
+        // The key completed, so no lease of this call's is left to release.
+        known.unreleased = undefined;
         // A hit returns without executing. When nothing is recorded at `seq` yet,
         // the result is recorded there before the next step runs, so the history
         // matches the work. The context decides which.
@@ -315,11 +326,14 @@ export function tool<A extends unknown[], R>(
       }
 
       if (resp.status === CacheStatus.IN_PROGRESS) {
-        await afterInProgress(acquiredSentAt, resp.retryAfterMs);
+        await afterInProgress(acquiredSentAt, ENGINE_WAIT_MS, resp.retryAfterMs);
         continue;
       }
 
       if (resp.status === CacheStatus.ACQUIRED) {
+        // A lease handed back below and not released has lapsed or been
+        // released by now, or the engine would not grant the key again.
+        known.unreleased = undefined;
         fencingToken = Number(resp.fencingToken ?? 0n);
         const engineInterval = Number(resp.heartbeatIntervalMs ?? 0n);
         const suggested = engineInterval > 0 ? engineInterval : 5000;
@@ -375,13 +389,29 @@ export function tool<A extends unknown[], R>(
           // this side has already given up. Nothing has run, so hand the lease
           // back and ask again, which finds the call's result, waits behind its
           // holder, or grants a lease this side can count on.
+          const lapsesInMs = hb.lastsAtMostMs + 1000;
+          const token = fencingToken;
+          const detail = hb.lostDetail ?? "no renewal was confirmed";
           await hb.stop();
-          await ctx.client.releaseLease(agentId, ikey, fencingToken, "LEASE_UNCONFIRMED").catch(() => {
-            // It lapses on its own, and asking again waits that out.
+          await ctx.client.releaseLease(agentId, ikey, token, "LEASE_UNCONFIRMED").catch(() => {
+            // It lapses on its own, and asking again waits that out. Until it
+            // does, it still claims this position, so if the call fails, the
+            // failure record there retries the release or waits for it.
+            known.unreleased = { agentId, key: ikey, token, lapsesInMs };
           });
           hb = undefined;
           handle = undefined;
           fencingToken = 0;
+          handedBack += 1;
+          if (handedBack >= MAX_HAND_BACKS) {
+            // Every grant comes too late to count on and no renewal confirms
+            // one: the engine grants leases but will not renew them. Waiting
+            // longer only repeats that, so the call fails and says why.
+            throw new Error(
+              `Tool '${toolName}' could not confirm any of ${handedBack} leases the ` +
+                `engine granted it, so its body did not run: ${detail}.`,
+            );
+          }
           continue;
         }
         hb.start();

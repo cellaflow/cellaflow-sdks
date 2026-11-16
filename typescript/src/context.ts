@@ -4,7 +4,7 @@ import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { failureIdempotencyKey, recordIdempotencyKey } from "./idempotency.js";
 import { checkLeaseTtlMs } from "./lease.js";
-import { ENGINE_WAIT_MS, afterInProgress } from "./wait.js";
+import { ENGINE_WAIT_DEADLINE_SECS, ENGINE_WAIT_MS, afterInProgress } from "./wait.js";
 import {
   errorCode,
   hasStatusCode,
@@ -464,6 +464,7 @@ export class WorkflowContext {
           pending.leaseTtlMs,
           this.sessionId,
           pending.sequence,
+          ENGINE_WAIT_DEADLINE_SECS,
         );
       } catch (err) {
         const held = pending.unreleased;
@@ -489,7 +490,7 @@ export class WorkflowContext {
         // it, or a replica writing the same record. It commits or lapses, and the
         // engine has waited for that; ask again. The await leaves the event loop
         // free; only this session's calls wait, behind the record, as they must.
-        await afterInProgress(sentAt, resp.retryAfterMs);
+        await afterInProgress(sentAt, ENGINE_WAIT_MS, resp.retryAfterMs);
         continue;
       }
       if (resp.status !== CacheStatus.ACQUIRED) {

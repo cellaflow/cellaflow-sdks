@@ -96,7 +96,7 @@ await durableTools("ticket-4417", { coordinationId: "ticket-4417" }, async () =>
 
 **Rules.** A coordination id may not contain colons, may not have leading or trailing whitespace, and may not exceed 256 bytes; an empty string means none. Invalid values throw before anything runs, and are never trimmed. `normalizeCoordinationId` applies the same check.
 
-**Waiting for another agent.** A call that another agent is already running waits for it in the engine, not by polling. It gets that agent's result the moment it is recorded, or the lease the moment it is released or lapses. Every caller waiting on the same call shares one watcher in the engine, so a hundred waiting agents cost the engine about what one does. Each request waits at most 10 s, and the call asks again until it has an answer, so it waits for as long as the other agent holds the call.
+**Waiting for another agent.** A call that another agent is already running waits for it in the engine, not by polling. It gets that agent's result the moment it is recorded, or the lease the moment it is released or lapses. The engine checks the holder every 100 ms on behalf of every caller waiting on the call, and each waiting caller asks again at most every 10 s, rather than once a second. A request that gets no answer within 15 s fails the call, so a lost connection to the engine is noticed.
 
 ## How long a tool's lease lasts
 

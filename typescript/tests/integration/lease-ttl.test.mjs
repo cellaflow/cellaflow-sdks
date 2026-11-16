@@ -91,7 +91,10 @@ async function takeover(t, holdMs) {
   // The holder's lease lapses no later than a TTL after the kill, and the
   // waiting caller is granted it by the engine as soon as the engine sees that
   // (it looks every 100 ms), not on its next poll a second later.
-  assert.ok(waited <= TTL_MS + 500, `took over after ${waited} ms`);
+  // The margin covers the engine's grant and the renewal that confirms it on
+  // a loaded CI engine. engine-wait.test.mjs is what tells waiting from
+  // polling.
+  assert.ok(waited <= TTL_MS + 750, `took over after ${waited} ms`);
   // And not while the lease was still live: the last renewal (or the
   // acquisition) came at most an interval before the kill.
   assert.ok(waited >= TTL_MS - 2 * RENEW_EVERY_MS, `took over after only ${waited} ms`);

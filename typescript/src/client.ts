@@ -215,6 +215,11 @@ export class CellaflowClient {
    * afterwards once the side effect has happened. The engine raises
    * `FAILED_PRECONDITION` when refused. Both fields are optional on the wire;
    * omitting `sequence` keeps the position unguarded.
+   *
+   * @param timeoutSecs - Bounds the RPC in **seconds**. A caller that asks the
+   *   engine to wait must supply one longer than the wait: without a deadline,
+   *   a connection that dies while the engine holds the request leaves the
+   *   call waiting for an answer that never comes.
    */
   async checkIdempotencyCache(
     agentId: string,
@@ -222,7 +227,8 @@ export class CellaflowClient {
     waitTimeoutMs?: number,
     leaseTtlMs?: number,
     sessionId?: string,
-    sequence?: number
+    sequence?: number,
+    timeoutSecs?: number
   ): Promise<CheckCacheResponse> {
     const req: MessageInitShape<typeof CheckCacheRequestSchema> = { agentId, idempotencyKey };
     // These proto fields are uint64 → bigint; convert from the JS number API.
@@ -239,7 +245,10 @@ export class CellaflowClient {
       req.sequence = BigInt(sequence);
     }
 
-    return await this.client.checkIdempotencyCache(req);
+    return await this.client.checkIdempotencyCache(req, {
+      timeoutMs:
+        timeoutSecs !== undefined && timeoutSecs > 0 ? Math.max(1, Math.round(timeoutSecs * 1000)) : undefined,
+    });
   }
 
   /**
