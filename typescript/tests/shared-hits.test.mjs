@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { CacheStatus, IdempotencyScope, WorkflowContext, tool } from "../dist/index.js";
 import { serialize } from "../dist/serialization.js";
 import { runWithContext } from "../dist/context.js";
+import { ENGINE_WAIT_MS } from "../dist/wait.js";
 
 /** Answers checks from `answers` in order, and records every commit. */
 function scriptedClient(
@@ -47,7 +48,7 @@ function scriptedClient(
       // A recorded hit is leased under its own key before it is committed.
       if (key.includes(":record:") || key.includes(":failure:")) {
         order.push(`record-lease:${sequence}`);
-        recordLeases.push({ agentId, key, sessionId, sequence });
+        recordLeases.push({ agentId, key, waitTimeoutMs, sessionId, sequence });
         if (recordLease) return recordLease();
         return { status: CacheStatus.ACQUIRED, fencingToken: 99n, heartbeatIntervalMs: 60_000n };
       }
@@ -487,6 +488,8 @@ test("a record held by a live lease is waited out, and calls queue behind it", a
     clearInterval(ticker);
   }
   assert.ok(ticks >= 4, `the event loop ran ${ticks} ticks during the wait`);
+  // Each try asks the engine to wait behind the lease rather than answer at once.
+  assert.ok(client.recordLeases.every((l) => l.waitTimeoutMs === ENGINE_WAIT_MS));
   assert.deepEqual(
     client.commits.map((c) => [c.sequence, c.name]).sort(),
     [

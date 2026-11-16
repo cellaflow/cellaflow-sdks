@@ -459,23 +459,10 @@ export async function executionLease<T>(
         }
       },
     });
-    if (waitMs > 0) {
-      // The engine may have waited before granting, so the lease can be much
-      // younger than the request that won it, and a deadline counted from that
-      // request would read a fresh lease as nearly expired. A renewal sent now
-      // gives a deadline counted from a known time. One failed attempt is not a
-      // loss, so try a few, backing off, while the lease, counted from when the
-      // grant arrived, could still be live. If none is confirmed, the deadline
-      // counted from the request still bounds the lease from below (the grant
-      // came after it), so the block runs only if that has not passed.
-      const windowEnd = performance.now() + ttlMs - hb.marginMs;
-      for (let attempt = 0; attempt < 3 && !hb.lost; attempt++) {
-        if (await hb.renewNow()) break;
-        const pause = Math.min(100 * 2 ** attempt, windowEnd - performance.now());
-        if (pause <= 0) break;
-        await new Promise((resolve) => setTimeout(resolve, pause));
-      }
-    }
+    // The engine may have waited before granting, so the lease can be much
+    // younger than the request that won it. The block runs only if the
+    // deadline that leaves has not passed.
+    if (waitMs > 0) await hb.confirmGrant();
     // A lease already lost before the block starts must not run it: a block
     // that acts before its first check() would act on a lease this side has
     // already given up.

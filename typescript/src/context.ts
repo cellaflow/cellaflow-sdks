@@ -4,6 +4,7 @@ import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { failureIdempotencyKey, recordIdempotencyKey } from "./idempotency.js";
 import { checkLeaseTtlMs } from "./lease.js";
+import { ENGINE_WAIT_MS, afterInProgress } from "./wait.js";
 import {
   errorCode,
   hasStatusCode,
@@ -451,11 +452,14 @@ export class WorkflowContext {
     for (;;) {
       await this.retryRelease(pending);
       let resp;
+      const sentAt = performance.now();
       try {
         resp = await this.client.checkIdempotencyCache(
           pending.agentId,
           key,
-          undefined,
+          // Wait in the engine behind a live lease on the record, as a call
+          // waits behind its holder.
+          ENGINE_WAIT_MS,
           // The same TTL as the call it records.
           pending.leaseTtlMs,
           this.sessionId,
@@ -482,10 +486,10 @@ export class WorkflowContext {
       if (resp.status === CacheStatus.HIT) return;
       if (resp.status === CacheStatus.IN_PROGRESS) {
         // A live lease on this record: an earlier attempt that could not release
-        // it, or a replica writing the same record. It commits or lapses, so wait
-        // and ask again. The await leaves the event loop free; only this session's
-        // calls wait, behind the record, as they must.
-        await sleep(Number(resp.retryAfterMs ?? 1000n));
+        // it, or a replica writing the same record. It commits or lapses, and the
+        // engine has waited for that; ask again. The await leaves the event loop
+        // free; only this session's calls wait, behind the record, as they must.
+        await afterInProgress(sentAt, resp.retryAfterMs);
         continue;
       }
       if (resp.status !== CacheStatus.ACQUIRED) {

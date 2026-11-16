@@ -388,6 +388,27 @@ export class LeaseHeartbeat {
     return confirmed;
   }
 
+  /**
+   * Counts the lease from a renewal rather than from the request that won it.
+   *
+   * After the engine waited before granting, the lease can be much younger than
+   * that request, and a deadline counted from it would read a fresh lease as
+   * nearly expired. A renewal sent now gives a deadline counted from a known
+   * time. One failed attempt is not a loss, so this tries a few, backing off,
+   * while the lease, counted from when the grant arrived, could still be live.
+   * If none is confirmed, the deadline counted from the request still bounds
+   * the lease from below, since the grant came after it.
+   */
+  async confirmGrant(): Promise<void> {
+    const windowEnd = performance.now() + this.opts.leaseTtlMs - this.marginMs;
+    for (let attempt = 0; attempt < 3 && !this.lost; attempt++) {
+      if (await this.renewNow()) return;
+      const pause = Math.min(100 * 2 ** attempt, windowEnd - performance.now());
+      if (pause <= 0) return;
+      await new Promise((resolve) => setTimeout(resolve, pause));
+    }
+  }
+
   private async beat(force = false): Promise<boolean> {
     if (this.stopped) return false;
     // Report a passed deadline before renewing. The forced renewal skips this,

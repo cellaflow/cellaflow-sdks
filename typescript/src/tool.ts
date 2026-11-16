@@ -6,6 +6,7 @@ import { IdempotencyScope, deriveIdempotencyKey, normalizeCoordinationId } from 
 import { LeaseHandle, LeaseLostError, runUnderLease, runWithoutLease } from "./execution.js";
 import { LeaseHeartbeat, checkLeaseTtlMs } from "./lease.js";
 import { deserialize, serialize } from "./serialization.js";
+import { ENGINE_WAIT_MS, afterInProgress } from "./wait.js";
 
 /**
  * Raised when the engine refuses a lease because another agent already owns the
@@ -80,8 +81,6 @@ export interface ToolOptions {
 export type LeasedTool<A extends unknown[], R> = ((...args: A) => Promise<R>) & {
   withCoordinationId(coordinationId: string): (...args: A) => Promise<R>;
 };
-
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * Wraps a function so the engine runs it at most once per idempotency key, and
@@ -269,7 +268,11 @@ export function tool<A extends unknown[], R>(
         resp = await ctx.client.checkIdempotencyCache(
           agentId,
           ikey,
-          0,
+          // Wait in the engine while another worker holds the call: it answers
+          // the moment that worker commits, or grants the lease the moment it
+          // is released or lapses, and every waiter on the key shares one
+          // watcher there instead of each polling.
+          ENGINE_WAIT_MS,
           leaseTtlMs,
           ctx.sessionId,
           // Tell the engine where this call intends to write, so a lease at an
@@ -312,7 +315,7 @@ export function tool<A extends unknown[], R>(
       }
 
       if (resp.status === CacheStatus.IN_PROGRESS) {
-        await sleep(Number(resp.retryAfterMs ?? 1000n));
+        await afterInProgress(acquiredSentAt, resp.retryAfterMs);
         continue;
       }
 
@@ -338,6 +341,11 @@ export function tool<A extends unknown[], R>(
           ikey,
         );
         handle = leaseHandle;
+        // A grant that came back after more than half an interval came after a
+        // wait in the engine, so it can be much younger than the request, and
+        // is counted from a renewal instead (below). Up to that, counting from
+        // the request costs the lease less than its margin.
+        const late = performance.now() - acquiredSentAt > intervalMs / 2;
         hb = new LeaseHeartbeat({
           client: ctx.client,
           agentId,
@@ -350,13 +358,32 @@ export function tool<A extends unknown[], R>(
           leaseTtlMs,
           acquiredSentAt,
           acquiredSentWallAt,
-          acquiredExpiresAtMs: resp.leaseExpiresAtMs !== undefined ? Number(resp.leaseExpiresAtMs) : undefined,
+          // Read against the request's send time, so only for a grant that
+          // answered at once.
+          acquiredExpiresAtMs:
+            !late && resp.leaseExpiresAtMs !== undefined ? Number(resp.leaseExpiresAtMs) : undefined,
           onLeaseLost: (detail) => {
             if (releasing) return;
             if (committing) lossDuringCommit = detail;
             else leaseHandle.markLost(detail);
           },
         });
+        if (late) await hb.confirmGrant();
+        if (leaseHandle.isLost) {
+          // Neither the renewal nor the request can show the lease is still
+          // held, so the body must not start under it: it would act on a lease
+          // this side has already given up. Nothing has run, so hand the lease
+          // back and ask again, which finds the call's result, waits behind its
+          // holder, or grants a lease this side can count on.
+          await hb.stop();
+          await ctx.client.releaseLease(agentId, ikey, fencingToken, "LEASE_UNCONFIRMED").catch(() => {
+            // It lapses on its own, and asking again waits that out.
+          });
+          hb = undefined;
+          handle = undefined;
+          fencingToken = 0;
+          continue;
+        }
         hb.start();
       }
       break;
