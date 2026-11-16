@@ -4,6 +4,7 @@ counted from when it was granted. Uses a scripted engine client, so no engine is
 needed."""
 
 import asyncio
+import concurrent.futures
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -14,8 +15,10 @@ import pytest
 import cellaflow.decorators
 import cellaflow.lease
 from cellaflow import current_lease, step
+from cellaflow.client import CellaflowClient
 from cellaflow.context import WorkflowContext
 from cellaflow.decorators import _ENGINE_WAIT_MS
+from cellaflow.lease import LeaseHeartbeat
 from cellaflow.v1 import idempotency_pb2, service_pb2
 
 
@@ -25,6 +28,22 @@ class Unavailable(grpc.RpcError):  # type: ignore[misc]
 
     def details(self) -> str:
         return "engine unavailable"
+
+
+class DeadlineExceeded(grpc.RpcError):  # type: ignore[misc]
+    def code(self) -> grpc.StatusCode:
+        return grpc.StatusCode.DEADLINE_EXCEEDED
+
+    def details(self) -> str:
+        return "deadline exceeded"
+
+
+class Refused(grpc.RpcError):  # type: ignore[misc]
+    def code(self) -> grpc.StatusCode:
+        return grpc.StatusCode.FAILED_PRECONDITION
+
+    def details(self) -> str:
+        return "the position is claimed by another lease"
 
 
 class Clocks:
@@ -70,21 +89,70 @@ class Answer:
         waited_s: float = 0.0,
         blocks_s: float = 0.0,
         expires_in_ms: Optional[int] = None,
+        raises: Optional[BaseException] = None,
     ) -> None:
+        self.raises = raises
         self.resp = resp
         self.waited_s = waited_s
         self.blocks_s = blocks_s
         self.expires_in_ms = expires_in_ms
 
 
-class WaitClient:
+class Request(grpc.Future):  # type: ignore[misc]
+    """A scripted request as a `grpc.Future`, which is what an async step waits
+    on without a thread."""
+
+    def __init__(self, future: "concurrent.futures.Future[Any]") -> None:
+        self._future = future
+
+    def cancel(self) -> bool:
+        return self._future.cancel()
+
+    def cancelled(self) -> bool:
+        return self._future.cancelled()
+
+    def running(self) -> bool:
+        return self._future.running()
+
+    def done(self) -> bool:
+        return self._future.done()
+
+    def result(self, timeout: Optional[float] = None) -> Any:
+        return self._future.result(timeout)
+
+    def exception(self, timeout: Optional[float] = None) -> Any:
+        return self._future.exception(timeout)
+
+    def traceback(self, timeout: Optional[float] = None) -> Any:
+        return None
+
+    def add_done_callback(self, fn: Callable[[Any], None]) -> None:
+        self._future.add_done_callback(lambda _: fn(self))
+
+
+class WaitClient(CellaflowClient):
+    """A scripted engine. Async steps wait on its `check_idempotency_cache_future`
+    as they do on a real client's; nothing of the real client is set up."""
+
     def __init__(
         self,
         answers: List[Answer],
         clocks: Optional[Clocks] = None,
         fail_renewals: Callable[[int], bool] = lambda token: False,
         fail_releases: bool = False,
+        record_answers: Optional[List[Answer]] = None,
+        renew_blocks_s: float = 0.0,
+        refuse_renewals: Callable[[int], bool] = lambda token: False,
+        cancellable: bool = True,
     ) -> None:
+        # Whether a request can still be cancelled once sent. A real one can,
+        # until the engine has answered; False models a grant that answered as
+        # the call was cancelled.
+        self.cancellable = cancellable
+        self.requests: List[Any] = []
+        self.record_answers = list(record_answers or [])
+        self.renew_blocks_s = renew_blocks_s
+        self.refuse_renewals = refuse_renewals
         self.answers = list(answers)
         self.clocks = clocks
         self.fail_renewals = fail_renewals
@@ -99,15 +167,22 @@ class WaitClient:
         with self._lock:
             self.order.append(event)
 
-    def check_idempotency_cache(self, **kw: Any) -> Any:
+    def check_idempotency_cache(self, **kw: Any) -> Any:  # type: ignore[override]
         key = kw["idempotency_key"]
         if ":record:" in key or ":failure:" in key:
             self.record_acquires.append(kw)
             self.note("record-acquire")
+            if self.record_answers:
+                record = self.record_answers.pop(0)
+                if record.raises is not None:
+                    raise record.raises
+                return record.resp
             return acquired(99)
         self.acquires.append(kw)
         self.note("acquire")
         answer = self.answers.pop(0)
+        if answer.raises is not None:
+            raise answer.raises
         if answer.blocks_s:
             time.sleep(answer.blocks_s)
         if answer.waited_s:
@@ -120,20 +195,45 @@ class WaitClient:
             resp.lease_expires_at_ms = int(now * 1000) + answer.expires_in_ms
         return resp
 
-    def renew_lease(self, **kw: Any) -> Any:
+    def check_idempotency_cache_future(  # type: ignore[override]
+        self, **kw: Any
+    ) -> Any:
+        future: "concurrent.futures.Future[Any]" = concurrent.futures.Future()
+        self.requests.append(future)
+        if not self.cancellable:
+            future.set_running_or_notify_cancel()
+
+        def answer() -> None:
+            try:
+                resp = self.check_idempotency_cache(**kw)
+            except BaseException as exc:
+                if not future.cancelled():
+                    future.set_exception(exc)
+                return
+            if not future.cancelled():
+                future.set_result(resp)
+
+        threading.Thread(target=answer, daemon=True).start()
+        return Request(future)
+
+    def renew_lease(self, **kw: Any) -> Any:  # type: ignore[override]
         self.note(f"renew:{kw['fencing_token']}")
+        if self.renew_blocks_s:
+            time.sleep(self.renew_blocks_s)
         if self.fail_renewals(kw["fencing_token"]):
             raise Unavailable()
+        if self.refuse_renewals(kw["fencing_token"]):
+            return idempotency_pb2.RenewLeaseResponse(renewed=False)
         now = self.clocks.time() if self.clocks else time.time()
         return idempotency_pb2.RenewLeaseResponse(
             renewed=True, new_expires_at_ms=int(now * 1000) + kw["extend_ms"]
         )
 
-    def commit_step(self, **kw: Any) -> Any:
-        self.note("commit")
+    def commit_step(self, **kw: Any) -> Any:  # type: ignore[override]
+        self.note(f"commit:{kw['sequence']}:{kw['name']}")
         return service_pb2.CommitStepResponse()
 
-    def release_lease(self, **kw: Any) -> Any:
+    def release_lease(self, **kw: Any) -> Any:  # type: ignore[override]
         self.releases.append(kw)
         self.note(f"release:{kw['fencing_token']}")
         if self.fail_releases:
@@ -146,7 +246,7 @@ class WaitClient:
 
 def session(client: WaitClient) -> WorkflowContext:
     return WorkflowContext(
-        client=client,  # type: ignore[arg-type]
+        client=client,
         session_id="s-wait",
         workflow_version="1.0.0",
         coordination_id="order-4417",
@@ -286,12 +386,14 @@ async def test_an_async_step_waiting_in_the_engine_leaves_the_event_loop_free() 
 
 
 def test_a_lease_granted_at_once_costs_no_extra_request_before_the_body() -> None:
-    client = WaitClient([Answer(acquired())])
+    # A 750 ms interval: a grant is late after 375 ms, so a threshold far off
+    # that would show here.
+    client = WaitClient([Answer(acquired(7, 750))])
     tokens: List[int] = []
-    charge = step(body_that_checks(client, tokens))
+    charge = step(body_that_checks(client, tokens), lease_ttl_ms=3000)
     with session(client).bind():
         charge()
-    assert client.order == ["acquire", "body", "commit"]
+    assert client.order == ["acquire", "body", "commit:1:charge_card"]
 
 
 @pytest.mark.asyncio
@@ -356,9 +458,7 @@ async def test_a_late_grant_no_renewal_confirms_is_handed_back_before_the_body(
 
 
 @pytest.mark.asyncio
-async def test_a_call_cancelled_while_waiting_hands_back_a_later_grant() -> None:
-    # The engine grants the lease after the caller gave up. Nothing will run the
-    # body under it, so it is released rather than left to lapse.
+async def test_a_call_cancelled_while_waiting_cancels_its_request() -> None:
     client = WaitClient([Answer(acquired(9), blocks_s=0.3)])
 
     async def charge_card() -> str:
@@ -371,17 +471,34 @@ async def test_a_call_cancelled_while_waiting_hands_back_a_later_grant() -> None
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+    assert client.requests[0].cancelled()
+
+
+@pytest.mark.asyncio
+async def test_a_grant_that_answers_as_the_call_is_cancelled_is_handed_back() -> None:
+    # The engine grants the lease after the caller gave up. Nothing will run the
+    # body under it, so it is released rather than left to lapse.
+    client = WaitClient([Answer(acquired(9), blocks_s=0.3)], cancellable=False)
+
+    async def charge_card() -> str:
+        client.note("body")
+        return "charged"
+
+    charge = step(charge_card)
+    with session(client).bind():
+        task = asyncio.ensure_future(charge())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
     deadline = time.monotonic() + 2.0
     while not client.releases and time.monotonic() < deadline:
         await asyncio.sleep(0.02)
-    assert client.releases == [
-        {
-            "agent_id": client.releases[0]["agent_id"],
-            "idempotency_key": client.acquires[0]["idempotency_key"],
-            "fencing_token": 9,
-            "reason": "CANCELLED",
-        }
+    assert [(r["fencing_token"], r["reason"]) for r in client.releases] == [
+        (9, "CANCELLED")
     ]
+    key = client.acquires[0]["idempotency_key"]
+    assert client.releases[0]["idempotency_key"] == key
     assert "body" not in client.order
 
 
@@ -461,3 +578,136 @@ async def test_a_step_no_renewal_confirms_fails_after_three_grants_and_frees_the
     after = client.order[client.order.index("next"):]
     assert "release:9" in after, after
     assert after.index("release:9") < after.index("record-acquire"), after
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_a_request_that_gets_no_answer_is_asked_again(asynchronous: bool) -> None:
+    client = WaitClient([Answer(None, raises=DeadlineExceeded()), Answer(acquired(8))])
+    runs = 0
+
+    def charge_card() -> str:
+        nonlocal runs
+        runs += 1
+        return "charged"
+
+    async def charge_card_async() -> str:
+        return charge_card()
+
+    with session(client).bind():
+        if asynchronous:
+            assert await step(charge_card_async, tool_name="charge_card")() == "charged"
+        else:
+            assert step(charge_card)() == "charged"
+    assert runs == 1
+    assert len(client.acquires) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_unanswered_requests_fail_the_call_and_its_record_waits_out_the_lease(
+    asynchronous: bool,
+) -> None:
+    # The engine may have granted the last request: a lease whose token this
+    # side never saw, claiming the call's position until it lapses. The failure
+    # record there is refused until then, and waits rather than being dropped.
+    lost = [Answer(None, raises=DeadlineExceeded()) for _ in range(3)]
+    client = WaitClient(
+        [*lost, Answer(acquired(9))],
+        record_answers=[Answer(None, raises=Refused())],
+    )
+
+    def charge_card() -> str:
+        return "charged"
+
+    async def charge_card_async() -> str:
+        return charge_card()
+
+    def next_step() -> str:
+        return "next"
+
+    with session(client).bind():
+        with pytest.raises(grpc.RpcError):
+            if asynchronous:
+                charge = step(
+                    charge_card_async, tool_name="charge_card", lease_ttl_ms=1000
+                )
+                await charge()
+            else:
+                step(charge_card, lease_ttl_ms=1000)()
+        assert step(next_step)() == "next"
+    assert len(client.acquires) == 4
+    assert len(client.record_acquires) == 2
+    # A lease without its token cannot be released, only waited out.
+    assert client.releases == []
+    assert [e for e in client.order if e.startswith("commit")] == [
+        "commit:1:charge_card",
+        "commit:2:next_step",
+    ]
+
+
+def test_a_renewal_the_engine_refuses_after_a_late_grant_hands_the_lease_back(
+    clocks: Clocks,
+) -> None:
+    client = WaitClient(
+        [
+            Answer(acquired(7, 750), waited_s=10.0, expires_in_ms=2900),
+            Answer(acquired(8)),
+        ],
+        clocks,
+        refuse_renewals=lambda token: token == 7,
+    )
+    tokens: List[int] = []
+    with session(client).bind():
+        assert step(body_that_checks(client, tokens), lease_ttl_ms=3000)() == "charged"
+    assert tokens == [8]
+    # Refused once, not tried again: a refusal is an answer.
+    assert client.order.count("renew:7") == 1
+    assert client.releases[0]["reason"] == "LEASE_UNCONFIRMED"
+
+
+def test_confirm_grant_stops_trying_once_the_lease_could_have_lapsed() -> None:
+    # Each renewal takes 0.5 s and fails. With a 1 s TTL, after two the lease
+    # could have lapsed even counted from when the grant arrived, so there is no
+    # third.
+    client = WaitClient([], fail_renewals=lambda token: True, renew_blocks_s=0.5)
+    hb = LeaseHeartbeat(
+        client=client,
+        agent_id="a",
+        idempotency_key="k",
+        fencing_token=7,
+        heartbeat_interval_ms=250,
+        lease_ttl_ms=1000,
+    )
+    hb.confirm_grant()
+    assert client.order == ["renew:7", "renew:7"]
+
+
+@pytest.mark.asyncio
+async def test_a_call_cancelled_while_its_late_grant_is_confirmed_hands_it_back(
+    clocks: Clocks,
+) -> None:
+    client = WaitClient(
+        [Answer(acquired(7, 750), waited_s=10.0, expires_in_ms=2900)],
+        clocks,
+        renew_blocks_s=0.3,
+    )
+
+    async def charge_card() -> str:
+        client.note("body")
+        return "charged"
+
+    charge = step(charge_card, lease_ttl_ms=3000)
+    with session(client).bind():
+        task = asyncio.ensure_future(charge())
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    deadline = time.monotonic() + 2.0
+    while not client.releases and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+    assert [(r["fencing_token"], r["reason"]) for r in client.releases] == [
+        (7, "CANCELLED")
+    ]
+    assert "body" not in client.order

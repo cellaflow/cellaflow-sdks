@@ -956,7 +956,9 @@ class WorkflowContext:
             )
         agent_id = pending["agent_id"]
         unreleased = pending.get("unreleased")
-        if unreleased is not None:
+        # Without its token (a grant whose answer was lost) the lease cannot be
+        # released, only waited out.
+        if unreleased is not None and unreleased["token"]:
             # The failed step's own lease still claims this position, so the
             # engine would refuse the record. Try the release again first.
             try:

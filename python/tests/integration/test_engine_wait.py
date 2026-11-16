@@ -5,6 +5,7 @@ per caller, not one per caller per second."""
 # `tool(...)` with arguments is not typed yet; the unit tests cast it instead.
 # mypy: disable-error-code="untyped-decorator"
 
+import asyncio
 import threading
 import time
 import uuid
@@ -101,3 +102,51 @@ def test_100_callers_on_one_shared_call_get_the_holders_result_asking_about_once
     # engine is one, answered when the holder commits; the slack allows a few
     # that started before the engine held them.
     assert waiting <= WAITERS * 1.5, f"{WAITERS} waiters made {waiting} requests"
+
+
+#: More than the event loop's default executor holds (at most 32 threads), so a
+#: waiter that held a thread for its wait would leave none for the holder.
+ASYNC_WAITERS = 40
+
+
+@pytest.mark.asyncio
+async def test_async_callers_on_one_loop_do_not_starve_the_holders_renewals(
+    target: str,
+) -> None:
+    # The holder's lease lasts 3 s and its body 4.5 s, so it keeps the call only
+    # if its renewals get through while 40 callers on the same loop wait.
+    order_id = f"order-{uuid.uuid4().hex[:8]}"
+    runs = 0
+    holding = asyncio.Event()
+    finish = asyncio.Event()
+
+    @tool(
+        tool_name="charge_card",
+        scope=IdempotencyScope.SCOPE_SHARED,
+        shared_on=["order_id"],
+        lease_ttl_ms=3000,
+    )
+    async def charge_card(order_id: str) -> str:
+        nonlocal runs
+        runs += 1
+        holding.set()
+        await finish.wait()
+        return f"charged-by-{runs}"
+
+    async def call(name: str) -> str:
+        with durable_tools(
+            f"{name}-{uuid.uuid4().hex[:8]}",
+            target=target,
+            coordination_id=order_id,
+        ):
+            return str(await charge_card(order_id))
+
+    holder = asyncio.ensure_future(call("holder"))
+    await asyncio.wait_for(holding.wait(), GIVE_UP_S)
+    waiters = [asyncio.ensure_future(call(f"waiter-{i}")) for i in range(ASYNC_WAITERS)]
+    await asyncio.sleep(4.5)
+    finish.set()
+    results = await asyncio.wait_for(asyncio.gather(holder, *waiters), GIVE_UP_S)
+
+    assert runs == 1, f"the body ran {runs} times: the holder lost its lease"
+    assert set(results) == {"charged-by-1"}

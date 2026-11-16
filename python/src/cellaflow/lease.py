@@ -282,7 +282,8 @@ class LeaseHeartbeat:
         """
         window_end = time.monotonic() + self.lease_ttl_ms / 1000.0 - self.margin_sec
         for attempt in range(3):
-            if self.lost:
+            # Told to stop: the call was cancelled, and the lease handed back.
+            if self.lost or self._stopped:
                 return
             sent = (time.monotonic(), time.time())
             try:
