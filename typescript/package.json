@@ -24,7 +24,7 @@
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build",
-    "test": "tsc && node --test tests/*.test.mjs",
+    "test": "tsc && tsc -p tests/types && node --test tests/*.test.mjs",
     "test:integration": "tsc && node --test tests/integration/*.test.mjs"
   },
   "keywords": [
