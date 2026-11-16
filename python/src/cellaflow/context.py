@@ -997,6 +997,9 @@ class WorkflowContext:
             if (
                 unreleased is not None
                 and exc.code() == grpc.StatusCode.FAILED_PRECONDITION
+                # A committed position never takes the record, whatever lease
+                # once claimed it, so there is nothing to wait out.
+                and "is already committed" not in _details(exc)
             ):
                 remaining = unreleased["lapses_at"] + _LAPSE_GRACE_S - time.monotonic()
                 if remaining > 0:
@@ -1165,3 +1168,9 @@ def set_context(context: WorkflowContext) -> contextvars.Token[WorkflowContext]:
 
 def reset_context(token: contextvars.Token[WorkflowContext]) -> None:
     _current_context.reset(token)
+
+
+def _details(exc: grpc.RpcError) -> str:
+    """An engine error's message, or "" for an error that carries none."""
+    details = getattr(exc, "details", None)
+    return (details() if callable(details) else None) or ""

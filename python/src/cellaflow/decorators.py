@@ -423,6 +423,9 @@ def _release_after_failure(
             idempotency_key=ikey,
             fencing_token=fencing_token,
             reason="TOOL_ERROR",
+            # Bounded: a release that hangs would hold the step, and an async
+            # step's event loop, for as long as TCP takes to give up.
+            timeout=hb.rpc_timeout_sec,
         )
     except Exception:
         # The lease lapses on its own. Losing the release is not worth
@@ -720,9 +723,12 @@ async def _arbitrate_async(
     executor, which the heartbeats of calls already holding a lease renew
     through, so a crowd of waiters could make a live holder lose its lease.
 
-    A call cancelled while it waits cancels the request. If the engine granted
-    the lease before that took effect, nothing will run the body under it, so
-    it is handed back rather than left to lapse.
+    A call cancelled while it waits leaves the request to finish (within its
+    deadline) rather than cancelling it: the engine may grant the lease just
+    before a cancellation would reach it, and a grant thrown away with the
+    cancelled request would hold the key, and the call's position, for a whole
+    TTL. Whatever it is granted is handed back, since nothing will run the body
+    under it.
 
     A client that does not return a `grpc.Future` (a test double) is asked from
     a worker thread instead."""
@@ -764,7 +770,10 @@ async def _arbitrate_async(
             # The call was cancelled while it waited.
             hand_back_if_granted(done)
         elif done.cancelled():
-            answer.cancel()
+            # Only the channel cancels it: the client was closed under the call.
+            answer.set_exception(
+                RuntimeError("the request to the engine was cancelled: client closed")
+            )
         elif done.exception() is not None:
             answer.set_exception(done.exception())
         else:
@@ -782,9 +791,10 @@ async def _arbitrate_async(
     try:
         return await answer
     except asyncio.CancelledError:
-        if not request.cancel() and answer.done() and not answer.cancelled():
+        if answer.done() and not answer.cancelled():
             # The answer reached the loop just before the cancellation did.
             hand_back_if_granted(answer)
+        # Otherwise `deliver` hands back whatever the request is granted.
         raise
 
 

@@ -216,6 +216,10 @@ class WaitClient(CellaflowClient):
         threading.Thread(target=answer, daemon=True).start()
         return Request(future)
 
+    def get_graph(self, **kw: Any) -> Any:  # type: ignore[override]
+        # Nothing committed: the scripted engine keeps no history.
+        return [], None
+
     def renew_lease(self, **kw: Any) -> Any:  # type: ignore[override]
         self.note(f"renew:{kw['fencing_token']}")
         if self.renew_blocks_s:
@@ -467,27 +471,11 @@ async def test_a_late_grant_no_renewal_confirms_is_handed_back_before_the_body(
 
 
 @pytest.mark.asyncio
-async def test_a_call_cancelled_while_waiting_cancels_its_request() -> None:
+async def test_a_call_cancelled_while_waiting_lets_its_request_finish() -> None:
+    # Cancelling the request could throw away a grant the engine made just
+    # before the cancellation reached it, leaving the key held for a TTL. The
+    # request finishes instead, and its grant is handed back.
     client = WaitClient([Answer(acquired(9), blocks_s=0.3)])
-
-    async def charge_card() -> str:
-        return "charged"
-
-    charge = step(charge_card)
-    with session(client).bind():
-        task = asyncio.ensure_future(charge())
-        await until(lambda: bool(client.requests))
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-    assert client.requests[0].cancelled()
-
-
-@pytest.mark.asyncio
-async def test_a_grant_that_answers_as_the_call_is_cancelled_is_handed_back() -> None:
-    # The engine grants the lease after the caller gave up. Nothing will run the
-    # body under it, so it is released rather than left to lapse.
-    client = WaitClient([Answer(acquired(9), blocks_s=0.3)], cancellable=False)
 
     async def charge_card() -> str:
         client.note("body")
@@ -500,15 +488,34 @@ async def test_a_grant_that_answers_as_the_call_is_cancelled_is_handed_back() ->
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-    deadline = time.monotonic() + 2.0
-    while not client.releases and time.monotonic() < deadline:
-        await asyncio.sleep(0.02)
+    assert not client.requests[0].cancelled()
+    await until(lambda: bool(client.releases))
     assert [(r["fencing_token"], r["reason"]) for r in client.releases] == [
         (9, "CANCELLED")
     ]
-    key = client.acquires[0]["idempotency_key"]
-    assert client.releases[0]["idempotency_key"] == key
     assert "body" not in client.order
+
+
+def test_a_grant_that_answers_after_the_loop_closed_is_handed_back() -> None:
+    # asyncio.run cancels the waiting call and closes its loop before the
+    # engine answers: the grant is handed back from the answering thread.
+    client = WaitClient([Answer(acquired(9), blocks_s=0.3)])
+
+    async def charge_card() -> str:
+        return "charged"
+
+    async def main() -> None:
+        asyncio.ensure_future(step(charge_card)())
+        await until(lambda: bool(client.requests))
+
+    with session(client).bind():
+        asyncio.run(main())
+    deadline = time.monotonic() + 2.0
+    while not client.releases and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert [(r["fencing_token"], r["reason"]) for r in client.releases] == [
+        (9, "CANCELLED")
+    ]
 
 
 @pytest.mark.asyncio
@@ -806,3 +813,50 @@ def test_confirm_grant_does_nothing_once_told_to_stop() -> None:
     hb.stop_sync()
     hb.confirm_grant()
     assert client.order == []
+
+
+@pytest.mark.asyncio
+async def test_an_async_grant_answered_at_once_costs_no_extra_request() -> None:
+    client = WaitClient([Answer(acquired(7, 750))])
+
+    async def charge_card() -> str:
+        client.note("body")
+        return "charged"
+
+    with session(client).bind():
+        await step(charge_card, lease_ttl_ms=3000)()
+    assert client.order == ["acquire", "body", "commit:1:charge_card"]
+
+
+class Committed(grpc.RpcError):  # type: ignore[misc]
+    def code(self) -> grpc.StatusCode:
+        return grpc.StatusCode.FAILED_PRECONDITION
+
+    def details(self) -> str:
+        return "Sequence 1 in session 's-wait' is already committed"
+
+
+def test_a_record_refused_at_a_committed_position_skips_the_lease_wait() -> (
+    None
+):
+    # The lost answer's lease may still claim the position, but a committed
+    # position never takes the record whatever claims it: waiting is wasted.
+    lost = [Answer(None, raises=Unavailable()) for _ in range(3)]
+    client = WaitClient(
+        [*lost, Answer(acquired(9))],
+        record_answers=[Answer(None, raises=Committed())],
+    )
+
+    def charge_card() -> str:
+        return "charged"
+
+    def next_step() -> str:
+        return "next"
+
+    with session(client).bind():
+        with pytest.raises(grpc.RpcError):
+            step(charge_card, lease_ttl_ms=1000)()
+        started = time.monotonic()
+        step(next_step)()
+        assert time.monotonic() - started < 1.0
+    assert len(client.record_acquires) == 1
