@@ -132,14 +132,15 @@ async def test_an_async_steps_ttl_is_sent_and_renewed_the_same_way() -> None:
 
 
 def test_without_a_ttl_the_engines_default_is_asked_for_as_before() -> None:
-    client = RecordingClient()
+    # An interval the heartbeat can keep: it renews at most every 100 ms.
+    client = RecordingClient(interval=100)
     charge = slow("charge_card")
     with session(client).bind():
         charge()
     assert client.acquires[0]["lease_ttl_ms"] is None
     # The heartbeat infers the engine's TTL from its interval: four of them.
     assert len(client.renewals) >= 2, client.renewals
-    assert all(r["extend_ms"] == 80 for r in client.renewals), client.renewals
+    assert all(r["extend_ms"] == 400 for r in client.renewals), client.renewals
 
 
 def test_the_sessions_ttl_applies_to_every_step_and_a_step_overrides_it() -> None:

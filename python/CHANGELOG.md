@@ -21,6 +21,39 @@ All notable changes to the Cellaflow Python SDK.
   `durable_tools` raises `ValueError`, or `TypeError` for a value that is not an `int`, before
   anything connects. The engine's maximum lease lifetime still caps every lease.
 
+- **A step's body can check its lease.** `current_lease()` inside a `@tool` or `@step` body returns
+  the call's lease, as it does inside `execution_lease` and `@task_lease`. A holder that froze and
+  woke up after another caller took the call over fails `check()` as soon as it resumes, so it does
+  not send. `LeaseHandle.cancel_on_loss()` cancels the awaits inside it when the lease is lost and
+  raises `LeaseLostError` in their place. See "Checking the lease inside a step" in the README. The
+  clock only tells the body to stop; whether the call's result is recorded is still the engine's
+  decision.
+
+### Changed
+
+- **A lease is judged on the clock.** `LeaseHandle.check()` and `is_lost` now fail once a TTL has
+  passed since the last confirmed renewal was sent, less half a renewal interval, without waiting
+  for a renewal to fail. This applies to `execution_lease`, `async_execution_lease` and
+  `@task_lease` too: a holder resumed past its deadline now fails `check()` straight away, and an
+  `async_execution_lease` caller is cancelled then, where before it ran until a renewal was
+  refused.
+- **A step body nested in `execution_lease` or `@task_lease` now gets the step call's lease from
+  `current_lease()`**, not the enclosing one. Code that passes `current_lease().fencing_token` to a
+  downstream fence from inside a step should read the enclosing lease before calling the step.
+- **A step whose commit the engine refuses because another worker holds the call now ends with
+  `LeaseLostError`** (the body's return value on its `result`, the refusal as its `__cause__`)
+  instead of the engine's FAILED_PRECONDITION. The failure is recorded at the step's position as
+  before, so a resumed `@workflow` replays it there.
+- **A step commit that gets no answer is sent again** before the call's lease is released, and once
+  more if the engine then refuses the release. An engine that already holds the commit answers it as
+  done, and while the lease is still the call's a resend is recorded, so a call whose commit answer
+  was dropped once returns its result, where before it failed with the transport error (and, if the
+  commit had not reached the engine, a retry ran the body again). An engine that stays unreachable
+  still fails the call, as before. An interrupt (Ctrl-C, `SystemExit`) is never resent.
+- **`execution_lease` and `async_execution_lease` handles read as released once their block ends**,
+  so work the block left running finds `is_lost` true and `check()` raising, without the lease
+  being reported lost, `on_lease_lost` running, or the caller being cancelled after the block.
+
 ### Fixed
 
 - **A lease heartbeat whose renewal interval was too long for Python's timers stopped with

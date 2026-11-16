@@ -4,12 +4,23 @@ import uuid
 import asyncio
 import time
 import logging
-from typing import Any, Callable, Dict, NoReturn, Optional, Sequence, TypeVar, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    NoReturn,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+    cast,
+)
 
 import grpc
 
 from cellaflow.client import CellaflowClient, _check_api_key_argument
 from cellaflow.context import (
+    _RETRYABLE_CODES,
     WorkflowContext,
     set_context,
     reset_context,
@@ -23,8 +34,9 @@ from cellaflow.idempotency import (
     normalize_coordination_id,
     IdempotencyScope,
 )
+from cellaflow.execution import LeaseHandle, LeaseLostError, _current_lease
 from cellaflow.lease import LeaseHeartbeat, check_lease_ttl_ms
-from cellaflow.serialization import deserialize
+from cellaflow.serialization import deserialize, serialize
 from cellaflow.v1.common_pb2 import STEP_STATUS_FAILED, STEP_STATUS_SUCCESS
 from cellaflow.v1.idempotency_pb2 import (
     CACHE_STATUS_HIT,
@@ -387,9 +399,11 @@ def _release_after_failure(
     fencing_token: int,
     name: str,
     hb: LeaseHeartbeat,
-) -> Optional[Dict[str, Any]]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[bool]]:
     """Releases the lease of a step that failed or was cancelled, so the step
-    that takes this position next is not refused until it lapses.
+    that takes this position next is not refused until it lapses. Returns the
+    unreleased lease, if any (below), and the engine's answer: False when the
+    lease was no longer this call's to release, None when there was none.
 
     If the release fails, returns the lease, for the failure record to retry the
     release or wait for the lapse: the lease still claims the step's position,
@@ -398,7 +412,7 @@ def _release_after_failure(
     renewal still in flight now can extend it.
     """
     try:
-        ctx.client.release_lease(
+        resp = ctx.client.release_lease(
             agent_id=agent_id,
             idempotency_key=ikey,
             fencing_token=fencing_token,
@@ -421,8 +435,8 @@ def _release_after_failure(
             "key": ikey,
             "token": fencing_token,
             "lapses_in_s": hb.rpc_timeout_sec + hb.lease_ttl_ms / 1000.0 + 1.0,
-        }
-    return None
+        }, None
+    return None, bool(getattr(resp, "released", True))
 
 
 def _note_failure(
@@ -492,6 +506,243 @@ def _note_failure(
             seq,
             exc_info=True,
         )
+
+
+class _CallLease:
+    """What one call knows about its lease while it runs.
+
+    The lease's clock only tells the body to stop. Whether the call's result is
+    recorded is the engine's decision: it accepts a commit or a release only
+    while the lease is still this call's. `lost` is set from its answers, never
+    from the clock alone. The held-back and dropped renewal refusals only
+    decide whether the handle reads as lost or merely released afterwards, for
+    work the body left running; no outcome depends on them.
+    """
+
+    def __init__(self) -> None:
+        self.handle: Optional[LeaseHandle] = None
+        # While the commit is on its way, a renewal can come back refused
+        # because that very commit completed the key: not a loss. It is held
+        # back, and applied only if the commit fails.
+        self.committing = False
+        self.held_loss = False
+        # Once the release is on its way, a renewal refused because of it is
+        # not a loss either, and is dropped.
+        self.releasing = False
+        # Set when the engine showed the lease is no longer this call's.
+        self.lost = False
+        self.returned = False
+        self.result: Any = None
+        # The payload committed, taken once from the result.
+        self.payload: Dict[str, Any] = {}
+
+    def on_lost(self) -> None:
+        if self.releasing:
+            return
+        if self.committing:
+            self.held_loss = True
+            return
+        if self.handle is not None:
+            self.handle.is_lost = True
+
+    def mark_taken_over(self) -> None:
+        """The engine showed another worker holds the call: the handle reads as
+        lost, not merely released, for work the body left running."""
+        self.lost = True
+        if self.handle is not None:
+            self.handle.is_lost = True
+
+    def apply_held_loss(self) -> None:
+        """A loss held back during a commit that failed counts once the call
+        fails. Not before: a resend can still show the commit landed, which is
+        what refused the renewal."""
+        if self.held_loss and self.handle is not None:
+            self.handle.is_lost = True
+
+
+def _lease_for_body(
+    ctx: WorkflowContext,
+    call: _CallLease,
+    agent_id: str,
+    ikey: str,
+    fencing_token: int,
+    interval_ms: int,
+    ttl_ms: Optional[int],
+    sent: Tuple[float, float],
+    expires_at_ms: int = 0,
+) -> Tuple[LeaseHandle, LeaseHeartbeat]:
+    """The heartbeat for a call's lease, and the handle its body sees through
+    `current_lease()`. The handle judges loss on the heartbeat's clock whenever
+    it is asked, so a holder resumed past its deadline finds the lease gone
+    before any renewal answers. `sent` is when the acquisition was sent."""
+    hb: Optional[LeaseHeartbeat] = None
+
+    def probe() -> bool:
+        return hb is not None and hb.past_deadline()
+
+    handle = LeaseHandle(fencing_token, probe=probe)
+    call.handle = handle
+    hb = LeaseHeartbeat(
+        client=ctx.client,
+        agent_id=agent_id,
+        idempotency_key=ikey,
+        fencing_token=fencing_token,
+        heartbeat_interval_ms=interval_ms,
+        on_lease_lost=call.on_lost,
+        # None infers the engine's TTL from its interval.
+        lease_ttl_ms=ttl_ms,
+        acquired_sent_at=sent,
+        acquired_expires_at_ms=expires_at_ms,
+    )
+    return handle, hb
+
+
+def _is_stale_lease(exc: BaseException) -> bool:
+    """Whether a commit was refused because its fencing token is stale: the
+    engine's FAILED_PRECONDITION "Fenced out: stale lease", which shares its code
+    with a position already taken, so the message tells them apart."""
+    if not isinstance(exc, grpc.RpcError):
+        return False
+    if exc.code() != grpc.StatusCode.FAILED_PRECONDITION:
+        return False
+    return "stale lease" in (exc.details() or "").lower()
+
+
+def _unanswered(exc: BaseException) -> bool:
+    """Whether a call got no answer either way: a transport error, or one that
+    may pass, rather than a refusal."""
+    if not isinstance(exc, grpc.RpcError):
+        return True
+    return exc.code() in _RETRYABLE_CODES
+
+
+def _is_committed_elsewhere(exc: BaseException) -> bool:
+    """Whether a commit was refused because its idempotency key is already
+    committed at a different position: the key's work was recorded by another
+    worker."""
+    if not isinstance(exc, grpc.RpcError):
+        return False
+    if exc.code() != grpc.StatusCode.FAILED_PRECONDITION:
+        return False
+    return "already committed at sequence" in (exc.details() or "").lower()
+
+
+def _taken_over(name: str, result: Any) -> LeaseLostError:
+    return LeaseLostError(
+        f"Step '{name}' lost its lease to another worker before its result was "
+        "recorded, so the result was not recorded. Calling the step again finds "
+        "that worker's result or waits for it, unless its key includes the "
+        "position (SCOPE_STEP_LOCAL).",
+        result=result,
+    )
+
+
+def _commit(
+    ctx: WorkflowContext,
+    call: _CallLease,
+    seq: int,
+    name: str,
+    result: Any,
+    ikey: str,
+    fencing_token: int,
+    call_coordination: Optional[str],
+) -> None:
+    """Commits a body's result, whatever the lease's clock says.
+
+    The engine decides: it accepts the commit while the lease is still this
+    call's, which it is unless another worker took it over, and refuses a stale
+    token. Not committing on a local judgement alone would throw away the
+    record of a side effect that ran, and calling again would run it twice. A
+    refusal about the key (a stale token, or the key recorded at another
+    position) raises `LeaseLostError` with the result attached. A commit that
+    gets no answer is sent once more before anything is released: while the
+    lease is still this call's, that one is recorded, and an engine that
+    already holds the first answers it as done.
+    """
+    # Taken once, so every attempt sends the same step, even if work the body
+    # left running changes the object it returned. First: a result that cannot
+    # be recorded fails here, before anything is sent or noted as returned.
+    payload = deserialize(serialize({"result": result}))
+    call.returned, call.result, call.payload = True, result, payload
+    call.committing = True
+    try:
+        _send_commit(ctx, call, seq, name, ikey, fencing_token, call_coordination)
+    except Exception as exc:
+        if _is_stale_lease(exc) or _is_committed_elsewhere(exc):
+            call.committing = False
+            call.mark_taken_over()
+            raise _taken_over(name, result) from exc
+        if not _unanswered(exc):
+            call.committing = False
+            raise
+        try:
+            _send_commit(
+                ctx, call, seq, name, ikey, fencing_token, call_coordination
+            )
+            return
+        except Exception as again:
+            call.committing = False
+            if _is_stale_lease(again) or _is_committed_elsewhere(again):
+                call.mark_taken_over()
+                raise _taken_over(name, result) from again
+            raise exc from None
+    except BaseException:
+        call.committing = False
+        raise
+
+
+def _send_commit(
+    ctx: WorkflowContext,
+    call: _CallLease,
+    seq: int,
+    name: str,
+    ikey: str,
+    fencing_token: int,
+    call_coordination: Optional[str],
+) -> None:
+    ctx.client.commit_step(
+        session_id=ctx.session_id,
+        sequence=seq,
+        name=name,
+        status=STEP_STATUS_SUCCESS,
+        output_payload=call.payload,
+        idempotency_key=ikey,
+        idempotency_fencing_token=fencing_token,
+        # Omitted when the call names none, so the engine records the
+        # session's default.
+        coordination_id=call_coordination,
+    )
+
+
+def _resend_commit(
+    ctx: WorkflowContext,
+    call: _CallLease,
+    seq: int,
+    name: str,
+    ikey: str,
+    fencing_token: int,
+    call_coordination: Optional[str],
+) -> bool:
+    """Decides a failed commit whose lease the engine would not release.
+
+    Either the commit landed and only its answer was lost, which completed the
+    key under this call's own token, or another worker holds the call. The same
+    commit sent again tells them apart: the engine answers an identical commit
+    it already holds as done, and refuses a stale token. True when it was done;
+    `LeaseLostError` when the refusal is about the key (a stale token, or the
+    key recorded at another position), so another worker holds the call; False
+    for anything else (no answer, or the position already filled, which can
+    also mean the commit landed), so the call fails as it would have.
+    """
+    try:
+        _send_commit(ctx, call, seq, name, ikey, fencing_token, call_coordination)
+    except Exception as again:
+        if not _is_stale_lease(again) and not _is_committed_elsewhere(again):
+            return False
+        call.apply_held_loss()
+        call.mark_taken_over()
+        raise _taken_over(name, call.result) from again
+    return True
 
 
 def _take_hit(
@@ -665,6 +916,8 @@ def step(
         failed_at: Optional[float] = None
         # Whether the failure path already stopped the heartbeat.
         stopped = False
+        # The call's lease as the engine answers about it.
+        call = _CallLease()
         try:
             if seq in ctx.replayed_steps:
                 return _replay(ctx, seq, actual_tool_name)
@@ -704,9 +957,13 @@ def step(
 
             fencing_token = 0
             hb: Optional[LeaseHeartbeat] = None
+            # The lease as the body sees it through current_lease(). Only when
+            # the call holds one: a hit never runs the body.
+            handle: Optional[LeaseHandle] = None
             ttl_ms = _ttl_for(ctx)
 
             while True:
+                sent = (time.monotonic(), time.time())
                 try:
                     resp = ctx.client.check_idempotency_cache(
                         agent_id=agent_id,
@@ -746,14 +1003,16 @@ def step(
                     await asyncio.sleep(retry_ms / 1000.0)
                 elif resp.status == CACHE_STATUS_ACQUIRED:
                     fencing_token = resp.fencing_token or 0
-                    hb = LeaseHeartbeat(
-                        client=ctx.client,
-                        agent_id=agent_id,
-                        idempotency_key=ikey,
-                        fencing_token=fencing_token,
-                        heartbeat_interval_ms=_interval_for(resp, ttl_ms),
-                        # None infers the engine's TTL from its interval.
-                        lease_ttl_ms=ttl_ms,
+                    handle, hb = _lease_for_body(
+                        ctx,
+                        call,
+                        agent_id,
+                        ikey,
+                        fencing_token,
+                        _interval_for(resp, ttl_ms),
+                        ttl_ms,
+                        sent,
+                        resp.lease_expires_at_ms,
                     )
                     hb.start_async()
                     break
@@ -761,41 +1020,91 @@ def step(
                     break
 
             try:
-                result = await func(*args, **kwargs)
-                ctx.client.commit_step(
-                    session_id=ctx.session_id,
-                    sequence=seq,
-                    name=actual_tool_name,
-                    status=STEP_STATUS_SUCCESS,
-                    output_payload={"result": result},
-                    idempotency_key=ikey,
-                    idempotency_fencing_token=fencing_token,
-                    # Omitted when the call names none, so the engine records the
-                    # session's default.
-                    coordination_id=call_coordination,
+                if handle is None:
+                    result = await func(*args, **kwargs)
+                else:
+                    lease_var = _current_lease.set(handle)
+                    try:
+                        result = await func(*args, **kwargs)
+                    finally:
+                        _current_lease.reset(lease_var)
+                # The body is over: work it started and left running finds the
+                # lease over from here on, through the commit's round trip too.
+                if handle is not None:
+                    handle._mark_released()
+                _commit(
+                    ctx,
+                    call,
+                    seq,
+                    actual_tool_name,
+                    result,
+                    ikey,
+                    fencing_token,
+                    call_coordination,
                 )
                 return result
             except BaseException as e:
                 failed_at = time.monotonic()
+                if handle is not None:
+                    handle._mark_released()
                 if hb:
                     # Told to stop before the release, so it starts no renewal
                     # after it. Not awaited: an await is where a cancellation
                     # lands, and would replace the step's own exception.
                     hb.stop_soon()
                     stopped = True
-                # Cancellation too: a lease left held would refuse the step that
-                # takes this position next until it lapsed.
-                if fencing_token > 0 and hb is not None:
-                    unreleased = _release_after_failure(
+                # Released whatever the body raised and whatever the lease's
+                # clock says, cancellation too: a lease left held would refuse
+                # the step that takes this position next until it lapsed. The
+                # engine releases only a lease that is still this call's, so its
+                # answer says whether another worker took the call over.
+                if fencing_token > 0 and hb is not None and not call.lost:
+                    call.releasing = True
+                    unreleased, released = _release_after_failure(
                         ctx, agent_id, ikey, fencing_token, actual_tool_name, hb
                     )
+                    if released is False:
+                        # For a body that returned, the commit may have landed
+                        # and refused the release itself: the resend below
+                        # decides. For one that raised, it is no longer ours.
+                        if call.returned:
+                            call.lost = True
+                        else:
+                            call.mark_taken_over()
+                # Only for an error: an interrupt (Ctrl-C, SystemExit) is on its
+                # way out and must not be swallowed by a resend that succeeds.
+                if (
+                    call.lost
+                    and call.returned
+                    and isinstance(e, Exception)
+                    and not isinstance(e, LeaseLostError)
+                ):
+                    if _resend_commit(
+                        ctx,
+                        call,
+                        seq,
+                        actual_tool_name,
+                        ikey,
+                        fencing_token,
+                        call_coordination,
+                    ):
+                        return call.result
+                call.apply_held_loss()
                 raise e
             finally:
+                if handle is not None:
+                    # Work the body started and left running finds the lease
+                    # over from here on.
+                    handle._mark_released()
                 if hb and not stopped:
                     # Not awaited after a commit either: a cancellation landing
                     # there would turn a committed step into a cancelled one.
                     hb.stop_soon()
         except BaseException as exc:
+            # Recorded at its position even when another worker took the call
+            # over: a resumed @workflow replays by position, and finds the
+            # failure there as the run saw it. Calling the step again lands
+            # one position on and finds the other worker's result as a hit.
             if live:
                 _note_failure(
                     ctx,
@@ -845,6 +1154,8 @@ def step(
         failed_at: Optional[float] = None
         # Whether the failure path already stopped the heartbeat.
         stopped = False
+        # The call's lease as the engine answers about it.
+        call = _CallLease()
         try:
             if seq in ctx.replayed_steps:
                 return _replay(ctx, seq, actual_tool_name)
@@ -884,9 +1195,13 @@ def step(
 
             fencing_token = 0
             hb: Optional[LeaseHeartbeat] = None
+            # The lease as the body sees it through current_lease(). Only when
+            # the call holds one: a hit never runs the body.
+            handle: Optional[LeaseHandle] = None
             ttl_ms = _ttl_for(ctx)
 
             while True:
+                sent = (time.monotonic(), time.time())
                 try:
                     resp = ctx.client.check_idempotency_cache(
                         agent_id=agent_id,
@@ -926,14 +1241,16 @@ def step(
                     time.sleep(retry_ms / 1000.0)
                 elif resp.status == CACHE_STATUS_ACQUIRED:
                     fencing_token = resp.fencing_token or 0
-                    hb = LeaseHeartbeat(
-                        client=ctx.client,
-                        agent_id=agent_id,
-                        idempotency_key=ikey,
-                        fencing_token=fencing_token,
-                        heartbeat_interval_ms=_interval_for(resp, ttl_ms),
-                        # None infers the engine's TTL from its interval.
-                        lease_ttl_ms=ttl_ms,
+                    handle, hb = _lease_for_body(
+                        ctx,
+                        call,
+                        agent_id,
+                        ikey,
+                        fencing_token,
+                        _interval_for(resp, ttl_ms),
+                        ttl_ms,
+                        sent,
+                        resp.lease_expires_at_ms,
                     )
                     hb.start_sync()
                     break
@@ -941,37 +1258,87 @@ def step(
                     break
 
             try:
-                result = func(*args, **kwargs)
-                ctx.client.commit_step(
-                    session_id=ctx.session_id,
-                    sequence=seq,
-                    name=actual_tool_name,
-                    status=STEP_STATUS_SUCCESS,
-                    output_payload={"result": result},
-                    idempotency_key=ikey,
-                    idempotency_fencing_token=fencing_token,
-                    # Omitted when the call names none, so the engine records the
-                    # session's default.
-                    coordination_id=call_coordination,
+                if handle is None:
+                    result = func(*args, **kwargs)
+                else:
+                    lease_var = _current_lease.set(handle)
+                    try:
+                        result = func(*args, **kwargs)
+                    finally:
+                        _current_lease.reset(lease_var)
+                # The body is over: work it started and left running finds the
+                # lease over from here on, through the commit's round trip too.
+                if handle is not None:
+                    handle._mark_released()
+                _commit(
+                    ctx,
+                    call,
+                    seq,
+                    actual_tool_name,
+                    result,
+                    ikey,
+                    fencing_token,
+                    call_coordination,
                 )
                 return result
             except BaseException as e:
                 failed_at = time.monotonic()
+                if handle is not None:
+                    handle._mark_released()
                 if hb:
                     # Stopped before the release, so it renews nothing after it.
                     hb.stop_sync()
                     stopped = True
-                # Cancellation too: a lease left held would refuse the step that
-                # takes this position next until it lapsed.
-                if fencing_token > 0 and hb is not None:
-                    unreleased = _release_after_failure(
+                # Released whatever the body raised and whatever the lease's
+                # clock says, cancellation too: a lease left held would refuse
+                # the step that takes this position next until it lapsed. The
+                # engine releases only a lease that is still this call's, so its
+                # answer says whether another worker took the call over.
+                if fencing_token > 0 and hb is not None and not call.lost:
+                    call.releasing = True
+                    unreleased, released = _release_after_failure(
                         ctx, agent_id, ikey, fencing_token, actual_tool_name, hb
                     )
+                    if released is False:
+                        # For a body that returned, the commit may have landed
+                        # and refused the release itself: the resend below
+                        # decides. For one that raised, it is no longer ours.
+                        if call.returned:
+                            call.lost = True
+                        else:
+                            call.mark_taken_over()
+                # Only for an error: an interrupt (Ctrl-C, SystemExit) is on its
+                # way out and must not be swallowed by a resend that succeeds.
+                if (
+                    call.lost
+                    and call.returned
+                    and isinstance(e, Exception)
+                    and not isinstance(e, LeaseLostError)
+                ):
+                    if _resend_commit(
+                        ctx,
+                        call,
+                        seq,
+                        actual_tool_name,
+                        ikey,
+                        fencing_token,
+                        call_coordination,
+                    ):
+                        return call.result
+                call.apply_held_loss()
                 raise e
             finally:
+                if handle is not None:
+                    # Work the body started and left running finds the lease
+                    # over from here on.
+                    handle._mark_released()
                 if hb and not stopped:
                     hb.stop_sync()
         except BaseException as exc:
+            # Recorded at its position even when another worker took the call
+            # over: a resumed @workflow replays by position, and finds the
+            # failure there as the run saw it. Calling the step again lands
+            # one position on and finds the other worker's result as a hit.
             if live:
                 _note_failure(
                     ctx,
