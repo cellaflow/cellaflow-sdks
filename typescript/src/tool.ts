@@ -6,7 +6,13 @@ import { IdempotencyScope, deriveIdempotencyKey, normalizeCoordinationId } from 
 import { LeaseHandle, LeaseLostError, LeaseNotAcquired, runUnderLease, runWithoutLease } from "./execution.js";
 import { LeaseHeartbeat, checkLeaseTtlMs } from "./lease.js";
 import { deserialize, serialize } from "./serialization.js";
-import { ENGINE_WAIT_DEADLINE_SECS, ENGINE_WAIT_MS, afterInProgress } from "./wait.js";
+import {
+  ENGINE_WAIT_DEADLINE_SECS,
+  ENGINE_WAIT_MS,
+  MAX_UNANSWERED,
+  RELEASE_DEADLINE_SECS,
+  afterInProgress,
+} from "./wait.js";
 
 /**
  * How many granted leases a call hands back, unconfirmed, before it fails
@@ -14,14 +20,6 @@ import { ENGINE_WAIT_DEADLINE_SECS, ENGINE_WAIT_MS, afterInProgress } from "./wa
  * once is granted again at once, so the next grant is not late.
  */
 const MAX_HAND_BACKS = 3;
-
-/**
- * How many times a call asks again after a request that got no answer, before
- * it fails. The engine may have granted the lost answer's lease: asking again
- * with the same key and position waits that lease out and is granted the next,
- * so the body still runs only under a lease this side was told about.
- */
-const MAX_UNANSWERED = 2;
 
 /** The engine's default lease TTL, for a call that asked for none. */
 const ENGINE_DEFAULT_TTL_MS = 20_000;
@@ -331,6 +329,9 @@ export function tool<A extends unknown[], R>(
         throw err;
       }
 
+      // An answer: only failures since the last one count towards giving up.
+      unanswered = 0;
+
       if (resp.status === CacheStatus.HIT) {
         // A hit returns without executing. When nothing is recorded at `seq` yet,
         // the result is recorded there before the next step runs, so the history
@@ -422,7 +423,7 @@ export function tool<A extends unknown[], R>(
           const token = fencingToken;
           const detail = hb.lostDetail ?? "no renewal was confirmed";
           await hb.stop();
-          await ctx.client.releaseLease(agentId, ikey, token, "LEASE_UNCONFIRMED").catch(() => {
+          await ctx.client.releaseLease(agentId, ikey, token, "LEASE_UNCONFIRMED", RELEASE_DEADLINE_SECS).catch(() => {
             // It lapses on its own, and asking again waits that out. Until it
             // does, it still claims this position, so if the call fails, the
             // failure record there retries the release or waits for it.
@@ -548,7 +549,7 @@ export function tool<A extends unknown[], R>(
       if (fencingToken > 0 && !known.lost) {
         releasing = true;
         await ctx.client
-          .releaseLease(agentId, ikey, fencingToken, "TOOL_ERROR")
+          .releaseLease(agentId, ikey, fencingToken, "TOOL_ERROR", RELEASE_DEADLINE_SECS)
           .then((released) => {
             // Not released: the lease was no longer this call's to release.
             if (!released.released) known.lost = true;

@@ -12,8 +12,8 @@ All notable changes to the Cellaflow TypeScript SDK.
   released or lapses, instead of up to a second later. The engine checks the holder every 100 ms
   for all the callers waiting on one key, and each asks again at most every 10 s, instead of once a
   second. The same applies to the lease that records a shared result or failure in the session. A
-  waiting request that gets no answer within 15 s is asked again, twice, and then fails the call,
-  so a lost connection to the engine is noticed. An engine that answers at once without waiting is
+  waiting request that gets no answer within 15 s is asked again, and after three in a row the call
+  fails, so a lost connection to the engine is noticed. Releases get a 5 s deadline. An engine that answers at once without waiting is
   asked again after its `retryAfterMs`, as before.
 - **A lease granted after a wait is counted from when it was granted.** The lease can be much younger
   than the request that won it, so the call sends a renewal before the body starts and counts the

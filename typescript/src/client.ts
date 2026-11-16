@@ -247,7 +247,7 @@ export class CellaflowClient {
 
     return await this.client.checkIdempotencyCache(req, {
       timeoutMs:
-        timeoutSecs !== undefined && timeoutSecs > 0 ? Math.max(1, Math.round(timeoutSecs * 1000)) : undefined,
+        deadlineMs(timeoutSecs),
     });
   }
 
@@ -278,9 +278,7 @@ export class CellaflowClient {
       // Whole milliseconds: the grpc-timeout header carries an integer, and a
       // fractional value is dropped by the server rather than rounded.
       timeoutMs:
-        timeoutSecs !== undefined && timeoutSecs > 0
-          ? Math.max(1, Math.round(timeoutSecs * 1000))
-          : undefined,
+        deadlineMs(timeoutSecs),
     });
   }
 
@@ -307,9 +305,7 @@ export class CellaflowClient {
 
     return await this.client.releaseLease(req, {
       timeoutMs:
-        timeoutSecs !== undefined && timeoutSecs > 0
-          ? Math.max(1, Math.round(timeoutSecs * 1000))
-          : undefined,
+        deadlineMs(timeoutSecs),
     });
   }
 
@@ -325,4 +321,20 @@ export class CellaflowClient {
   close(): void {
     // No-op: Connect-ES does not provide a transport.close() API.
   }
+}
+
+/**
+ * The longest deadline a timer can hold. Node runs a longer one at once, so a
+ * deadline past it would fail the call immediately instead of never.
+ */
+const MAX_DEADLINE_MS = 2 ** 31 - 1;
+
+/**
+ * A call's deadline in whole milliseconds, or none. Whole: the grpc-timeout
+ * header carries an integer, and a fractional value is dropped by the server
+ * rather than rounded. Capped at what a timer can hold.
+ */
+function deadlineMs(timeoutSecs: number | undefined): number | undefined {
+  if (timeoutSecs === undefined || !(timeoutSecs > 0)) return undefined;
+  return Math.min(MAX_DEADLINE_MS, Math.max(1, Math.round(timeoutSecs * 1000)));
 }

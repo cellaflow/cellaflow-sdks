@@ -13,7 +13,9 @@ import { fileURLToPath } from "node:url";
 
 import { IdempotencyScope, durableTools, tool } from "../../dist/index.js";
 
-const TAKEN_OVER_WITHIN_MS = 350;
+// Below what polling takes here (at least the 600 ms the mid-call kill leaves
+// after a renewal), with room for a loaded CI engine.
+const TAKEN_OVER_WITHIN_MS = 500;
 
 const target = process.env.CELLAFLOW_TARGET;
 const engine = { skip: target ? false : "needs an engine: set CELLAFLOW_TARGET" };
@@ -36,6 +38,7 @@ function holder(orderId, coordinationId) {
     import { CacheStatus, CellaflowClient, IdempotencyScope, durableTools, tool } from ${JSON.stringify(dist)};
     const renew = CellaflowClient.prototype.renewLease;
     CellaflowClient.prototype.renewLease = async function (...args) {
+      console.log("sending " + Date.now());
       const resp = await renew.apply(this, args);
       if (resp.renewed) console.log("confirmed " + Date.now());
       return resp;
@@ -61,6 +64,7 @@ function holder(orderId, coordinationId) {
     stdio: ["ignore", "pipe", "inherit"],
   });
   const confirmed = [];
+  const sent = [];
   const listeners = new Set();
   let buffered = "";
   const ready = new Promise((resolve, reject) => {
@@ -69,6 +73,7 @@ function holder(orderId, coordinationId) {
       const lines = buffered.split("\n");
       buffered = lines.pop();
       for (const line of lines) {
+        if (line.startsWith("sending ")) sent.push(Number(line.slice("sending ".length)));
         if (line.startsWith("confirmed ")) {
           confirmed.push(Number(line.slice("confirmed ".length)));
           for (const listener of listeners) listener();
@@ -87,7 +92,7 @@ function holder(orderId, coordinationId) {
       };
       listeners.add(listener);
     });
-  return { child, ready, confirmed, closed, nextConfirmation };
+  return { child, ready, confirmed, sent, closed, nextConfirmation };
 }
 
 /**
@@ -98,7 +103,7 @@ function holder(orderId, coordinationId) {
 async function takeover(t, holdMs, afterRenewalMs) {
   const orderId = `order-${randomUUID().slice(0, 8)}`;
   const coordinationId = orderId;
-  const { child, ready, confirmed, closed, nextConfirmation } = holder(orderId, coordinationId);
+  const { child, ready, confirmed, sent, closed, nextConfirmation } = holder(orderId, coordinationId);
   let killedAt;
   try {
     await ready;
@@ -137,7 +142,10 @@ async function takeover(t, holdMs, afterRenewalMs) {
   // renewal that confirms a late grant. One polling once a second, started at
   // the kill, lands up to a second after the lapse.
   const lastConfirmed = Math.max(...confirmed.filter((at) => at <= killedAt));
-  const afterLapse = ranAt - (lastConfirmed + TTL_MS);
+  // A renewal sent but not confirmed before the kill may still have reached the
+  // engine, as late as the kill: the lease is then counted from the kill.
+  const unconfirmed = sent.some((at) => at > lastConfirmed && at <= killedAt);
+  const afterLapse = ranAt - ((unconfirmed ? killedAt : lastConfirmed) + TTL_MS);
   t.diagnostic(`took over ${afterLapse} ms after the latest possible lapse`);
   assert.ok(afterLapse <= TAKEN_OVER_WITHIN_MS, `took over ${afterLapse} ms after the lapse`);
   // The holder's lease lapses no later than a TTL after the kill, and the

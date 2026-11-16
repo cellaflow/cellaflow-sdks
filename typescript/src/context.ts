@@ -4,7 +4,13 @@ import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { failureIdempotencyKey, recordIdempotencyKey } from "./idempotency.js";
 import { checkLeaseTtlMs } from "./lease.js";
-import { ENGINE_WAIT_DEADLINE_SECS, ENGINE_WAIT_MS, afterInProgress } from "./wait.js";
+import {
+  ENGINE_WAIT_DEADLINE_SECS,
+  ENGINE_WAIT_MS,
+  MAX_UNANSWERED,
+  RELEASE_DEADLINE_SECS,
+  afterInProgress,
+} from "./wait.js";
 import {
   errorCode,
   hasStatusCode,
@@ -450,6 +456,7 @@ export class WorkflowContext {
         ? failureIdempotencyKey(this.sessionId, pending.sequence, pending.name, pending.receivedKey)
         : recordIdempotencyKey(this.sessionId, pending.sequence, pending.receivedKey);
     let token = 0;
+    let unanswered = 0;
     for (;;) {
       await this.retryRelease(pending);
       let resp;
@@ -480,10 +487,18 @@ export class WorkflowContext {
           // Lapsed, so the refusal is someone else's claim.
           pending.unreleased = undefined;
         }
+        if (isRetryable(err) && unanswered < MAX_UNANSWERED) {
+          // No answer: the engine may have granted it, and asking again with
+          // the same key waits that lease out, as a call does.
+          unanswered += 1;
+          await sleep(200 * unanswered);
+          continue;
+        }
         // Anything else, including an error that may pass, keeps the lease, so
         // the next attempt still retries the release or waits for the lapse.
         throw err;
       }
+      unanswered = 0;
       // Written by an earlier attempt whose answer was lost.
       if (resp.status === CacheStatus.HIT) return;
       if (resp.status === CacheStatus.IN_PROGRESS) {
@@ -512,7 +527,7 @@ export class WorkflowContext {
         pending.coordinationId,
       );
     } catch (err) {
-      await this.client.releaseLease(pending.agentId, key, token, "TOOL_ERROR").catch(() => {
+      await this.client.releaseLease(pending.agentId, key, token, "TOOL_ERROR", RELEASE_DEADLINE_SECS).catch(() => {
         // The lease lapses on its own. Losing the release is not worth masking the
         // error that caused it.
       });
@@ -535,6 +550,7 @@ export class WorkflowContext {
         unreleased.key,
         unreleased.token,
         "TOOL_ERROR",
+        RELEASE_DEADLINE_SECS,
       );
       pending.unreleased = undefined;
     } catch (err) {

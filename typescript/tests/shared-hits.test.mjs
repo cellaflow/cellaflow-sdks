@@ -659,8 +659,13 @@ test("a failure record waits for an unreleased lease to lapse", async () => {
 test("an error that may pass does not make the record forget the unreleased lease", async () => {
   // The record is kept for the next call. That call must still know the failed
   // call's lease holds the position, or it drops the record as someone else's.
+  // Unavailable three times in a row: the record asks again twice before the
+  // call gives up.
+  const unavailable = () => { throw Object.assign(new Error("engine unavailable"), { code: 14 }); };
   const answers = [
-    () => { throw Object.assign(new Error("engine unavailable"), { code: 14 }); },
+    unavailable,
+    unavailable,
+    unavailable,
     () => { throw Object.assign(new Error("position claimed"), { code: 9 }); },
     () => ({ status: CacheStatus.ACQUIRED, fencingToken: 99n, heartbeatIntervalMs: 60_000n }),
   ];

@@ -24,6 +24,23 @@ export const ENGINE_WAIT_MS = 10_000;
 export const ENGINE_WAIT_DEADLINE_SECS = (ENGINE_WAIT_MS + 5_000) / 1000;
 
 /**
+ * The deadline on a release. A release often follows renewals or requests that
+ * failed, when the connection is most likely bad, and one that hangs would hold
+ * up the call, and every call queued behind it in the session. A release that
+ * fails is kept as the call's unreleased lease, so giving up costs nothing.
+ */
+export const RELEASE_DEADLINE_SECS = 5;
+
+/**
+ * How many times a request that got no answer is asked again before the call
+ * fails, counted since the last answer. The engine may have granted the lost
+ * answer's lease: asking again with the same key and position waits that lease
+ * out and is granted the next, so a body still runs only under a lease this
+ * side was told about.
+ */
+export const MAX_UNANSWERED = 2;
+
+/**
  * Bounds on a back-off the engine suggests: a zero would make the loop busy,
  * and a value past what timers hold would fire at once.
  */

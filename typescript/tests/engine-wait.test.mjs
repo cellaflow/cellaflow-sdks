@@ -423,6 +423,13 @@ test("a waiting request that gets no answer fails at its deadline", { timeout: 1
   server.on("stream", () => {});
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const client = new CellaflowClient({ target: `127.0.0.1:${server.address().port}` });
+  // If the deadline regresses, the test's own timeout fires and the finally
+  // below never runs: this still shuts the server, so the file can exit.
+  const guard = setTimeout(() => {
+    for (const session of sessions) session.destroy();
+    server.close();
+  }, 9_000);
+  guard.unref();
   try {
     const started = performance.now();
     await assert.rejects(
@@ -431,6 +438,68 @@ test("a waiting request that gets no answer fails at its deadline", { timeout: 1
     );
     const tookMs = performance.now() - started;
     assert.ok(tookMs < 3000, `the deadline fired after ${tookMs} ms`);
+  } finally {
+    clearTimeout(guard);
+    client.close();
+    for (const session of sessions) session.destroy();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("only failures since the last answer count towards giving up", async () => {
+  // A long wait can meet the odd dropped connection; each answer in between
+  // shows the engine is there.
+  const lost = { throws: 14 };
+  const client = scriptedClient([lost, inProgress({ retryAfterMs: 1n }), lost, inProgress({ retryAfterMs: 1n }), lost, acquired()]);
+  const charge = tool(async () => "charged", { toolName: "charge_card" });
+  assert.equal(await runWithContext(session(client), () => charge()), "charged");
+  assert.equal(client.acquires.length, 6);
+});
+
+test("the lease that records a received result is asked again after a request that got no answer", async () => {
+  const hit = {
+    status: CacheStatus.HIT,
+    currentSequence: 0n,
+    cachedResult: { outputPayload: serialize({ result: "placed-elsewhere" }) },
+  };
+  const client = scriptedClient([hit, acquired()], { recordAnswers: [{ throws: 4 }] });
+  const place = tool(async () => "placed-here", { toolName: "place_order" });
+  const confirm = tool(async () => "confirmed", { toolName: "send_confirmation" });
+  await runWithContext(session(client), async () => {
+    await place();
+    assert.equal(await confirm(), "confirmed");
+  });
+  assert.equal(client.recordAcquires.length, 2);
+  assert.deepEqual(
+    client.order.filter((e) => e.startsWith("commit")),
+    ["commit:1:place_order", "commit:2:send_confirmation"],
+  );
+});
+
+test("a deadline longer than a timer can hold does not fail the call at once", { timeout: 10_000 }, async () => {
+  // A server that answers UNAVAILABLE after 500 ms. A deadline that fired at
+  // once would fail the call first, with DEADLINE_EXCEEDED.
+  const server = http2.createServer();
+  const sessions = [];
+  server.on("session", (session) => sessions.push(session));
+  server.on("stream", (stream) => {
+    stream.on("error", () => {});
+    setTimeout(() => {
+      if (stream.destroyed) return;
+      stream.respond({ ":status": 200, "content-type": "application/grpc" }, { waitForTrailers: true });
+      stream.on("wantTrailers", () => stream.sendTrailers({ "grpc-status": "14", "grpc-message": "unavailable" }));
+      stream.end();
+    }, 500);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const client = new CellaflowClient({ target: `127.0.0.1:${server.address().port}` });
+  try {
+    const started = performance.now();
+    await assert.rejects(
+      client.checkIdempotencyCache("agent", "key", 10_000, undefined, undefined, undefined, 2 ** 32),
+      (err) => err.code === 14,
+    );
+    assert.ok(performance.now() - started >= 400);
   } finally {
     client.close();
     for (const session of sessions) session.destroy();
