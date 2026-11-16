@@ -3,7 +3,7 @@ import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { getContext, type UnreleasedLease, type WorkflowContext } from "./context.js";
 import { IdempotencyScope, deriveIdempotencyKey, normalizeCoordinationId } from "./idempotency.js";
-import { LeaseHandle, LeaseLostError, runUnderLease } from "./execution.js";
+import { LeaseHandle, LeaseLostError, runUnderLease, runWithoutLease } from "./execution.js";
 import { LeaseHeartbeat, checkLeaseTtlMs } from "./lease.js";
 import { deserialize, serialize } from "./serialization.js";
 
@@ -330,9 +330,13 @@ export function tool<A extends unknown[], R>(
             : suggested;
         // Judged on the clock whenever the body asks, so a holder resumed past its
         // deadline finds the lease gone before any renewal has to answer.
-        const leaseHandle = new LeaseHandle(fencingToken, () => {
-          hb?.pastDeadline();
-        });
+        const leaseHandle = new LeaseHandle(
+          fencingToken,
+          () => {
+            hb?.pastDeadline();
+          },
+          ikey,
+        );
         handle = leaseHandle;
         hb = new LeaseHeartbeat({
           client: ctx.client,
@@ -410,7 +414,10 @@ export function tool<A extends unknown[], R>(
 
     try {
       const body = () => fn(...args);
-      const result = handle ? await runUnderLease(handle, body) : await body();
+      // Without a lease of its own (an answer this SDK does not know), no
+      // enclosing lease reaches the body either, so its key cannot be
+      // forwarded in this call's name.
+      const result = handle ? await runUnderLease(handle, body) : await runWithoutLease(body);
       // The body is over: work it started and did not await finds the lease
       // over from here on, through the commit's round trip too.
       handle?.markReleased();

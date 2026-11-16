@@ -25,11 +25,22 @@ All notable changes to the Cellaflow TypeScript SDK.
   call over fails `check()` as soon as it resumes, so it does not send. See "Checking the lease
   inside a tool" in the README. The clock only tells the body to stop; whether the call's result is
   recorded is still the engine's decision.
+- **A tool body can send its call's idempotency key to the destination.** `currentLease().key` is
+  the key the call's lease was taken under, the same on every attempt at the same call, and
+  `keyDigest` its SHA-256 (64 lowercase hex characters). `withIdempotencyKey(init)` adds an
+  `Idempotency-Key` header carrying the digest (or the key, with `{ raw: true }`) and the lease's
+  `signal` (unless the request has its own) to a `fetch` request, so a destination that
+  deduplicates applies a request repeated after a crash once. `keyDigestFor(part)` and
+  `{ part }` give each of several requests its own key. An `executionLease` handle carries its key
+  too. See "Sending the call's key to the destination" in the README. The helper's types name the
+  fetch globals `RequestInit` and `Headers`, which come with `@types/node` 18.19 or later, or with
+  `lib: ["DOM"]`.
 
 ### Changed
 
 - **A tool body nested in `executionLease` or `taskLease` now gets the tool call's lease from
-  `currentLease()`**, not the enclosing one. Code that passes `currentLease().fencingToken` to a
+  `currentLease()`**, not the enclosing one. A body the SDK runs without a lease of its own sees no
+  lease at all. Code that passes `currentLease().fencingToken` to a
   downstream fence from inside a tool should read the enclosing lease before calling the tool.
 - **A tool call another worker took over is no longer recorded in its name.** A commit the engine
   refuses because another worker holds the call now ends with `LeaseLostError` (the body's return
