@@ -3,6 +3,7 @@ import inspect
 import uuid
 import asyncio
 import time
+import threading
 import logging
 from typing import (
     Any,
@@ -560,6 +561,139 @@ class _CallLease:
             self.handle.is_lost = True
 
 
+#: How long one arbitration request asks the engine to wait while another
+#: worker holds the call. The engine answers the moment that worker commits, or
+#: grants the lease the moment it is released or lapses, and every caller
+#: waiting on the key shares one watcher there instead of each polling. The
+#: call's total wait is the loop around it, so this only bounds how long one
+#: request stays open: a dead connection is noticed within it.
+_ENGINE_WAIT_MS = 10_000
+
+#: The deadline on a request that asks to wait, in seconds: the wait, plus time
+#: for the engine to answer. A connection that dies while the engine holds the
+#: request fails the call by then, rather than leaving it waiting for an answer
+#: that never comes.
+_ENGINE_WAIT_DEADLINE_S = (_ENGINE_WAIT_MS + 5_000) / 1000.0
+
+
+def _retry_after_s(resp: Any) -> float:
+    """The back-off an engine that did not wait suggests, bounded: a zero would
+    make the loop busy."""
+    return float(min(60_000, max(50, resp.retry_after_ms or 1000))) / 1000.0
+
+
+def _answered_at_once(sent: Tuple[float, float]) -> bool:
+    """Whether an IN_PROGRESS answer came back well before the wait it asked
+    for. An engine that waited answers at the end of its wait, so the call can
+    ask again at once; one that answered sooner did not wait (an engine that
+    ignores the field), and is asked again only after its `retry_after_ms`, so
+    an old engine cannot turn the loop into a busy one."""
+    return time.monotonic() - sent[0] < _ENGINE_WAIT_MS / 2000.0
+
+
+def _granted_late(sent: Tuple[float, float], interval_ms: int) -> bool:
+    """Whether a grant came back more than half an interval after its request,
+    so after a wait in the engine. Such a lease can be much younger than the
+    request and is counted from a renewal instead (`confirm_grant`). Up to
+    that, counting from the request costs the lease less than its margin."""
+    return time.monotonic() - sent[0] > interval_ms / 2000.0
+
+
+#: How many granted leases a call hands back, unconfirmed, before it fails
+#: rather than asking again. A healthy engine needs none: a lease released at
+#: once is granted again at once, so the next grant is not late.
+_MAX_HAND_BACKS = 3
+
+
+def _hand_back(
+    ctx: WorkflowContext,
+    agent_id: str,
+    ikey: str,
+    fencing_token: int,
+    reason: str,
+    hb: Optional[LeaseHeartbeat] = None,
+) -> Optional[Dict[str, Any]]:
+    """Releases a lease whose body never started. It lapses on its own if the
+    release fails, and asking again waits that out. Until it does, it still
+    claims the call's position, so it is returned, as `_release_after_failure`
+    returns one, for a failure record there to retry the release or wait for
+    the lapse."""
+    try:
+        ctx.client.release_lease(
+            agent_id=agent_id,
+            idempotency_key=ikey,
+            fencing_token=fencing_token,
+            reason=reason,
+        )
+    except Exception:
+        logger.info("Could not hand back the lease on %s; it lapses on its own", ikey)
+        if hb is None:
+            return None
+        return {
+            "agent_id": agent_id,
+            "key": ikey,
+            "token": fencing_token,
+            "lapses_in_s": hb.rpc_timeout_sec + hb.lease_ttl_ms / 1000.0 + 1.0,
+        }
+    return None
+
+
+def _unconfirmed(name: str, handed_back: int, hb: LeaseHeartbeat) -> RuntimeError:
+    """The error for a call none of whose granted leases could be confirmed:
+    the engine grants leases but will not renew them, and waiting longer only
+    repeats that."""
+    detail = hb.lost_detail or "no renewal was confirmed"
+    return RuntimeError(
+        f"Step '{name}' could not confirm any of {handed_back} leases the engine "
+        f"granted it, so its body did not run: {detail}."
+    )
+
+
+async def _arbitrate_async(
+    ctx: WorkflowContext,
+    agent_id: str,
+    ikey: str,
+    ttl_ms: Optional[int],
+    seq: int,
+) -> Any:
+    """Asks for the lease from a worker thread, so the engine's wait does not
+    hold the event loop. A call cancelled while it waits leaves the request
+    running; if that request is then granted the lease, nothing will run the
+    body under it, so it is handed back rather than left to lapse."""
+    request = asyncio.ensure_future(
+        asyncio.to_thread(
+            ctx.client.check_idempotency_cache,
+            agent_id=agent_id,
+            idempotency_key=ikey,
+            wait_timeout_ms=_ENGINE_WAIT_MS,
+            lease_ttl_ms=ttl_ms,
+            session_id=ctx.session_id,
+            # Tell the engine where this call intends to write, so a lease at
+            # an already-committed position is refused before the tool body
+            # runs rather than after.
+            sequence=seq,
+            timeout=_ENGINE_WAIT_DEADLINE_S,
+        )
+    )
+    try:
+        return await asyncio.shield(request)
+    except asyncio.CancelledError:
+
+        def hand_back_if_granted(done: "asyncio.Future[Any]") -> None:
+            if done.cancelled() or done.exception() is not None:
+                return
+            resp = done.result()
+            if resp.status == CACHE_STATUS_ACQUIRED:
+                threading.Thread(
+                    target=_hand_back,
+                    args=(ctx, agent_id, ikey, resp.fencing_token or 0, "CANCELLED"),
+                    daemon=True,
+                ).start()
+
+        request.add_done_callback(hand_back_if_granted)
+        raise
+
+
 def _lease_for_body(
     ctx: WorkflowContext,
     call: _CallLease,
@@ -962,19 +1096,11 @@ def step(
             handle: Optional[LeaseHandle] = None
             ttl_ms = _ttl_for(ctx)
 
+            handed_back = 0
             while True:
                 sent = (time.monotonic(), time.time())
                 try:
-                    resp = ctx.client.check_idempotency_cache(
-                        agent_id=agent_id,
-                        idempotency_key=ikey,
-                        lease_ttl_ms=ttl_ms,
-                        session_id=ctx.session_id,
-                        # Tell the engine where this call intends to write,
-                        # so a lease at an already-committed position is refused
-                        # before the tool body runs rather than after.
-                        sequence=seq,
-                    )
+                    resp = await _arbitrate_async(ctx, agent_id, ikey, ttl_ms, seq)
                 except grpc.RpcError as exc:
                     if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
                         raise DivergentStepError(
@@ -983,6 +1109,8 @@ def step(
                         ) from exc
                     raise
                 if resp.status == CACHE_STATUS_HIT:
+                    # The key completed, so no lease of this call's is left.
+                    unreleased = None
                     return _take_hit(
                         ctx,
                         resp,
@@ -994,26 +1122,65 @@ def step(
                         ttl_ms,
                     )
                 elif resp.status == CACHE_STATUS_IN_PROGRESS:
-                    retry_ms = resp.retry_after_ms or 1000
-                    logger.info(
-                        "Step %s is in progress by another worker. Sleeping %d ms...",
-                        actual_tool_name,
-                        retry_ms,
-                    )
-                    await asyncio.sleep(retry_ms / 1000.0)
+                    # After a wait the engine served, ask again at once.
+                    if _answered_at_once(sent):
+                        retry_s = _retry_after_s(resp)
+                        logger.info(
+                            "Step %s is in progress by another worker. "
+                            "Sleeping %d ms...",
+                            actual_tool_name,
+                            retry_s * 1000,
+                        )
+                        await asyncio.sleep(retry_s)
                 elif resp.status == CACHE_STATUS_ACQUIRED:
+                    # A lease handed back below and not released has lapsed or
+                    # been released by now, or the engine would not grant the
+                    # key again.
+                    unreleased = None
                     fencing_token = resp.fencing_token or 0
+                    interval_ms = _interval_for(resp, ttl_ms)
+                    late = _granted_late(sent, interval_ms)
                     handle, hb = _lease_for_body(
                         ctx,
                         call,
                         agent_id,
                         ikey,
                         fencing_token,
-                        _interval_for(resp, ttl_ms),
+                        interval_ms,
                         ttl_ms,
                         sent,
-                        resp.lease_expires_at_ms,
+                        # Read against the request's send time, so only for a
+                        # grant that answered at once.
+                        0 if late else resp.lease_expires_at_ms,
                     )
+                    if late:
+                        try:
+                            await asyncio.to_thread(hb.confirm_grant)
+                        except asyncio.CancelledError:
+                            # The body will not run under this lease.
+                            threading.Thread(
+                                target=_hand_back,
+                                args=(ctx, agent_id, ikey, fencing_token, "CANCELLED"),
+                                daemon=True,
+                            ).start()
+                            raise
+                    if handle.is_lost:
+                        # Neither the renewal nor the request can show the
+                        # lease is still held, so the body must not start under
+                        # it: it would act on a lease this side has already
+                        # given up. Nothing has run, so hand the lease back and
+                        # ask again, which finds the call's result, waits behind
+                        # its holder, or grants a lease this side can count on.
+                        unreleased = _hand_back(
+                            ctx, agent_id, ikey, fencing_token, "LEASE_UNCONFIRMED", hb
+                        )
+                        handed_back += 1
+                        unconfirmed = _unconfirmed(actual_tool_name, handed_back, hb)
+                        call.handle = None
+                        handle, hb, fencing_token = None, None, 0
+                        if handed_back >= _MAX_HAND_BACKS:
+                            raise unconfirmed
+                        continue
                     hb.start_async()
                     break
                 else:
@@ -1200,18 +1367,23 @@ def step(
             handle: Optional[LeaseHandle] = None
             ttl_ms = _ttl_for(ctx)
 
+            handed_back = 0
             while True:
                 sent = (time.monotonic(), time.time())
                 try:
                     resp = ctx.client.check_idempotency_cache(
                         agent_id=agent_id,
                         idempotency_key=ikey,
+                        # Wait in the engine while another worker holds the
+                        # call; see _ENGINE_WAIT_MS.
+                        wait_timeout_ms=_ENGINE_WAIT_MS,
                         lease_ttl_ms=ttl_ms,
                         session_id=ctx.session_id,
                         # Tell the engine where this call intends to write,
                         # so a lease at an already-committed position is refused
                         # before the tool body runs rather than after.
                         sequence=seq,
+                        timeout=_ENGINE_WAIT_DEADLINE_S,
                     )
                 except grpc.RpcError as exc:
                     if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
@@ -1221,6 +1393,8 @@ def step(
                         ) from exc
                     raise
                 if resp.status == CACHE_STATUS_HIT:
+                    # The key completed, so no lease of this call's is left.
+                    unreleased = None
                     return _take_hit(
                         ctx,
                         resp,
@@ -1232,26 +1406,56 @@ def step(
                         ttl_ms,
                     )
                 elif resp.status == CACHE_STATUS_IN_PROGRESS:
-                    retry_ms = resp.retry_after_ms or 1000
-                    logger.info(
-                        "Step %s is in progress by another worker. Sleeping %d ms...",
-                        actual_tool_name,
-                        retry_ms,
-                    )
-                    time.sleep(retry_ms / 1000.0)
+                    # After a wait the engine served, ask again at once.
+                    if _answered_at_once(sent):
+                        retry_s = _retry_after_s(resp)
+                        logger.info(
+                            "Step %s is in progress by another worker. "
+                            "Sleeping %d ms...",
+                            actual_tool_name,
+                            retry_s * 1000,
+                        )
+                        time.sleep(retry_s)
                 elif resp.status == CACHE_STATUS_ACQUIRED:
+                    # A lease handed back below and not released has lapsed or
+                    # been released by now, or the engine would not grant the
+                    # key again.
+                    unreleased = None
                     fencing_token = resp.fencing_token or 0
+                    interval_ms = _interval_for(resp, ttl_ms)
+                    late = _granted_late(sent, interval_ms)
                     handle, hb = _lease_for_body(
                         ctx,
                         call,
                         agent_id,
                         ikey,
                         fencing_token,
-                        _interval_for(resp, ttl_ms),
+                        interval_ms,
                         ttl_ms,
                         sent,
-                        resp.lease_expires_at_ms,
+                        # Read against the request's send time, so only for a
+                        # grant that answered at once.
+                        0 if late else resp.lease_expires_at_ms,
                     )
+                    if late:
+                        hb.confirm_grant()
+                    if handle.is_lost:
+                        # Neither the renewal nor the request can show the
+                        # lease is still held, so the body must not start under
+                        # it: it would act on a lease this side has already
+                        # given up. Nothing has run, so hand the lease back and
+                        # ask again, which finds the call's result, waits behind
+                        # its holder, or grants a lease this side can count on.
+                        unreleased = _hand_back(
+                            ctx, agent_id, ikey, fencing_token, "LEASE_UNCONFIRMED", hb
+                        )
+                        handed_back += 1
+                        unconfirmed = _unconfirmed(actual_tool_name, handed_back, hb)
+                        call.handle = None
+                        handle, hb, fencing_token = None, None, 0
+                        if handed_back >= _MAX_HAND_BACKS:
+                            raise unconfirmed
+                        continue
                     hb.start_sync()
                     break
                 else:

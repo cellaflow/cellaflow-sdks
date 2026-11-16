@@ -974,6 +974,12 @@ class WorkflowContext:
                     # Already released or lapsed: nothing is left to free.
                     pending["unreleased"] = None
         try:
+            # Asked without a wait, unlike a call's own lease. This runs under
+            # the session's lock, which also guards every call's bookkeeping,
+            # so a request the engine held for seconds would stall them all. A
+            # held record is rare (an earlier attempt that could not release
+            # it, or a replica writing the same record): the caller sleeps on
+            # `_RecordHeld` outside the lock and asks again.
             resp = self.client.check_idempotency_cache(
                 agent_id=agent_id,
                 idempotency_key=key,

@@ -99,9 +99,13 @@ def takeover(target: str, hold_s: float) -> float:
 
 
 def check_bounds(waited: float) -> None:
-    # The holder's lease lapses no later than a TTL after the kill, and a waiting
-    # caller asks again about once a second.
-    assert waited <= TTL_MS + 1000 + 500, f"took over after {waited:.0f} ms"
+    # The holder's lease lapses no later than a TTL after the kill, and the
+    # waiting caller is granted it by the engine as soon as the engine sees that
+    # (it looks every 100 ms), not on its next poll a second later.
+    # The margin covers the engine's grant and the renewal that confirms it on
+    # a loaded CI engine. test_engine_wait.py is what tells waiting from
+    # polling.
+    assert waited <= TTL_MS + 750, f"took over after {waited:.0f} ms"
     # And not while the lease was still live: the last renewal (or the
     # acquisition) came at most an interval before the kill.
     assert waited >= TTL_MS - 2 * RENEW_EVERY_MS, f"took over after {waited:.0f} ms"

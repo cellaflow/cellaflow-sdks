@@ -224,6 +224,13 @@ behaviour without changing its name or arguments will not produce a new key**, s
 version can receive a result produced by the old one. Encode the behaviour change in the arguments,
 or in `tool_name`, when that matters.
 
+**Waiting for another agent.** A call that another agent is already running waits for it in the
+engine, not by polling. It gets that agent's result the moment it is recorded, or the lease the
+moment it is released or lapses. The engine checks the holder every 100 ms on behalf of every caller
+waiting on the call, and each waiting caller asks again at most every 10 s, rather than once a
+second. An `async` step waits in a worker thread, so the event loop keeps running. A request that
+gets no answer within 15 s fails the call, so a lost connection to the engine is noticed.
+
 ---
 
 ### 4. Transparent Replay & Session Recovery
@@ -637,7 +644,7 @@ with durable_tools(config, lease_ttl_ms=10_000):
     send_receipt(order)  # 10 s: the block's
 ```
 
-A shorter TTL means a faster takeover, and more renewals while a call runs. A holder that stops renewing for one TTL while its body still runs (a long garbage-collection pause, a process stopped by the OS, a lost connection to the engine) is taken over too, so set the TTL well above the longest pause a call can see. The TTL that decides a takeover is the holder's: a waiting caller's own `lease_ttl_ms` does not shorten it. A waiting caller asks again about once a second, so it takes over up to a second after the lease lapses. The lease that records a call's shared result or failure in the session uses the TTL of that call, and is not renewed, so the TTL also bounds how long that one write may take.
+A shorter TTL means a faster takeover, and more renewals while a call runs. A holder that stops renewing for one TTL while its body still runs (a long garbage-collection pause, a process stopped by the OS, a lost connection to the engine) is taken over too, so set the TTL well above the longest pause a call can see. The TTL that decides a takeover is the holder's: a waiting caller's own `lease_ttl_ms` does not shorten it. A waiting caller waits in the engine, which grants it the lease as soon as it sees the lease lapse (it looks every 100 ms). The lease that records a call's shared result or failure in the session uses the TTL of that call, and is not renewed, so the TTL also bounds how long that one write may take.
 
 `lease_ttl_ms` must be a whole number of milliseconds, from 1000 (`MIN_LEASE_TTL_MS`) to 2^53 - 1 (`MAX_LEASE_TTL_MS`): a number outside that makes the decorator or `durable_tools` raise `ValueError`, and anything that is not an `int` raises `TypeError`, before anything connects. The engine's maximum lease lifetime (`CELLAFLOW_MAX_LEASE_LIFETIME_MS`, an hour by default) caps every lease, whatever is asked for. The TypeScript SDK's `ttlMs` works the same way, so agents in both languages can be configured alike.
 
