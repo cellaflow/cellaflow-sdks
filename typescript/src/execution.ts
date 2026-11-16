@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { checkApiKeyOption } from "./apikey.js";
 import { CellaflowClient } from "./client.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
@@ -55,6 +56,29 @@ export class LeaseLostError extends Error {
  */
 export class LeaseHandle {
   readonly fencingToken: number;
+  /**
+   * The idempotency key the lease is held under: the key a `tool()` call
+   * derived (or was given), or the `executionLease` key.
+   *
+   * A tool call's key is the same on every attempt at the same call, as long
+   * as its arguments are the same, so it can be forwarded to a destination
+   * that deduplicates on it; see {@link withIdempotencyKey}. Under STEP_LOCAL
+   * the key includes the call's position, which calling the tool again after a
+   * failure, or a resumed `durableTools` thread, can change, so prefer
+   * SESSION_WIDE, SHARED, or an explicit key for forwarding.
+   *
+   * An `executionLease` key names a lock, which is released when the block
+   * ends and taken again by the next run: forward it only when it names
+   * exactly one operation (a task id), or add a run id of your own.
+   *
+   * A derived key carries the ids it is made of (the session or thread id, or
+   * the coordination id, the agent id and the tool name, by scope), so the
+   * helpers send {@link keyDigest} unless asked for the key itself.
+   */
+  get key(): string {
+    return this.#key;
+  }
+  readonly #key: string;
   private readonly controller = new AbortController();
   private lostDetail?: string;
   private released = false;
@@ -64,9 +88,125 @@ export class LeaseHandle {
    * @param probe Called before every `isLost` and `check()`, so loss is judged
    *   on the clock at the moment of asking rather than on the last heartbeat.
    */
-  constructor(fencingToken: number, probe?: () => void) {
+  constructor(fencingToken: number, probe?: () => void, key = "") {
     this.fencingToken = fencingToken;
     this.probe = probe;
+    this.#key = key;
+  }
+
+  /**
+   * SHA-256 of the UTF-8 {@link key}, as 64 lowercase hex characters: the same
+   * on every attempt, like the key, ASCII and within the length destinations
+   * allow (Stripe takes up to 255), and without the ids the key is made of in
+   * readable form. It is not a secret: anyone who can guess the inputs of a
+   * key can compute its digest.
+   */
+  get keyDigest(): string {
+    return createHash("sha256").update(this.requireKey(), "utf8").digest("hex");
+  }
+
+  /**
+   * A digest for one of several requests a body sends under this lease: the
+   * SHA-256 of {@link keyDigest} followed by `part` (UTF-8), as 64 lowercase
+   * hex characters, the same on every attempt, and different for each `part`.
+   * `part` must be a non-empty string. A destination that deduplicates refuses (Stripe) or answers from
+   * its first request (others) a key reused for a different request, so each
+   * request needs its own:
+   *
+   * ```ts
+   * await stripe.customers.create(customer, { idempotencyKey: lease.keyDigestFor("customer") });
+   * await stripe.paymentIntents.create(payment, { idempotencyKey: lease.keyDigestFor("payment") });
+   * ```
+   */
+  keyDigestFor(part: string): string {
+    if (typeof part !== "string" || part === "" || LONE_SURROGATE.test(part)) {
+      throw new TypeError(
+        "keyDigestFor: part must be a non-empty string of whole characters, so " +
+          "requests without one do not all share the call's key.",
+      );
+    }
+    // The digest is fixed-length, so no key and part can run into another's.
+    return createHash("sha256").update(this.keyDigest + part, "utf8").digest("hex");
+  }
+
+  /**
+   * Returns `init` for `fetch` with an `Idempotency-Key` header and this
+   * lease's `signal`, so the request is deduplicated by a destination that
+   * honours the header and cancelled on this side if the lease is lost. The
+   * header carries {@link keyDigest}, or the key itself with `{ raw: true }`.
+   * Other headers in `init` are kept and an `Idempotency-Key` already there is
+   * replaced. A `signal` already in `init` is kept instead of the lease's: to
+   * have both, pass `signal: AbortSignal.any([yours, lease.signal])` (Node
+   * 18.17 and later), with a signal of your own that ends with the request,
+   * such as `AbortSignal.timeout(...)`: `AbortSignal.any` keeps memory for each
+   * call on a long-lived one. `init` is not changed.
+   *
+   * ```ts
+   * await fetch(url, currentLease().withIdempotencyKey({ method: "POST", body }));
+   * ```
+   *
+   * @param options.part Which of several requests this is: the header carries
+   *   {@link keyDigestFor}(part), so each request has its own key.
+   * @param options.raw Send {@link key} rather than its digest. The key must
+   *   then be printable ASCII with no space at either end, and can be longer
+   *   than some destinations allow. Not with `part`.
+   * @param options.header The header's name, for a destination that uses
+   *   another one (PayPal: `PayPal-Request-Id`). Defaults to `Idempotency-Key`.
+   */
+  withIdempotencyKey<T extends RequestInit = RequestInit>(
+    init?: T,
+    options: { part?: string; raw?: boolean; header?: string } = {},
+  ): Omit<T, "headers" | "signal"> & { headers: Headers; signal: AbortSignal } {
+    if (isRequestLike(init)) {
+      // Its fields are getters, which spreading does not copy: the request
+      // would go out as a bare GET.
+      throw new TypeError(
+        "withIdempotencyKey takes a plain init object, not a Request. Pass " +
+          "fetch(request, lease.withIdempotencyKey({ headers: request.headers })): " +
+          "init's headers replace the request's, so they are passed on, and " +
+          "the lease's signal replaces the request's own.",
+      );
+    }
+    // `part: undefined` given explicitly is refused below, not taken for the
+    // call's own key: requests without a part would all share it.
+    const hasPart = "part" in options;
+    if (options.raw && hasPart) {
+      throw new TypeError("withIdempotencyKey: part sends a digest, so it cannot be combined with raw.");
+    }
+    const value = hasPart
+      ? this.keyDigestFor(options.part as string)
+      : options.raw
+        ? this.rawHeaderValue()
+        : this.keyDigest;
+    const headers = new Headers(init?.headers ?? undefined);
+    headers.set(options.header ?? "Idempotency-Key", value);
+    // A signal of the caller's own is kept as it is: combining two signals
+    // here would have to hold a listener on a signal that may live for the
+    // whole process. Pass AbortSignal.any([yours, lease.signal]) to have both.
+    const signal = init?.signal ?? this.signal;
+    return { ...(init ?? ({} as T)), headers, signal };
+  }
+
+  /** The key as a header value, refusing one a header cannot carry as it is. */
+  private rawHeaderValue(): string {
+    const key = this.requireKey();
+    if (!HEADER_VALUE.test(key)) {
+      throw new Error(
+        "This lease's key contains characters a header cannot carry as they " +
+          "are. Send its digest instead (the default).",
+      );
+    }
+    return key;
+  }
+
+  private requireKey(): string {
+    if (!this.key) {
+      throw new Error(
+        "This lease has no idempotency key to send: a handle made without one " +
+          "would make unrelated operations look like repeats.",
+      );
+    }
+    return this.key;
   }
 
   /**
@@ -123,7 +263,23 @@ export class LeaseHandle {
   }
 }
 
-const currentLeaseStore = new AsyncLocalStorage<LeaseHandle>();
+/**
+ * Whether `init` is a Request rather than a plain init object, including one
+ * from another realm or from the `undici` package, which `instanceof` misses.
+ */
+function isRequestLike(init: unknown): boolean {
+  if (typeof Request !== "undefined" && init instanceof Request) return true;
+  const candidate = init as { url?: unknown; clone?: unknown } | undefined;
+  return typeof candidate?.url === "string" && typeof candidate?.clone === "function";
+}
+
+/** An unpaired surrogate, which UTF-8 cannot encode as it is. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+/** A header value sent as it is: printable ASCII, with no space at either end. */
+const HEADER_VALUE = /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/;
+
+const currentLeaseStore = new AsyncLocalStorage<LeaseHandle | undefined>();
 
 /**
  * Returns the lease held by the enclosing block.
@@ -148,6 +304,14 @@ export function currentLease(): LeaseHandle {
 /** @internal Runs `fn` with `handle` as the lease `currentLease()` returns. */
 export function runUnderLease<T>(handle: LeaseHandle, fn: () => T): T {
   return currentLeaseStore.run(handle, fn);
+}
+
+/**
+ * @internal Runs `fn` with no lease for `currentLease()` to return, not even an
+ * enclosing one: for a tool body that runs without a lease of its own.
+ */
+export function runWithoutLease<T>(fn: () => T): T {
+  return currentLeaseStore.run(undefined, fn);
 }
 
 export interface ExecutionLeaseOptions {
@@ -252,9 +416,13 @@ export async function executionLease<T>(
     }
 
     fencingToken = Number(resp.fencingToken ?? 0n);
-    handle = new LeaseHandle(fencingToken, () => {
-      hb?.pastDeadline();
-    });
+    handle = new LeaseHandle(
+      fencingToken,
+      () => {
+        hb?.pastDeadline();
+      },
+      key,
+    );
     const leaseHandle = handle;
     emit({
       type: "acquired",
