@@ -16,6 +16,28 @@ export function isFailedPrecondition(err: unknown): boolean {
 }
 
 /**
+ * Whether a commit was refused because its fencing token is stale: the lease it
+ * was made under has been taken over. The engine reports it as
+ * FAILED_PRECONDITION "Fenced out: stale lease", which shares its code with a
+ * position already taken, so the message tells them apart.
+ */
+export function isStaleLease(err: unknown): boolean {
+  if (!isFailedPrecondition(err)) return false;
+  const message = (err as { message?: unknown } | undefined)?.message;
+  return typeof message === "string" && /stale lease/i.test(message);
+}
+
+/**
+ * Whether a commit was refused because its idempotency key is already committed
+ * at a different position: the key's work was recorded by another worker.
+ */
+export function isCommittedElsewhere(err: unknown): boolean {
+  if (!isFailedPrecondition(err)) return false;
+  const message = (err as { message?: unknown } | undefined)?.message;
+  return typeof message === "string" && /already committed at sequence/i.test(message);
+}
+
+/**
  * Status codes for a failure that may pass if the call is sent again. INTERNAL is
  * how the engine reports a failed storage write, which it does not retry itself,
  * and CANCELLED is the call being abandoned rather than refused.

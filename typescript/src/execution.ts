@@ -18,9 +18,28 @@ export class LeaseNotAcquired extends Error {
 
 /** Raised by `LeaseHandle.check()` once the lease has been lost. */
 export class LeaseLostError extends Error {
-  constructor(message: string) {
+  /**
+   * What a `tool()` body returned before the engine refused to record it,
+   * because another worker had taken the call over. Kept for logging, and not
+   * enumerable, so a logger that serialises the error does not print it.
+   * Undefined for a loss found any other way.
+   */
+  declare readonly result?: unknown;
+
+  constructor(message: string, options?: { result?: unknown; cause?: unknown }) {
     super(message);
     this.name = "LeaseLostError";
+    if (options && "result" in options) {
+      Object.defineProperty(this, "result", { value: options.result, enumerable: false });
+    }
+    if (options && "cause" in options) {
+      Object.defineProperty(this, "cause", {
+        value: options.cause,
+        enumerable: false,
+        writable: true,
+        configurable: true,
+      });
+    }
   }
 }
 
@@ -109,19 +128,26 @@ const currentLeaseStore = new AsyncLocalStorage<LeaseHandle>();
 /**
  * Returns the lease held by the enclosing block.
  *
- * Lets code inside an {@link executionLease} block, or inside a
- * {@link taskLease} function which has no handle to receive, reach the fencing
- * token to pass downstream.
+ * Lets code inside an {@link executionLease} block, a {@link taskLease}
+ * function, or the body of a `tool()` that holds its call's lease, reach the
+ * lease to check it, abort with its `signal`, or pass its fencing token
+ * downstream.
  */
 export function currentLease(): LeaseHandle {
   const handle = currentLeaseStore.getStore();
   if (!handle) {
     throw new Error(
       "No execution lease is active. currentLease() is only valid inside an " +
-        "executionLease(...) block or a taskLease(...) function.",
+        "executionLease(...) block, a taskLease(...) function, or the body of a " +
+        "tool() call that holds its lease.",
     );
   }
   return handle;
+}
+
+/** @internal Runs `fn` with `handle` as the lease `currentLease()` returns. */
+export function runUnderLease<T>(handle: LeaseHandle, fn: () => T): T {
+  return currentLeaseStore.run(handle, fn);
 }
 
 export interface ExecutionLeaseOptions {
@@ -251,6 +277,10 @@ export async function executionLease<T>(
       leaseTtlMs: ttlMs,
       acquiredSentAt,
       acquiredSentWallAt,
+      // Only when the engine answered at once: after a wait the grant can be
+      // much younger than the request it is counted against.
+      acquiredExpiresAtMs:
+        waitMs === 0 && resp.leaseExpiresAtMs !== undefined ? Number(resp.leaseExpiresAtMs) : undefined,
       onEvent,
       onLeaseLost: (detail) => {
         leaseHandle.markLost(detail);

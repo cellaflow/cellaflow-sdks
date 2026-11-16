@@ -1,10 +1,11 @@
-import { isFailedPrecondition } from "./errors.js";
+import { hasStatusCode, isCommittedElsewhere, isFailedPrecondition, isRetryable, isStaleLease } from "./errors.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { getContext, type UnreleasedLease, type WorkflowContext } from "./context.js";
 import { IdempotencyScope, deriveIdempotencyKey, normalizeCoordinationId } from "./idempotency.js";
+import { LeaseHandle, LeaseLostError, runUnderLease } from "./execution.js";
 import { LeaseHeartbeat, checkLeaseTtlMs } from "./lease.js";
-import { deserialize } from "./serialization.js";
+import { deserialize, serialize } from "./serialization.js";
 
 /**
  * Raised when the engine refuses a lease because another agent already owns the
@@ -169,10 +170,17 @@ export function tool<A extends unknown[], R>(
       await ctx.settleRecording();
     }
     const seq = ctx.claimPosition();
-    const known: { key?: string; unreleased?: UnreleasedLease } = {};
+    const known: Known = {};
     try {
       return await runAt(ctx, seq, args, callCoordination, coordinationId, leaseTtlMs, known);
     } catch (err) {
+      if (known.lost) {
+        // The call's outcome belongs to the lease's new holder, so nothing is
+        // recorded here in its name. The position goes back, so calling the
+        // tool again claims it and finds that holder's result.
+        ctx.giveBackPosition(seq);
+        throw err;
+      }
       // A failed call leaves its position empty; record the failure there so the
       // next call does not land past the gap. Not for a refused lease: another
       // writer owns that position and fills it.
@@ -202,7 +210,7 @@ export function tool<A extends unknown[], R>(
     callCoordination: string | undefined,
     coordinationId: string | undefined,
     leaseTtlMs: number | undefined,
-    known: { key?: string; unreleased?: UnreleasedLease },
+    known: Known,
   ): Promise<R> {
 
     let ikey = idempotencyKey;
@@ -236,6 +244,20 @@ export function tool<A extends unknown[], R>(
     let fencingToken = 0;
     let intervalMs = 5000;
     let hb: LeaseHeartbeat | undefined;
+    // The lease as the body sees it, through currentLease(). Only when the call
+    // holds one: a hit never runs the body.
+    let handle: LeaseHandle | undefined;
+    // While the commit is on its way, a renewal can come back refused because
+    // that very commit completed the key. That is not a loss: it is held back,
+    // and applied only if the commit fails.
+    let committing = false;
+    let lossDuringCommit: string | undefined;
+    // Once the release is on its way, a renewal refused because of it is not a
+    // loss either, and is dropped.
+    let releasing = false;
+    // Set once the body has returned, so a takeover found afterwards can carry
+    // its result.
+    let returned: { result: R } | undefined;
 
     // Arbitrate. Loop because IN_PROGRESS means another worker holds it and the
     // right move is to wait for their result rather than to act.
@@ -306,6 +328,12 @@ export function tool<A extends unknown[], R>(
           leaseTtlMs !== undefined
             ? Math.min(suggested, Math.max(1, Math.floor(leaseTtlMs / 4)))
             : suggested;
+        // Judged on the clock whenever the body asks, so a holder resumed past its
+        // deadline finds the lease gone before any renewal has to answer.
+        const leaseHandle = new LeaseHandle(fencingToken, () => {
+          hb?.pastDeadline();
+        });
+        handle = leaseHandle;
         hb = new LeaseHeartbeat({
           client: ctx.client,
           agentId,
@@ -318,15 +346,23 @@ export function tool<A extends unknown[], R>(
           leaseTtlMs,
           acquiredSentAt,
           acquiredSentWallAt,
+          acquiredExpiresAtMs: resp.leaseExpiresAtMs !== undefined ? Number(resp.leaseExpiresAtMs) : undefined,
+          onLeaseLost: (detail) => {
+            if (releasing) return;
+            if (committing) lossDuringCommit = detail;
+            else leaseHandle.markLost(detail);
+          },
         });
         hb.start();
       }
       break;
     }
 
-    try {
-      const result = await fn(...args);
-      await ctx.client.commitStep(
+    // What is committed, taken once: every attempt sends the same step, even if
+    // work the body left running changes the object it returned.
+    let committed: { result: unknown } | undefined;
+    const commitOnce = (result: R) =>
+      ctx.client.commitStep(
         ctx.sessionId,
         seq,
         toolName,
@@ -334,18 +370,96 @@ export function tool<A extends unknown[], R>(
         // The envelope is part of the cross-language contract: the Python SDK
         // commits {result} and reads .result back. A bare value here would not
         // interoperate on a shared key.
-        { result },
+        (committed ??= deserialize(serialize({ result })) as { result: unknown }),
         ikey,
         fencingToken,
         // Only the override is sent. Without one the engine records the step
         // under the session's default, which it already holds.
         callCoordination,
       );
+    /**
+     * Sends the same commit again. Done: the engine holds it, either from the
+     * first attempt or this one. Taken over: the refusal is about the key (a
+     * stale token, or the key recorded at another position), so another worker
+     * holds the call. Neither: no answer, or the position already filled,
+     * which can also mean the commit landed, so the outcome stays unknown.
+     */
+    const resend = async (
+      result: R,
+    ): Promise<{ done?: boolean; takenOver?: boolean; error?: unknown }> => {
+      try {
+        await commitOnce(result);
+        return { done: true };
+      } catch (again) {
+        if (isStaleLease(again) || isCommittedElsewhere(again)) return { takenOver: true, error: again };
+        return { error: again };
+      }
+    };
+    /** Concludes a takeover: the body's signal aborts, and the caller hears it. */
+    const takenOver = (result: R, cause: unknown) => {
+      known.lost = true;
+      handle?.markLost("another worker holds the call");
+      return new LeaseLostError(
+        `Tool '${toolName}' lost its lease to another worker before its result ` +
+          "was recorded, so the result was not recorded. Calling the tool again " +
+          "finds that worker's result or waits for it, unless its key includes the " +
+          "position (STEP_LOCAL).",
+        { result, cause },
+      );
+    };
+
+    try {
+      const body = () => fn(...args);
+      const result = handle ? await runUnderLease(handle, body) : await body();
+      // The body is over: work it started and did not await finds the lease
+      // over from here on, through the commit's round trip too.
+      handle?.markReleased();
+      returned = { result };
+      // Committed whatever this side's clock says about the lease. The engine
+      // decides: it accepts the commit while the lease is still this call's,
+      // which it is unless another worker took it over, and refuses a stale
+      // token. Not committing on a local judgement alone would throw away the
+      // record of a side effect that ran, and calling again would run it twice.
+      committing = true;
+      try {
+        await commitOnce(result);
+      } catch (err) {
+        // No answer: the commit may have landed. While the lease is still this
+        // call's, the same commit sent again is certain to be recorded, and an
+        // engine that already holds it answers it as done. Still committing
+        // meanwhile: a renewal refused then may be this commit landing.
+        const outcome =
+          !isStaleLease(err) && !isCommittedElsewhere(err) && isUnanswered(err)
+            ? await resend(result)
+            : undefined;
+        if (outcome?.done) return result;
+        // The call fails from here on; losses held back count from now.
+        committing = false;
+        if (isStaleLease(err) || isCommittedElsewhere(err)) throw takenOver(result, err);
+        if (outcome?.takenOver) throw takenOver(result, outcome.error);
+        throw err;
+      }
       return result;
     } catch (err) {
-      if (fencingToken > 0) {
+      handle?.markReleased();
+      // A loss held back during a commit that failed counts once the call
+      // fails. Not before: a resend below can still show the commit landed,
+      // which is what refused the renewal.
+      const applyHeldLoss = () => {
+        if (lossDuringCommit !== undefined) handle?.markLost(lossDuringCommit);
+      };
+      // Released whatever the body threw and whatever this side's clock says:
+      // the engine releases only a lease that is still this call's, so its
+      // answer says whether the lease is still this call's (it may have been
+      // taken over, or, on some engines, simply lapsed).
+      if (fencingToken > 0 && !known.lost) {
+        releasing = true;
         await ctx.client
           .releaseLease(agentId, ikey, fencingToken, "TOOL_ERROR")
+          .then((released) => {
+            // Not released: the lease was no longer this call's to release.
+            if (!released.released) known.lost = true;
+          })
           .catch(() => {
             // The lease expires on its own. Losing the release is not worth
             // masking the error that caused it. Until it does, it still claims
@@ -361,8 +475,27 @@ export function tool<A extends unknown[], R>(
             };
           });
       }
+      if (known.lost && returned && !(err instanceof LeaseLostError)) {
+        // The commit failed and the lease would not be released. Either the
+        // commit landed and only its answer was lost, which completed the key
+        // under this call's own token, or another worker holds the call. The
+        // same commit sent again tells them apart.
+        const outcome = await resend(returned.result);
+        if (outcome.done) {
+          known.lost = false;
+          return returned.result;
+        }
+        if (outcome.takenOver) throw takenOver(returned.result, outcome.error);
+        // Unknown: the call is not treated as taken over, and fails as it
+        // would have.
+        known.lost = false;
+      }
+      if (known.lost) handle?.markLost("the engine would not release the lease: it is no longer this call's");
+      applyHeldLoss();
       throw err;
     } finally {
+      // Already marked on every path that ran the body; this covers the rest.
+      handle?.markReleased();
       await hb?.stop();
     }
   }
@@ -375,8 +508,23 @@ export function tool<A extends unknown[], R>(
   return leased;
 }
 
+/** What one call learned that its caller needs after it fails. */
+interface Known {
+  /** The idempotency key, once derived. */
+  key?: string;
+  /** Its own lease, if it failed and could not release it. */
+  unreleased?: UnreleasedLease;
+  /** Set when the call's lease was lost while its body ran. */
+  lost?: boolean;
+}
+
 /** `step` and `tool` are the same mechanism, kept distinct for readability. */
 export const step = tool;
+
+/** Whether an engine call got no answer either way, rather than a refusal. */
+function isUnanswered(err: unknown): boolean {
+  return isRetryable(err) || !hasStatusCode(err);
+}
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);

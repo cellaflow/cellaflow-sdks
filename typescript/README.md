@@ -112,6 +112,36 @@ await durableTools("ticket-4417", { ttlMs: 10_000 }, async () => {
 
 A shorter TTL means a faster takeover, and more renewals while a call runs. A holder that stops renewing for one TTL while its body still runs (a blocked event loop, a long garbage-collection pause, a lost connection to the engine) is taken over too, so set the TTL well above the longest pause a call can see. The lease that records a call's shared result or failure in the session is not renewed, so the TTL also bounds how long that one write may take. The TTL that decides a takeover is the holder's: a waiting caller's own `ttlMs` does not shorten it. A waiting caller asks again about once a second, so it takes over up to a second after the lease lapses. `ttlMs` must be a whole number of milliseconds, at least 1000 (`MIN_LEASE_TTL_MS`); anything else makes `tool` throw a `RangeError` when the tool is created, and makes `durableTools` reject with one before it connects. The engine's maximum lease lifetime (`CELLAFLOW_MAX_LEASE_LIFETIME_MS`, an hour by default) caps every lease, whatever is asked for.
 
+## Checking the lease inside a tool
+
+A tool's body can reach its call's lease through `currentLease()`, the same handle `executionLease` and `taskLease` give. Check it right before anything irreversible, and hand its `signal` to the request:
+
+```typescript
+import { IdempotencyScope, currentLease, tool } from "@cellaflow/sdk";
+
+const refund = tool(
+  async ({ order, amount }: { order: string; amount: number }) => {
+    const lease = currentLease();
+    lease.check(); // throws LeaseLostError if the lease is gone
+    return await payments.refund(order, amount, { signal: lease.signal });
+  },
+  { toolName: "refund", scope: IdempotencyScope.SHARED, sharedOn: ["order"] },
+);
+```
+
+This is what stops a holder that froze (a long garbage-collection pause, a stopped process, a suspended laptop or VM) and woke up after another caller took the call over. The lease is judged on the clock, so `check()` throws as soon as the holder resumes past its lease's deadline, before any renewal has to answer, and the request never leaves. `signal` aborts once the lease is judged lost: when it is read, or when the deadline timer fires, so a request given it is cancelled on this side.
+
+The clock only tells the body to stop. What happens to the call is up to the engine, which accepts a commit only while the lease is still this call's, that is, unless another worker has taken it over:
+
+- **The body returns:** its result is committed. If another worker holds the call now (in another session, or before it has committed), the engine refuses it, and the caller gets `LeaseLostError` with the body's return value on its `result`, for logging. If nobody took over, the commit stands, so a body that finished just as its deadline passed is recorded, not run again. A commit that gets no answer is sent once more before the lease is released, and again if the engine then refuses the release; only a refusal about the call's key counts as a takeover.
+- **The body throws** (including `LeaseLostError` from `check()`): the lease is released. If the engine releases it, the lease was still this call's, and the failure is recorded as for any failing tool. If it refuses, the lease is no longer this call's (another worker took it over, or it lapsed): nothing is recorded at the call's position in its name, and the position is handed back, so calling the same tool again finds the other worker's result, waits for it, or, if the lease only lapsed, runs the body again. (When a later position was claimed meanwhile, the position stays empty instead, and the run stops recording, as it does for any call that overlaps.)
+
+The check covers a request that has not left. A request already on its way when the holder froze can still arrive, and so can one whose effect landed just before a crash, ahead of the commit. For those, give the destination a way to recognise a repeat, such as an idempotency key it deduplicates on.
+
+The clock can only judge what it can see: keep `ttlMs` below the engine's maximum lease lifetime (`CELLAFLOW_MAX_LEASE_LIFETIME_MS`), or a holder frozen past that limit can still pass `check()` when it wakes.
+
+Inside a tool body, `currentLease()` is the tool call's lease, even when the tool is called from inside an `executionLease` block or a `taskLease` function. To pass the enclosing lease's fencing token downstream from a tool, read it before calling the tool. A cache hit never runs the body, so it never sees a lease; outside any lease, `currentLease()` throws, as before.
+
 ## Execution leases
 
 `executionLease` runs a block while holding a lock on a key, renewed by a heartbeat. One worker holds it at a time; if that worker dies, the lease stops being renewed and the next worker gets it once the TTL runs out, with a higher fencing token.

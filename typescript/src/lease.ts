@@ -89,6 +89,14 @@ export interface LeaseHeartbeatOptions {
   /** The same moment on the wall clock (`Date.now()`). */
   acquiredSentWallAt?: number;
   /**
+   * The engine's expiry for the grant (`leaseExpiresAtMs` on the acquisition's
+   * answer). It is the first reference for spotting a renewal the engine
+   * shortens near its maximum lease lifetime, so even the first renewal is
+   * judged by what the engine granted. Only for a grant answered without
+   * waiting, since it is read against `acquiredSentWallAt`.
+   */
+  acquiredExpiresAtMs?: number;
+  /**
    * How long before the computed expiry the lease stops being treated as held.
    * Defaults to half a heartbeat interval, capped at half of `extendMs`.
    */
@@ -127,9 +135,10 @@ export interface LeaseEvent {
  * renewal has had a chance to answer.
  *
  * Passing the deadline is reported, but renewing carries on: the engine may
- * still hold the lease, and a caller that cannot act on the report (`tool()`
- * does not) keeps it for as long as the engine agrees. Renewing stops only when
- * the engine refuses a renewal, or on `stop()`.
+ * still hold the lease, and work that went ahead anyway (a `tool()` body that
+ * did not check) keeps it for as long as the engine agrees, so its result can
+ * still be recorded. Renewing stops only when the engine refuses a renewal, or
+ * on `stop()`.
  *
  * Near the engine's maximum lease lifetime a renewal is granted less than it
  * asked for. The engine's expiry on each renewal is mapped onto the local
@@ -149,7 +158,7 @@ export interface LeaseEvent {
  */
 export class LeaseHeartbeat {
   private readonly opts: Required<
-    Omit<LeaseHeartbeatOptions, "onLeaseLost" | "onEvent" | "acquiredSentAt" | "acquiredSentWallAt" | "marginMs">
+    Omit<LeaseHeartbeatOptions, "onLeaseLost" | "onEvent" | "acquiredSentAt" | "acquiredSentWallAt" | "acquiredExpiresAtMs" | "marginMs">
   > &
     Pick<LeaseHeartbeatOptions, "onLeaseLost" | "onEvent">;
   /** How long before the computed expiry the lease stops being treated as held. */
@@ -210,6 +219,12 @@ export class LeaseHeartbeat {
     this.deadline = 0;
     this.wallDeadline = 0;
     this.setDeadline({ mono: sentAt, wall: sentWallAt }, this.opts.leaseTtlMs - this.marginMs);
+    if (options.acquiredExpiresAtMs) {
+      this.pending = {
+        offset: sentWallAt + this.opts.leaseTtlMs - options.acquiredExpiresAtMs,
+        expiresAtMs: options.acquiredExpiresAtMs,
+      };
+    }
   }
 
   /**

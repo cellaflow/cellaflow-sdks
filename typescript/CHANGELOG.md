@@ -19,6 +19,30 @@ All notable changes to the Cellaflow TypeScript SDK.
   (`MIN_LEASE_TTL_MS`, exported): otherwise `tool` throws a `RangeError` when the tool is created,
   and `durableTools` rejects with one before it connects. The engine's maximum lease lifetime still
   caps every lease.
+- **A tool's body can check its lease.** `currentLease()` inside a `tool()` (or `step`) body returns
+  the call's lease, with `check()`, `isLost`, `signal` and `fencingToken`, as it does inside
+  `executionLease` and `taskLease`. A holder that froze and woke up after another caller took the
+  call over fails `check()` as soon as it resumes, so it does not send. See "Checking the lease
+  inside a tool" in the README. The clock only tells the body to stop; whether the call's result is
+  recorded is still the engine's decision.
+
+### Changed
+
+- **A tool body nested in `executionLease` or `taskLease` now gets the tool call's lease from
+  `currentLease()`**, not the enclosing one. Code that passes `currentLease().fencingToken` to a
+  downstream fence from inside a tool should read the enclosing lease before calling the tool.
+- **A tool call another worker took over is no longer recorded in its name.** A commit the engine
+  refuses because another worker holds the call now ends with `LeaseLostError` (the body's return
+  value on its `result`) instead of the engine's FAILED_PRECONDITION. A body that throws and whose
+  lease the engine will no longer release (another worker took it over, or it lapsed) leaves no
+  failure record: its position is handed back, so calling the same tool again finds the other
+  worker's result, waits for it, or runs the body again if the lease only lapsed. While the lease is
+  still the call's, the result is committed, or the failure recorded, as before.
+- **A tool commit that gets no answer is sent again** before the call's lease is released, and once
+  more if the engine then refuses the release. An engine that already holds the commit answers it as
+  done, and while the lease is still the call's a resend is recorded, so a call whose commit answer
+  was dropped once returns its result, where before it failed with the transport error and a retry
+  ran the body again. An engine that stays unreachable still fails the call, as before.
 
 ### Fixed
 
@@ -27,8 +51,7 @@ All notable changes to the Cellaflow TypeScript SDK.
   over 2^31 - 1 ms. The heartbeat now caps the interval, so a tool's `ttlMs` gets the same cap.
 - **A renewal that hung could hold up the return of a tool or an `executionLease` block for half a
   renewal interval** (7.5 minutes for an hour-long TTL), because stopping the heartbeat waits for
-  the renewal in flight. A renewal
-  is now abandoned after at most 10 s, as in the Python SDK.
+  the renewal in flight. A renewal is now abandoned after at most 10 s, as in the Python SDK.
 
 ## 0.10.0
 
