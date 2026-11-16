@@ -143,12 +143,7 @@ class WaitClient(CellaflowClient):
         record_answers: Optional[List[Answer]] = None,
         renew_blocks_s: float = 0.0,
         refuse_renewals: Callable[[int], bool] = lambda token: False,
-        cancellable: bool = True,
     ) -> None:
-        # Whether a request can still be cancelled once sent. A real one can,
-        # until the engine has answered; False models a grant that answered as
-        # the call was cancelled.
-        self.cancellable = cancellable
         self.requests: List[Any] = []
         self.record_answers = list(record_answers or [])
         self.renew_blocks_s = renew_blocks_s
@@ -200,8 +195,6 @@ class WaitClient(CellaflowClient):
     ) -> Any:
         future: "concurrent.futures.Future[Any]" = concurrent.futures.Future()
         self.requests.append(future)
-        if not self.cancellable:
-            future.set_running_or_notify_cancel()
 
         def answer() -> None:
             try:
@@ -475,7 +468,7 @@ async def test_a_call_cancelled_while_waiting_lets_its_request_finish() -> None:
     # Cancelling the request could throw away a grant the engine made just
     # before the cancellation reached it, leaving the key held for a TTL. The
     # request finishes instead, and its grant is handed back.
-    client = WaitClient([Answer(acquired(9), blocks_s=0.3)])
+    client = WaitClient([Answer(acquired(9), blocks_s=1.0)])
 
     async def charge_card() -> str:
         client.note("body")
@@ -748,7 +741,7 @@ def test_only_failures_since_the_last_answer_count_towards_giving_up() -> None:
 async def test_a_grant_reaching_the_loop_just_before_a_cancel_is_handed_back() -> None:
     # The answer is handed to the loop, and the cancellation lands before the
     # call resumes to take it: the request can no longer be cancelled.
-    client = WaitClient([Answer(acquired(9), blocks_s=0.2)])
+    client = WaitClient([Answer(acquired(9), blocks_s=1.0)])
     loop = asyncio.get_running_loop()
 
     async def charge_card() -> str:
@@ -860,3 +853,26 @@ def test_a_record_refused_at_a_committed_position_skips_the_lease_wait() -> (
         step(next_step)()
         assert time.monotonic() - started < 1.0
     assert len(client.record_acquires) == 1
+
+
+class BlockingOnly(WaitClient):
+    """A client that overrides only the blocking request, as instrumentation or
+    a fake built on `CellaflowClient` does."""
+
+    check_idempotency_cache_future = (
+        CellaflowClient.check_idempotency_cache_future  # type: ignore[assignment]
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_async_step_uses_a_clients_own_blocking_request() -> None:
+    # The inherited future would go straight to the stub, bypassing the
+    # override (and, here, failing: the stub was never set up).
+    client = BlockingOnly([Answer(acquired(7))])
+
+    async def charge_card() -> str:
+        return "charged"
+
+    with session(client).bind():
+        assert await step(charge_card)() == "charged"
+    assert len(client.acquires) == 1

@@ -625,17 +625,25 @@ _MAX_UNANSWERED = 2
 _ENGINE_DEFAULT_TTL_MS = 20_000
 
 
-def _lost_answer(agent_id: str, ikey: str, ttl_ms: Optional[int]) -> Dict[str, Any]:
+def _lost_answer(
+    agent_id: str,
+    ikey: str,
+    ttl_ms: Optional[int],
+    previous: Optional[Dict[str, Any]] = None,
+    granted_within_s: float = 0.0,
+) -> Dict[str, Any]:
     """The unreleased lease of a request whose answer never came: the engine
     may have granted it, a lease nobody here knows the token of, which claims
     the call's position until it lapses. Kept for the failure record there to
-    wait out; without its token it cannot be released."""
-    return {
-        "agent_id": agent_id,
-        "key": ikey,
-        "token": 0,
-        "lapses_in_s": (ttl_ms or _ENGINE_DEFAULT_TTL_MS) / 1000.0 + 1.0,
-    }
+    wait out; without its token it cannot be released.
+
+    `granted_within_s` is how long the request may still be granted: a
+    cancelled call's request runs on to its deadline. A lease already kept
+    (`previous`) is waited out too: the later of the two lapses counts."""
+    lapses_in_s = (ttl_ms or _ENGINE_DEFAULT_TTL_MS) / 1000.0 + 1.0 + granted_within_s
+    if previous is not None:
+        lapses_in_s = max(lapses_in_s, previous["lapses_in_s"])
+    return {"agent_id": agent_id, "key": ikey, "token": 0, "lapses_in_s": lapses_in_s}
 
 
 def _hand_back(
@@ -730,8 +738,9 @@ async def _arbitrate_async(
     TTL. Whatever it is granted is handed back, since nothing will run the body
     under it.
 
-    A client that does not return a `grpc.Future` (a test double) is asked from
-    a worker thread instead."""
+    A client that does not return a `grpc.Future` (a test double), or that
+    overrides `check_idempotency_cache` but not `check_idempotency_cache_future`,
+    is asked from a worker thread instead."""
     kwargs: Dict[str, Any] = dict(
         agent_id=agent_id,
         idempotency_key=ikey,
@@ -745,6 +754,16 @@ async def _arbitrate_async(
         timeout=_ENGINE_WAIT_DEADLINE_S,
     )
     send = getattr(ctx.client, "check_idempotency_cache_future", None)
+    cls = type(ctx.client)
+    if (
+        getattr(cls, "check_idempotency_cache", None)
+        is not CellaflowClient.check_idempotency_cache
+        and getattr(cls, "check_idempotency_cache_future", None)
+        is CellaflowClient.check_idempotency_cache_future
+    ):
+        # A client that overrides the blocking request but not this one (to
+        # instrument it, or to fake it) would be bypassed by the future.
+        send = None
     request = send(**kwargs) if send is not None else None
     if not isinstance(request, grpc.Future):
         return await asyncio.to_thread(ctx.client.check_idempotency_cache, **kwargs)
@@ -770,9 +789,11 @@ async def _arbitrate_async(
             # The call was cancelled while it waited.
             hand_back_if_granted(done)
         elif done.cancelled():
-            # Only the channel cancels it: the client was closed under the call.
+            # Defensive: nothing here cancels the request, and a channel closed
+            # under it fails it with CANCELLED instead. Fail the call rather
+            # than cancel its task, which would record a cancellation.
             answer.set_exception(
-                RuntimeError("the request to the engine was cancelled: client closed")
+                RuntimeError("the request to the engine was cancelled")
             )
         elif done.exception() is not None:
             answer.set_exception(done.exception())
@@ -781,6 +802,8 @@ async def _arbitrate_async(
 
     def on_done(done: Any) -> None:
         # On a gRPC thread, or on the loop if the call had already finished.
+        # A loop stopped for good after this is queued, and never run or closed,
+        # drops it: the grant then lapses after its TTL.
         try:
             loop.call_soon_threadsafe(deliver, done)
         except RuntimeError:
@@ -1210,7 +1233,9 @@ def step(
                     # The engine may have granted the request before its
                     # cancellation took effect, and the grant may not have come
                     # back to be handed back.
-                    unreleased = _lost_answer(agent_id, ikey, ttl_ms)
+                    unreleased = _lost_answer(
+                        agent_id, ikey, ttl_ms, unreleased, _ENGINE_WAIT_DEADLINE_S
+                    )
                     raise
                 except grpc.RpcError as exc:
                     if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
@@ -1221,7 +1246,7 @@ def step(
                     if exc.code() in _RETRYABLE_CODES:
                         # Kept until an answer, so a failure or cancellation
                         # before one leaves the record waiting it out.
-                        unreleased = _lost_answer(agent_id, ikey, ttl_ms)
+                        unreleased = _lost_answer(agent_id, ikey, ttl_ms, unreleased)
                         if unanswered < _MAX_UNANSWERED:
                             unanswered += 1
                             await asyncio.sleep(0.2 * unanswered)
@@ -1526,7 +1551,7 @@ def step(
                     if exc.code() in _RETRYABLE_CODES:
                         # Kept until an answer, so a failure before one leaves
                         # the record waiting it out.
-                        unreleased = _lost_answer(agent_id, ikey, ttl_ms)
+                        unreleased = _lost_answer(agent_id, ikey, ttl_ms, unreleased)
                         if unanswered < _MAX_UNANSWERED:
                             unanswered += 1
                             time.sleep(0.2 * unanswered)

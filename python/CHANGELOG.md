@@ -10,14 +10,18 @@ All notable changes to the Cellaflow Python SDK.
   call that finds the key held asks the engine to wait (up to 10 s per request, asking again until
   it has an answer). It gets the holder's result the moment the holder commits, or the lease the
   moment it is released or lapses, instead of up to a second later. The engine checks the holder
-  every 100 ms for all the callers waiting on one key, and each asks again at most every 10 s,
-  instead of once a second. An `async` step waits on the gRPC call itself, holding neither the event
-  loop nor a thread, so any number of waiters cannot delay the renewals of a call that holds a lease.
-  A call cancelled during the wait cancels the request, and releases a lease granted to it anyway.
-  A waiting request that gets no answer within 15 s is asked again, and after three in a row the
-  call fails, so a lost connection to the engine is noticed. An engine that answers at once
-  without waiting is asked again after its `retry_after_ms`, as before. The lease that records a shared result or failure in the session
-  still asks without waiting: it is requested under the session's lock, and a held record is rare.
+  every 100 ms for all the callers waiting on one key, and each sends a new request about once
+  every 10 s, instead of once a second. An `async` step waits on the gRPC call itself
+  (`CellaflowClient.check_idempotency_cache_future`), holding neither the event loop nor a thread,
+  so any number of waiters cannot delay the renewals of a call that holds a lease. A call
+  cancelled during the wait lets its request finish (within its 15 s deadline) and releases any
+  lease it is granted. A request that fails without an answer (no answer within 15 s, the engine
+  unavailable, a dropped connection) is asked again, and after three in a row the call fails, so a
+  lost connection to the engine is noticed. A proxy between the SDK and the engine must let a
+  request run for at least 15 s. An engine that answers at once without waiting is asked again
+  after its `retry_after_ms`, as before. The lease that records a shared result or failure in the
+  session still asks without waiting: it is requested under the session's lock, and a held record
+  is rare.
 - **A lease granted after a wait is counted from when it was granted.** The lease can be much younger
   than the request that won it, so the call sends a renewal before the body starts and counts the
   lease from that. A grant that comes back within half a renewal interval (an eighth of the TTL)
