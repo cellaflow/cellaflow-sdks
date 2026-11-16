@@ -35,7 +35,12 @@ from cellaflow.idempotency import (
     normalize_coordination_id,
     IdempotencyScope,
 )
-from cellaflow.execution import LeaseHandle, LeaseLostError, _current_lease
+from cellaflow.execution import (
+    LeaseHandle,
+    LeaseLostError,
+    LeaseNotAcquired,
+    _current_lease,
+)
 from cellaflow.lease import LeaseHeartbeat, check_lease_ttl_ms
 from cellaflow.serialization import deserialize, serialize
 from cellaflow.v1.common_pb2 import STEP_STATUS_FAILED, STEP_STATUS_SUCCESS
@@ -657,13 +662,21 @@ def _hand_back(
         logger.info("Could not hand back the lease on %s; it lapses on its own", ikey)
         if hb is None:
             return None
-        return {
-            "agent_id": agent_id,
-            "key": ikey,
-            "token": fencing_token,
-            "lapses_in_s": hb.rpc_timeout_sec + hb.lease_ttl_ms / 1000.0 + 1.0,
-        }
+        return _held(agent_id, ikey, fencing_token, hb)
     return None
+
+
+def _held(
+    agent_id: str, ikey: str, fencing_token: int, hb: LeaseHeartbeat
+) -> Dict[str, Any]:
+    """A lease of this call's that may not have been released, as the failure
+    record there needs it: to retry the release, or wait for the lapse."""
+    return {
+        "agent_id": agent_id,
+        "key": ikey,
+        "token": fencing_token,
+        "lapses_in_s": hb.rpc_timeout_sec + hb.lease_ttl_ms / 1000.0 + 1.0,
+    }
 
 
 def _hand_back_later(
@@ -680,20 +693,15 @@ def _hand_back_later(
         args=(ctx, agent_id, ikey, fencing_token, "CANCELLED", hb),
         daemon=True,
     ).start()
-    return {
-        "agent_id": agent_id,
-        "key": ikey,
-        "token": fencing_token,
-        "lapses_in_s": hb.rpc_timeout_sec + hb.lease_ttl_ms / 1000.0 + 1.0,
-    }
+    return _held(agent_id, ikey, fencing_token, hb)
 
 
-def _unconfirmed(name: str, handed_back: int, hb: LeaseHeartbeat) -> RuntimeError:
+def _unconfirmed(name: str, handed_back: int, hb: LeaseHeartbeat) -> LeaseNotAcquired:
     """The error for a call none of whose granted leases could be confirmed:
     the engine grants leases but will not renew them, and waiting longer only
     repeats that."""
     detail = hb.lost_detail or "no renewal was confirmed"
-    return RuntimeError(
+    return LeaseNotAcquired(
         f"Step '{name}' could not confirm any of {handed_back} leases the engine "
         f"granted it, so its body did not run: {detail}."
     )
@@ -774,7 +782,9 @@ async def _arbitrate_async(
     try:
         return await answer
     except asyncio.CancelledError:
-        request.cancel()
+        if not request.cancel() and answer.done() and not answer.cancelled():
+            # The answer reached the loop just before the cancellation did.
+            hand_back_if_granted(answer)
         raise
 
 
@@ -1186,6 +1196,12 @@ def step(
                 sent = (time.monotonic(), time.time())
                 try:
                     resp = await _arbitrate_async(ctx, agent_id, ikey, ttl_ms, seq)
+                except asyncio.CancelledError:
+                    # The engine may have granted the request before its
+                    # cancellation took effect, and the grant may not have come
+                    # back to be handed back.
+                    unreleased = _lost_answer(agent_id, ikey, ttl_ms)
+                    raise
                 except grpc.RpcError as exc:
                     if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
                         raise DivergentStepError(
@@ -1193,15 +1209,17 @@ def step(
                             f"{exc.details()}"
                         ) from exc
                     if exc.code() in _RETRYABLE_CODES:
+                        # Kept until an answer, so a failure or cancellation
+                        # before one leaves the record waiting it out.
+                        unreleased = _lost_answer(agent_id, ikey, ttl_ms)
                         if unanswered < _MAX_UNANSWERED:
                             unanswered += 1
                             await asyncio.sleep(0.2 * unanswered)
                             continue
-                        unreleased = _lost_answer(agent_id, ikey, ttl_ms)
                     raise
+                # An answer: only failures since the last one count.
+                unanswered = 0
                 if resp.status == CACHE_STATUS_HIT:
-                    # The key completed, so no lease of this call's is left.
-                    unreleased = None
                     return _take_hit(
                         ctx,
                         resp,
@@ -1264,8 +1282,18 @@ def step(
                         # given up. Nothing has run, so hand the lease back and
                         # ask again, which finds the call's result, waits behind
                         # its holder, or grants a lease this side can count on.
-                        unreleased = _hand_back(
-                            ctx, agent_id, ikey, fencing_token, "LEASE_UNCONFIRMED", hb
+                        # Off the loop: a release can take its whole deadline,
+                        # and other calls' renewals run on this loop. Counted
+                        # as unreleased until it says otherwise.
+                        unreleased = _held(agent_id, ikey, fencing_token, hb)
+                        unreleased = await asyncio.to_thread(
+                            _hand_back,
+                            ctx,
+                            agent_id,
+                            ikey,
+                            fencing_token,
+                            "LEASE_UNCONFIRMED",
+                            hb,
                         )
                         handed_back += 1
                         unconfirmed = _unconfirmed(actual_tool_name, handed_back, hb)
@@ -1486,15 +1514,17 @@ def step(
                             f"{exc.details()}"
                         ) from exc
                     if exc.code() in _RETRYABLE_CODES:
+                        # Kept until an answer, so a failure before one leaves
+                        # the record waiting it out.
+                        unreleased = _lost_answer(agent_id, ikey, ttl_ms)
                         if unanswered < _MAX_UNANSWERED:
                             unanswered += 1
                             time.sleep(0.2 * unanswered)
                             continue
-                        unreleased = _lost_answer(agent_id, ikey, ttl_ms)
                     raise
+                # An answer: only failures since the last one count.
+                unanswered = 0
                 if resp.status == CACHE_STATUS_HIT:
-                    # The key completed, so no lease of this call's is left.
-                    unreleased = None
                     return _take_hit(
                         ctx,
                         resp,

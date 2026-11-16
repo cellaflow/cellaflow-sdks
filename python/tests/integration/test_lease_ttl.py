@@ -22,7 +22,9 @@ RENEW_EVERY_MS = TTL_MS // 4
 #: engine's default lapses, or its maximum lease lifetime: fail rather than hang.
 GIVE_UP_S = 30.0
 #: How soon after the latest possible lapse a waiting caller must run the call.
-TAKEN_OVER_WITHIN_MS = 350
+#: Below what polling takes here (at least the 600 ms the mid-call kill leaves
+#: after a renewal), with room for a loaded CI engine.
+TAKEN_OVER_WITHIN_MS = 500
 
 
 def holder(target: str, order_id: str) -> "subprocess.Popen[str]":
@@ -42,6 +44,7 @@ def holder(target: str, order_id: str) -> "subprocess.Popen[str]":
 
         renew = CellaflowClient.renew_lease
         def renew_lease(self, *args, **kwargs):
+            print("sending", time.time(), flush=True)
             resp = renew(self, *args, **kwargs)
             if resp.renewed:
                 print("confirmed", time.time(), flush=True)
@@ -82,13 +85,16 @@ def takeover(
     order_id = f"order-{uuid.uuid4().hex[:8]}"
     child = holder(target, order_id)
     confirmed: List[float] = []
+    sent: List[float] = []
     renewed = threading.Event()
     holding = threading.Event()
 
     def read() -> None:
         assert child.stdout is not None
         for line in child.stdout:
-            if line.startswith("confirmed "):
+            if line.startswith("sending "):
+                sent.append(float(line.split()[1]))
+            elif line.startswith("confirmed "):
                 confirmed.append(float(line.split()[1]))
                 renewed.set()
             elif line.strip() == "holding":
@@ -143,6 +149,10 @@ def takeover(
     assert results == ["charged-here"]
     ran_wall = killed_wall + (ran_at - killed_at)
     last = max(at for at in confirmed if at <= killed_wall)
+    # A renewal sent but not confirmed before the kill may still have reached
+    # the engine, as late as the kill: the lease is then counted from the kill.
+    if any(last < at <= killed_wall for at in sent):
+        last = killed_wall
     after_lapse = (ran_wall - (last + TTL_MS / 1000.0)) * 1000.0
     return float((ran_at - killed_at) * 1000.0), after_lapse
 

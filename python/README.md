@@ -229,8 +229,8 @@ engine, not by polling. It gets that agent's result the moment it is recorded, o
 moment it is released or lapses. The engine checks the holder every 100 ms on behalf of every caller
 waiting on the call, and each waiting caller asks again at most every 10 s, rather than once a
 second. An `async` step waits on the gRPC call itself, holding neither the event loop nor a thread.
-A request that gets no answer within 15 s is asked again, twice, and then fails the call, so a lost
-connection to the engine is noticed.
+A request that gets no answer within 15 s is asked again, and after three in a row the call fails,
+so a lost connection to the engine is noticed.
 
 ---
 

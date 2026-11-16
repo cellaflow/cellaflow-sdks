@@ -244,6 +244,15 @@ class WaitClient(CellaflowClient):
         pass
 
 
+async def until(condition: Callable[[], bool], within_s: float = 5.0) -> None:
+    """Waits for a condition rather than a fixed time, so a slow runner does
+    not move what the test interrupts."""
+    deadline = time.monotonic() + within_s
+    while not condition():
+        assert time.monotonic() < deadline, "the condition never held"
+        await asyncio.sleep(0.005)
+
+
 def session(client: WaitClient) -> WorkflowContext:
     return WorkflowContext(
         client=client,
@@ -467,7 +476,7 @@ async def test_a_call_cancelled_while_waiting_cancels_its_request() -> None:
     charge = step(charge_card)
     with session(client).bind():
         task = asyncio.ensure_future(charge())
-        await asyncio.sleep(0.05)
+        await until(lambda: bool(client.requests))
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -487,7 +496,7 @@ async def test_a_grant_that_answers_as_the_call_is_cancelled_is_handed_back() ->
     charge = step(charge_card)
     with session(client).bind():
         task = asyncio.ensure_future(charge())
-        await asyncio.sleep(0.05)
+        await until(lambda: bool(client.requests))
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -700,7 +709,7 @@ async def test_a_call_cancelled_while_its_late_grant_is_confirmed_hands_it_back(
     charge = step(charge_card, lease_ttl_ms=3000)
     with session(client).bind():
         task = asyncio.ensure_future(charge())
-        await asyncio.sleep(0.1)
+        await until(lambda: "renew:7" in client.order)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -711,3 +720,89 @@ async def test_a_call_cancelled_while_its_late_grant_is_confirmed_hands_it_back(
         (7, "CANCELLED")
     ]
     assert "body" not in client.order
+
+
+def test_only_failures_since_the_last_answer_count_towards_giving_up() -> None:
+    # A long wait can meet the odd dropped connection; each answer in between
+    # shows the engine is there.
+    def lost() -> Answer:
+        return Answer(None, raises=Unavailable())
+
+    client = WaitClient(
+        [lost(), Answer(in_progress(1)), lost(), Answer(in_progress(1)), lost()]
+        + [Answer(acquired())]
+    )
+    with session(client).bind():
+        assert step(lambda: "charged", tool_name="charge_card")() == "charged"
+    assert len(client.acquires) == 6
+
+
+@pytest.mark.asyncio
+async def test_a_grant_reaching_the_loop_just_before_a_cancel_is_handed_back() -> None:
+    # The answer is handed to the loop, and the cancellation lands before the
+    # call resumes to take it: the request can no longer be cancelled.
+    client = WaitClient([Answer(acquired(9), blocks_s=0.2)])
+    loop = asyncio.get_running_loop()
+
+    async def charge_card() -> str:
+        client.note("body")
+        return "charged"
+
+    with session(client).bind():
+        task = asyncio.ensure_future(step(charge_card)())
+        await until(lambda: bool(client.requests))
+        client.requests[0].add_done_callback(
+            lambda _: loop.call_soon_threadsafe(task.cancel)
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    await until(lambda: bool(client.releases))
+    assert [(r["fencing_token"], r["reason"]) for r in client.releases] == [
+        (9, "CANCELLED")
+    ]
+    assert "body" not in client.order
+
+
+@pytest.mark.asyncio
+async def test_a_call_cancelled_after_a_lost_answer_leaves_its_record_waiting() -> None:
+    # The unanswered request may have been granted. The cancellation's record
+    # at the call's position is refused until that lease lapses, and waits
+    # rather than being dropped.
+    client = WaitClient(
+        [Answer(None, raises=Unavailable()), Answer(acquired(9))],
+        record_answers=[Answer(None, raises=Refused())],
+    )
+
+    async def charge_card() -> str:
+        return "charged"
+
+    async def next_step() -> str:
+        return "next"
+
+    with session(client).bind():
+        task = asyncio.ensure_future(step(charge_card, lease_ttl_ms=1000)())
+        await until(lambda: len(client.acquires) == 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await step(next_step)() == "next"
+    assert len(client.record_acquires) == 2
+    assert [e for e in client.order if e.startswith("commit")] == [
+        "commit:1:charge_card",
+        "commit:2:next_step",
+    ]
+
+
+def test_confirm_grant_does_nothing_once_told_to_stop() -> None:
+    client = WaitClient([])
+    hb = LeaseHeartbeat(
+        client=client,
+        agent_id="a",
+        idempotency_key="k",
+        fencing_token=7,
+        heartbeat_interval_ms=250,
+        lease_ttl_ms=1000,
+    )
+    hb.stop_sync()
+    hb.confirm_grant()
+    assert client.order == []
