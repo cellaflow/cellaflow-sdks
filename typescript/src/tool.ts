@@ -3,7 +3,7 @@ import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { getContext, type UnreleasedLease, type WorkflowContext } from "./context.js";
 import { IdempotencyScope, deriveIdempotencyKey, normalizeCoordinationId } from "./idempotency.js";
-import { LeaseHandle, LeaseLostError, runUnderLease, runWithoutLease } from "./execution.js";
+import { LeaseHandle, LeaseLostError, LeaseNotAcquired, runUnderLease, runWithoutLease } from "./execution.js";
 import { LeaseHeartbeat, checkLeaseTtlMs } from "./lease.js";
 import { deserialize, serialize } from "./serialization.js";
 import { ENGINE_WAIT_DEADLINE_SECS, ENGINE_WAIT_MS, afterInProgress } from "./wait.js";
@@ -14,6 +14,19 @@ import { ENGINE_WAIT_DEADLINE_SECS, ENGINE_WAIT_MS, afterInProgress } from "./wa
  * once is granted again at once, so the next grant is not late.
  */
 const MAX_HAND_BACKS = 3;
+
+/**
+ * How many times a call asks again after a request that got no answer, before
+ * it fails. The engine may have granted the lost answer's lease: asking again
+ * with the same key and position waits that lease out and is granted the next,
+ * so the body still runs only under a lease this side was told about.
+ */
+const MAX_UNANSWERED = 2;
+
+/** The engine's default lease TTL, for a call that asked for none. */
+const ENGINE_DEFAULT_TTL_MS = 20_000;
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * Raised when the engine refuses a lease because another agent already owns the
@@ -268,6 +281,7 @@ export function tool<A extends unknown[], R>(
     // Arbitrate. Loop because IN_PROGRESS means another worker holds it and the
     // right move is to wait for their result rather than to act.
     let handedBack = 0;
+    let unanswered = 0;
     for (;;) {
       let resp;
       const acquiredSentAt = performance.now();
@@ -297,12 +311,27 @@ export function tool<A extends unknown[], R>(
             err,
           );
         }
+        if (isRetryable(err)) {
+          if (unanswered < MAX_UNANSWERED) {
+            unanswered += 1;
+            await sleep(200 * unanswered);
+            continue;
+          }
+          // The engine may still have granted the last request, a lease nobody
+          // here knows the token of, which claims this position until it
+          // lapses. The failure record there waits that out rather than being
+          // refused by it.
+          known.unreleased = {
+            agentId,
+            key: ikey,
+            token: 0,
+            lapsesInMs: (leaseTtlMs ?? ENGINE_DEFAULT_TTL_MS) + 1000,
+          };
+        }
         throw err;
       }
 
       if (resp.status === CacheStatus.HIT) {
-        // The key completed, so no lease of this call's is left to release.
-        known.unreleased = undefined;
         // A hit returns without executing. When nothing is recorded at `seq` yet,
         // the result is recorded there before the next step runs, so the history
         // matches the work. The context decides which.
@@ -407,7 +436,7 @@ export function tool<A extends unknown[], R>(
             // Every grant comes too late to count on and no renewal confirms
             // one: the engine grants leases but will not renew them. Waiting
             // longer only repeats that, so the call fails and says why.
-            throw new Error(
+            throw new LeaseNotAcquired(
               `Tool '${toolName}' could not confirm any of ${handedBack} leases the ` +
                 `engine granted it, so its body did not run: ${detail}.`,
             );

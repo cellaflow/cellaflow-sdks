@@ -40,6 +40,7 @@ interface PendingHit {
 export interface UnreleasedLease {
   agentId: string;
   key: string;
+  /** 0 when the lease's token is unknown: a grant whose answer was lost. */
   token: number;
   /** How long it can still last, from when the heartbeat stopped. */
   lapsesInMs: number;
@@ -526,7 +527,8 @@ export class WorkflowContext {
    */
   private async retryRelease(pending: PendingHit): Promise<void> {
     const unreleased = pending.unreleased;
-    if (!unreleased) return;
+    // Without its token the lease cannot be released, only waited out.
+    if (!unreleased || unreleased.token === 0) return;
     try {
       await this.client.releaseLease(
         unreleased.agentId,

@@ -3,8 +3,9 @@
 // was granted. Runs against dist/ with a scripted engine client: `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import http2 from "node:http2";
 
-import { CacheStatus, WorkflowContext, currentLease, tool } from "../dist/index.js";
+import { CacheStatus, CellaflowClient, LeaseNotAcquired, WorkflowContext, currentLease, tool } from "../dist/index.js";
 import { runWithContext } from "../dist/context.js";
 import { serialize } from "../dist/serialization.js";
 import { ENGINE_WAIT_MS } from "../dist/wait.js";
@@ -27,6 +28,7 @@ function fakeClocks() {
     advance: (ms) => {
       offset += ms;
     },
+    offset: () => offset,
     restore: () => {
       if (own) Object.defineProperty(performance, "now", own);
       else delete performance.now;
@@ -54,8 +56,9 @@ function scriptedClient(
   const releases = [];
   const order = [];
   const answer = (next) => {
-    const { waited, expiresInMs, ...resp } = next;
+    const { waited, expiresInMs, throws, ...resp } = next;
     if (waited) clocks.advance(waited);
+    if (throws !== undefined) throw Object.assign(new Error(`engine error ${throws}`), { code: throws });
     if (expiresInMs !== undefined) resp.leaseExpiresAtMs = BigInt(Date.now() + expiresInMs);
     return resp;
   };
@@ -92,7 +95,8 @@ function scriptedClient(
     async releaseLease(agentId, key, fencingToken, reason) {
       releases.push({ fencingToken, reason });
       order.push(`release:${fencingToken}`);
-      if (failReleases) throw Object.assign(new Error("engine unavailable"), { code: 14 });
+      const fails = typeof failReleases === "function" ? failReleases(Number(fencingToken)) : failReleases;
+      if (fails) throw Object.assign(new Error("engine unavailable"), { code: 14 });
       return { released: true };
     },
     close() {},
@@ -266,7 +270,12 @@ test("a call whose late grants no renewal ever confirms fails after three, and i
     );
     const next = tool(async () => "next", { toolName: "next_step" });
     await runWithContext(session(client), async () => {
-      await assert.rejects(charge(), /could not confirm any of 3 leases/);
+      const started = performance.now() - clocks.offset();
+      await assert.rejects(charge(), (err) => err instanceof LeaseNotAcquired && /could not confirm any of 3 leases/.test(err.message));
+      // Three grants, each tried three times with 100 and 200 ms between: no
+      // pause after the last try, which would add 400 ms to each.
+      const tookMs = performance.now() - clocks.offset() - started;
+      assert.ok(tookMs < 1500, `three hand-backs took ${tookMs} ms`);
       // The failure is recorded at the call's position before the next call
       // claims one, and the lease still claiming it is released first.
       client.order.push("next");
@@ -319,5 +328,112 @@ test("the lease that records a received result waits in the engine, and asks aga
     );
   } finally {
     clocks.restore();
+  }
+});
+
+test("a request that gets no answer is asked again, and the body runs once under the lease it is told about", async () => {
+  const client = scriptedClient([{ throws: 4 }, acquired(8n)]);
+  let runs = 0;
+  const charge = tool(
+    async () => {
+      runs += 1;
+      return "charged";
+    },
+    { toolName: "charge_card" },
+  );
+  assert.equal(await runWithContext(session(client), () => charge()), "charged");
+  assert.equal(runs, 1);
+  assert.equal(client.acquires.length, 2);
+});
+
+test("a call whose requests go unanswered fails, and its failure record waits out a lease it was never told about", async () => {
+  // The engine may have granted the last request: a lease whose token this side
+  // never saw, claiming the call's position until it lapses. The failure record
+  // there is refused until then, and waits rather than being dropped.
+  const client = scriptedClient([{ throws: 4 }, { throws: 4 }, { throws: 4 }, acquired(9n)], {
+    recordAnswers: [{ throws: 9 }],
+  });
+  const charge = tool(async () => "charged", { toolName: "charge_card", ttlMs: 1000 });
+  const next = tool(async () => "next", { toolName: "next_step" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), (err) => err.code === 4);
+    assert.equal(await next(), "next");
+  });
+  assert.equal(client.acquires.length, 4);
+  assert.equal(client.recordAcquires.length, 2);
+  // A lease without its token cannot be released, only waited out.
+  assert.deepEqual(client.releases, []);
+  assert.deepEqual(
+    client.order.filter((e) => e.startsWith("commit")),
+    ["commit:1:charge_card", "commit:2:next_step"],
+  );
+});
+
+test("a lease handed back unreleased is forgotten once the engine grants the key again", async () => {
+  const clocks = fakeClocks();
+  try {
+    // The first grant is handed back and its release fails. The engine grants
+    // the key again, so that lease is gone: the failure record for the body's
+    // error must not wait for it or release it.
+    const client = scriptedClient(
+      [acquired(7n, 750n, { waited: 10_000, expiresInMs: 2900 }), acquired(8n, 750n), acquired(9n)],
+      { clocks, failRenewalsFor: (token) => token === 7, failReleases: (token) => token === 7 },
+    );
+    const charge = tool(
+      async () => {
+        throw new Error("card declined");
+      },
+      { toolName: "charge_card", ttlMs: 3000 },
+    );
+    const next = tool(async () => "next", { toolName: "next_step" });
+    await runWithContext(session(client), async () => {
+      await assert.rejects(charge(), /card declined/);
+      client.order.push("next");
+      await next();
+    });
+    const afterNext = client.order.slice(client.order.indexOf("next"));
+    assert.ok(!afterNext.includes("release:7"), afterNext.join(" "));
+    assert.deepEqual(
+      client.releases.map((r) => [r.fencingToken, r.reason]),
+      [
+        [7, "LEASE_UNCONFIRMED"],
+        [8, "TOOL_ERROR"],
+      ],
+    );
+  } finally {
+    clocks.restore();
+  }
+});
+
+test("an engine suggesting no back-off is still backed off from", async () => {
+  const client = scriptedClient([inProgress({ retryAfterMs: 0n }), inProgress({ retryAfterMs: 0n }), acquired()]);
+  const charge = tool(async () => "charged", { toolName: "charge_card" });
+  const started = performance.now();
+  await runWithContext(session(client), () => charge());
+  const tookMs = performance.now() - started;
+  assert.ok(tookMs >= 95, `two back-offs of at least 50 ms took ${tookMs} ms`);
+});
+
+test("a waiting request that gets no answer fails at its deadline", { timeout: 10_000 }, async () => {
+  // An engine whose connection stays open but never answers, as one does when
+  // the network drops while the engine holds a request.
+  const server = http2.createServer();
+  const sessions = [];
+  server.on("session", (session) => sessions.push(session));
+  server.on("stream", () => {});
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const client = new CellaflowClient({ target: `127.0.0.1:${server.address().port}` });
+  try {
+    const started = performance.now();
+    await assert.rejects(
+      client.checkIdempotencyCache("agent", "key", 10_000, undefined, undefined, undefined, 0.3),
+      (err) => err.code === 4,
+    );
+    const tookMs = performance.now() - started;
+    assert.ok(tookMs < 3000, `the deadline fired after ${tookMs} ms`);
+  } finally {
+    client.close();
+    for (const session of sessions) session.destroy();
+    await new Promise((resolve) => server.close(resolve));
   }
 });

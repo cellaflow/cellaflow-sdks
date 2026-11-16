@@ -397,7 +397,17 @@ export async function executionLease<T>(
   try {
     const acquiredSentAt = performance.now();
     const acquiredSentWallAt = Date.now();
-    const resp = await client.checkIdempotencyCache(workerId, key, waitMs, ttlMs);
+    // A waiting request gets a deadline past its wait, so a connection that
+    // dies while the engine holds it fails the block rather than hanging it.
+    const resp = await client.checkIdempotencyCache(
+      workerId,
+      key,
+      waitMs,
+      ttlMs,
+      undefined,
+      undefined,
+      waitMs > 0 ? (waitMs + 5_000) / 1000 : undefined,
+    );
 
     if (resp.status === CacheStatus.HIT) {
       throw new LeaseNotAcquired(
