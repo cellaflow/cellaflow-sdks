@@ -246,8 +246,7 @@ export class CellaflowClient {
     }
 
     return await this.client.checkIdempotencyCache(req, {
-      timeoutMs:
-        deadlineMs(timeoutSecs),
+      timeoutMs: deadlineMs(timeoutSecs),
     });
   }
 
@@ -277,8 +276,7 @@ export class CellaflowClient {
       // Guard against timeout=0 which would cause an instant timeout.
       // Whole milliseconds: the grpc-timeout header carries an integer, and a
       // fractional value is dropped by the server rather than rounded.
-      timeoutMs:
-        deadlineMs(timeoutSecs),
+      timeoutMs: deadlineMs(timeoutSecs),
     });
   }
 
@@ -304,8 +302,7 @@ export class CellaflowClient {
     }
 
     return await this.client.releaseLease(req, {
-      timeoutMs:
-        deadlineMs(timeoutSecs),
+      timeoutMs: deadlineMs(timeoutSecs),
     });
   }
 

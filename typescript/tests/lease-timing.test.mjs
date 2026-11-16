@@ -374,9 +374,10 @@ afterEach(() => Object.assign(CellaflowClient.prototype, original));
 const engineNow = () => performance.now() + 7_000_000;
 
 function stubEngine({ renew } = {}) {
-  const calls = { renew: [], release: [] };
+  const calls = { renew: [], release: [], acquireDeadlines: [], releaseDeadlines: [] };
   Object.assign(CellaflowClient.prototype, {
-    async checkIdempotencyCache() {
+    async checkIdempotencyCache(agentId, key, waitTimeoutMs, leaseTtlMs, sessionId, sequence, timeoutSecs) {
+      calls.acquireDeadlines.push(timeoutSecs);
       return {
         status: CacheStatus.ACQUIRED,
         fencingToken: 5n,
@@ -390,8 +391,9 @@ function stubEngine({ renew } = {}) {
         ? renew(calls.renew.length)
         : { renewed: true, newExpiresAtMs: BigInt(Math.round(engineNow() + extendMs)) };
     },
-    async releaseLease(agentId, key, token, reason) {
+    async releaseLease(agentId, key, token, reason, timeoutSecs) {
       calls.release.push(reason);
+      calls.releaseDeadlines.push(timeoutSecs);
       return { released: true };
     },
   });
@@ -415,6 +417,15 @@ test("executionLease renews for the full TTL and reports each step", async () =>
   assert.equal(types.at(-1), "released");
   assert.ok(events.every((e) => e.fencingToken === 5 && typeof e.at === "number"));
   assert.deepEqual(calls.release, ["BLOCK_EXIT"]);
+});
+
+test("a waiting acquisition and the release both carry a deadline", async () => {
+  const calls = stubEngine();
+  await executionLease("k", { workerId: "w", ttlMs: 200, waitMs: 1_000 }, async () => {});
+  // The wait plus 5 s for the engine to answer, so a connection that dies
+  // during the wait fails the block rather than hanging it.
+  assert.deepEqual(calls.acquireDeadlines, [6]);
+  assert.deepEqual(calls.releaseDeadlines, [5]);
 });
 
 test("after waiting for a lease, it renews once before the block runs", async () => {

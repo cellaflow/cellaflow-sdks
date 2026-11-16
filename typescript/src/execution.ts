@@ -5,6 +5,7 @@ import { CellaflowClient } from "./client.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { LeaseHeartbeat } from "./lease.js";
 import type { LeaseEvent } from "./lease.js";
+import { RELEASE_DEADLINE_SECS } from "./wait.js";
 
 const DEFAULT_TTL_MS = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
@@ -492,7 +493,7 @@ export async function executionLease<T>(
     await hb?.stop();
     if (fencingToken > 0) {
       await client
-        .releaseLease(workerId, key, fencingToken, "BLOCK_EXIT")
+        .releaseLease(workerId, key, fencingToken, "BLOCK_EXIT", RELEASE_DEADLINE_SECS)
         .then((released) => {
           // Only a release the engine confirms: if another worker holds the
           // lease by now, there was nothing of this worker's to release.

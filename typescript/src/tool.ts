@@ -21,7 +21,11 @@ import {
  */
 const MAX_HAND_BACKS = 3;
 
-/** The engine's default lease TTL, for a call that asked for none. */
+/**
+ * The engine's default lease TTL, for a call that asked for none: what engines
+ * 0.2.0 and 0.3.0 grant. An engine configured with a longer default lets a lost
+ * grant outlast this estimate, and the failure record then stops waiting early.
+ */
 const ENGINE_DEFAULT_TTL_MS = 20_000;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -310,21 +314,22 @@ export function tool<A extends unknown[], R>(
           );
         }
         if (isRetryable(err)) {
-          if (unanswered < MAX_UNANSWERED) {
-            unanswered += 1;
-            await sleep(200 * unanswered);
-            continue;
-          }
-          // The engine may still have granted the last request, a lease nobody
-          // here knows the token of, which claims this position until it
-          // lapses. The failure record there waits that out rather than being
-          // refused by it.
+          // The engine may have granted the request, a lease nobody here knows
+          // the token of, which claims this position until it lapses. Kept
+          // until a grant shows it is gone, so whatever fails the call from
+          // here leaves the failure record waiting it out rather than refused
+          // by it.
           known.unreleased = {
             agentId,
             key: ikey,
             token: 0,
             lapsesInMs: (leaseTtlMs ?? ENGINE_DEFAULT_TTL_MS) + 1000,
           };
+          if (unanswered < MAX_UNANSWERED) {
+            unanswered += 1;
+            await sleep(200 * unanswered);
+            continue;
+          }
         }
         throw err;
       }

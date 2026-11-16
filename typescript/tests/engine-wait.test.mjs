@@ -92,8 +92,8 @@ function scriptedClient(
       order.push(`commit:${sequence}:${name}`);
       return {};
     },
-    async releaseLease(agentId, key, fencingToken, reason) {
-      releases.push({ fencingToken, reason });
+    async releaseLease(agentId, key, fencingToken, reason, timeoutSecs) {
+      releases.push({ fencingToken, reason, timeoutSecs });
       order.push(`release:${fencingToken}`);
       const fails = typeof failReleases === "function" ? failReleases(Number(fencingToken)) : failReleases;
       if (fails) throw Object.assign(new Error("engine unavailable"), { code: 14 });
@@ -215,7 +215,7 @@ test("a lease granted after a long wait that no renewal confirms is handed back 
     );
     assert.equal(await runWithContext(session(client), () => charge()), "charged");
     assert.deepEqual(tokens, [8]);
-    assert.deepEqual(client.releases[0], { fencingToken: 7, reason: "LEASE_UNCONFIRMED" });
+    assert.deepEqual(client.releases[0], { fencingToken: 7, reason: "LEASE_UNCONFIRMED", timeoutSecs: 5 });
     const body = client.order.indexOf("body");
     assert.ok(client.order.indexOf("release:7") < body, client.order.join(" "));
     assert.ok(!client.order.slice(body).includes("renew:7"), "the abandoned lease was renewed after the body began");
@@ -394,10 +394,10 @@ test("a lease handed back unreleased is forgotten once the engine grants the key
     const afterNext = client.order.slice(client.order.indexOf("next"));
     assert.ok(!afterNext.includes("release:7"), afterNext.join(" "));
     assert.deepEqual(
-      client.releases.map((r) => [r.fencingToken, r.reason]),
+      client.releases.map((r) => [r.fencingToken, r.reason, r.timeoutSecs]),
       [
-        [7, "LEASE_UNCONFIRMED"],
-        [8, "TOOL_ERROR"],
+        [7, "LEASE_UNCONFIRMED", 5],
+        [8, "TOOL_ERROR", 5],
       ],
     );
   } finally {
@@ -505,4 +505,42 @@ test("a deadline longer than a timer can hold does not fail the call at once", {
     for (const session of sessions) session.destroy();
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test("the record lease counts only failures since its last answer", async () => {
+  const hit = {
+    status: CacheStatus.HIT,
+    currentSequence: 0n,
+    cachedResult: { outputPayload: serialize({ result: "placed-elsewhere" }) },
+  };
+  const lost = { throws: 14 };
+  const held = inProgress({ retryAfterMs: 1n });
+  const client = scriptedClient([hit, acquired()], { recordAnswers: [lost, held, lost, held, lost] });
+  const place = tool(async () => "placed-here", { toolName: "place_order" });
+  const confirm = tool(async () => "confirmed", { toolName: "send_confirmation" });
+  await runWithContext(session(client), async () => {
+    await place();
+    assert.equal(await confirm(), "confirmed");
+  });
+  assert.equal(client.recordAcquires.length, 6);
+});
+
+test("a call failed by a refusal after an unanswered request still leaves its record waiting", async () => {
+  // The first request may have been granted. The second is refused for another
+  // reason, which fails the call; the possibly granted lease still claims the
+  // position, so the failure record waits it out rather than being dropped.
+  const client = scriptedClient([{ throws: 14 }, { throws: 16 }, acquired(9n)], {
+    recordAnswers: [{ throws: 9 }],
+  });
+  const charge = tool(async () => "charged", { toolName: "charge_card", ttlMs: 1000 });
+  const next = tool(async () => "next", { toolName: "next_step" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), (err) => err.code === 16);
+    assert.equal(await next(), "next");
+  });
+  assert.equal(client.recordAcquires.length, 2);
+  assert.deepEqual(
+    client.order.filter((e) => e.startsWith("commit")),
+    ["commit:1:charge_card", "commit:2:next_step"],
+  );
 });
