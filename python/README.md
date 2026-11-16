@@ -663,11 +663,41 @@ The clock only tells the body to stop. What happens to the call is up to the eng
 - **The body returns:** its result is committed. If another worker holds the call now (in another session, or before it has committed), the engine refuses it, and the caller gets `LeaseLostError` with the body's return value on its `result`, for logging. If nobody took over, the commit stands, so a body that finished just as its deadline passed is recorded, not run again. A commit that gets no answer is sent once more before the lease is released, and again if the engine then refuses the release; only a refusal about the call's key counts as a takeover. `result` is for logging only: it is not kept in the session's history, so a resumed run that replays the failure raises `LeaseLostError` with `has_result` false.
 - **The body raises** (including `LeaseLostError` from `check()`): the lease is released, and the failure is recorded at the call's position, as for any failing step, whether or not another worker took the call over. A resumed `@workflow` replays by position, so it finds the failure where the run saw it. Calling the same step again lands one position on and, under a scope whose key does not include the position, finds the other worker's result or waits for it; if nobody took over, or under `SCOPE_STEP_LOCAL`, it runs the body again.
 
-The check covers a request that has not left. A request already on its way when the holder froze can still arrive, and so can one whose effect landed just before a crash, ahead of the commit. For those, give the destination a way to recognise a repeat, such as an idempotency key it deduplicates on.
+The check covers a request that has not left. A request already on its way when the holder froze can still arrive, and so can one whose effect landed just before a crash, ahead of the commit. For those, send the call's key to the destination, as below.
 
 The clock can only judge what it can see: keep `lease_ttl_ms` below the engine's maximum lease lifetime (`CELLAFLOW_MAX_LEASE_LIFETIME_MS`), or a holder frozen past that limit can still pass `check()` when it wakes.
 
-Inside a step body, `current_lease()` is the step call's lease, even when the step is called from inside an `execution_lease` block or a `@task_lease` function. To pass the enclosing lease's fencing token downstream from a step, read it before calling the step. A cache hit or a replayed step never runs the body, so it never sees a lease; outside any lease, `current_lease()` raises `LookupError`, as before.
+Inside a step body, `current_lease()` is the step call's lease, even when the step is called from inside an `execution_lease` block or a `@task_lease` function. To pass the enclosing lease's fencing token downstream from a step, read it before calling the step. A cache hit or a replayed step never runs the body, so it never sees a lease; outside any lease, `current_lease()` raises `LookupError`, as before. A body the SDK runs without a lease of its own sees no lease at all, not an enclosing one.
+
+### Sending the call's key to the destination
+
+A process can crash after its request lands and before the result is recorded. The engine and the destination are two systems, so nothing on the engine's side can close that window: the next holder runs the step again. The destination can, if both attempts carry the same key. Stripe, Adyen and many internal services deduplicate on an `Idempotency-Key` header; PayPal on `PayPal-Request-Id`.
+
+`current_lease().key` is the call's idempotency key: the one the decorator derived, or the `idempotency_key` you gave it. It is the same on every attempt at the same call (only `fencing_token` changes), so a request sent again after a crash is recognised as a repeat. `current_lease().key_digest` is its SHA-256 (of the UTF-8 key, as 64 lowercase hex characters), and it is what `idempotency_headers()` sends unless asked otherwise:
+
+```python
+@tool(scope=IdempotencyScope.SCOPE_SHARED, shared_on=["order", "amount"])
+def refund(order: str, amount: int) -> dict:
+    lease = current_lease()
+    lease.check()
+    response = httpx.post(
+        "https://payments.example/refunds",
+        json={"order": order, "amount": amount},
+        headers=lease.idempotency_headers(),
+    )
+    return response.json()
+```
+
+With a client library, pass the digest yourself: `stripe.Refund.create(charge=order, amount=amount, idempotency_key=lease.key_digest)`.
+
+- **Send what the key covers, one key per request.** A destination that deduplicates compares the request too: Stripe refuses a reused key with different parameters. Keep everything the request depends on in the key (in `shared_on`, for a shared call), or a worker that takes the call over with different arguments gets an error instead of the original result. A body that sends several requests needs a key for each: `lease.key_digest_for("customer")`, `lease.key_digest_for("payment")`, or `idempotency_headers(part="payment")`. Each is the SHA-256 of the key's digest followed by the part, as 64 lowercase hex characters, the same on every attempt and the same as the TypeScript SDK's; a part must be a non-empty string.
+- **Which attempts share the key.** A worker taking the call over after a crash, and calling the step again with the same arguments after it failed, use the same key. Under `SCOPE_STEP_LOCAL` the key also includes the call's position, so a call made again at a later position after a failure does not share it, and neither does a resumed `durable_tools` thread that reaches its tools in another order. Arguments that differ between attempts (a timestamp, text an LLM rewrites) give a different key. For forwarding, prefer the session-wide scope, `SCOPE_SHARED` with `shared_on`, or an explicit `idempotency_key`.
+- **The destination's first answer is final for the key.** A destination that deduplicates replays its first answer for a key, a refusal included: a card declined once stays declined for that key until the destination forgets it (at Stripe, until the key is at least 24 hours old). When a retry should be a new attempt, give it a new key: include an attempt number in the call's arguments (and in `shared_on`, for a shared call).
+- **What the key contains, and why the digest is the default.** A derived key carries the ids it is made of: the session (for `durable_tools`, the thread id) under the default session-wide scope, the coordination id under `SCOPE_SHARED`, and the session and agent ids under the agent-private and step-local scopes, along with the step's name. Those can hold characters a header cannot, and make keys longer than some destinations allow (Stripe takes 255). The digest has neither problem and does not show the ids in readable form; it is not a secret, since anyone who can guess a key's inputs can compute it. `idempotency_headers(raw=True)` sends the key itself (it must then be printable ASCII with no space at either end); `header="PayPal-Request-Id"` names another header.
+- **Keys are only as unique as their ids.** The destination remembers keys on its own, apart from the engine. A thread id reused after the engine's data is cleared, or staging and production sharing one destination account, makes a new call look like a repeat, and the destination replays the old answer. Keep the ids that make up a key unique across everything that talks to the destination: prefix thread or coordination ids with the deployment, or give an explicit `idempotency_key`.
+- **Fencing tokens.** A service of your own can also reject a request whose `lease.fencing_token` is lower than the last one it saw for the same key (the same call, or the same `execution_lease` key), which turns away a holder that was taken over even when its request is not a repeat: `headers={"X-Fencing-Token": str(lease.fencing_token), **lease.idempotency_headers()}`. Tokens are ordered within one key only: never compare tokens from different keys.
+- **Execution leases.** An `execution_lease` handle carries its key too, but that key names a lock, which is taken again by the next run. Forward it only when it names exactly one operation (a `@task_lease` keyed by task id), or add a run id of your own.
+- **Where it does not help.** A destination that neither deduplicates nor can be asked whether the request landed. There, check the destination before acting again, or accept that a crash in that window repeats the effect.
 
 ### `durable_tools(config, *, workflow_id="langgraph", version="1.0.0", target=..., secure=False, coordination_id=None, api_key=None, lease_ttl_ms=None)`
 Context manager that makes `@tool` work inside LangGraph node bodies, where there is no

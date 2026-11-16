@@ -580,7 +580,7 @@ def _lease_for_body(
     def probe() -> bool:
         return hb is not None and hb.past_deadline()
 
-    handle = LeaseHandle(fencing_token, probe=probe)
+    handle = LeaseHandle(fencing_token, probe=probe, key=ikey)
     call.handle = handle
     hb = LeaseHeartbeat(
         client=ctx.client,
@@ -1020,14 +1020,14 @@ def step(
                     break
 
             try:
-                if handle is None:
+                # The body sees the call's own lease. Without one (an answer
+                # this SDK does not know) it sees none, not an enclosing one,
+                # so no other lease's key is forwarded in this call's name.
+                lease_var = _current_lease.set(handle)
+                try:
                     result = await func(*args, **kwargs)
-                else:
-                    lease_var = _current_lease.set(handle)
-                    try:
-                        result = await func(*args, **kwargs)
-                    finally:
-                        _current_lease.reset(lease_var)
+                finally:
+                    _current_lease.reset(lease_var)
                 # The body is over: work it started and left running finds the
                 # lease over from here on, through the commit's round trip too.
                 if handle is not None:
@@ -1258,14 +1258,14 @@ def step(
                     break
 
             try:
-                if handle is None:
+                # The body sees the call's own lease. Without one (an answer
+                # this SDK does not know) it sees none, not an enclosing one,
+                # so no other lease's key is forwarded in this call's name.
+                lease_var = _current_lease.set(handle)
+                try:
                     result = func(*args, **kwargs)
-                else:
-                    lease_var = _current_lease.set(handle)
-                    try:
-                        result = func(*args, **kwargs)
-                    finally:
-                        _current_lease.reset(lease_var)
+                finally:
+                    _current_lease.reset(lease_var)
                 # The body is over: work it started and left running finds the
                 # lease over from here on, through the commit's round trip too.
                 if handle is not None:
