@@ -16,6 +16,7 @@ import {
   hasStatusCode,
   isFailedPrecondition,
   isNotFound,
+  isPositionCommitted,
   isRetryable,
 } from "./errors.js";
 
@@ -476,7 +477,9 @@ export class WorkflowContext {
         );
       } catch (err) {
         const held = pending.unreleased;
-        if (held && isFailedPrecondition(err)) {
+        // A committed position never takes the record, whatever lease once
+        // claimed it, so there is nothing to wait out.
+        if (held && isFailedPrecondition(err) && !isPositionCommitted(err)) {
           const remaining = (held.lapsesAt ?? 0) - Date.now();
           if (remaining > 0) {
             // Refused because of that lease, which lapses on its own: wait for

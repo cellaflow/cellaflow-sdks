@@ -56,9 +56,9 @@ function scriptedClient(
   const releases = [];
   const order = [];
   const answer = (next) => {
-    const { waited, expiresInMs, throws, ...resp } = next;
+    const { waited, expiresInMs, throws, message, ...resp } = next;
     if (waited) clocks.advance(waited);
-    if (throws !== undefined) throw Object.assign(new Error(`engine error ${throws}`), { code: throws });
+    if (throws !== undefined) throw Object.assign(new Error(message ?? `engine error ${throws}`), { code: throws });
     if (expiresInMs !== undefined) resp.leaseExpiresAtMs = BigInt(Date.now() + expiresInMs);
     return resp;
   };
@@ -79,6 +79,10 @@ function scriptedClient(
       const next = answers.shift();
       if (!next) throw new Error("no scripted answer left");
       return answer(next);
+    },
+    async getGraph() {
+      // Nothing committed: the scripted engine keeps no history.
+      return [[], undefined];
     },
     async renewLease(agentId, key, fencingToken, extendMs) {
       renewals.push({ fencingToken, extendMs });
@@ -543,4 +547,22 @@ test("a call failed by a refusal after an unanswered request still leaves its re
     client.order.filter((e) => e.startsWith("commit")),
     ["commit:1:charge_card", "commit:2:next_step"],
   );
+});
+
+test("a record refused at a committed position does not wait out a lost lease", async () => {
+  // The lost answer's lease may still claim the position, but a committed
+  // position never takes the record whatever claims it: waiting is wasted.
+  const committed = { throws: 9, message: "Sequence 1 in session 's-wait' is already committed" };
+  const client = scriptedClient([{ throws: 14 }, { throws: 14 }, { throws: 14 }, acquired(9n)], {
+    recordAnswers: [committed],
+  });
+  const charge = tool(async () => "charged", { toolName: "charge_card", ttlMs: 1000 });
+  const next = tool(async () => "next", { toolName: "next_step" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), (err) => err.code === 14);
+    const started = performance.now();
+    await next();
+    assert.ok(performance.now() - started < 1000, "the record waited for a lease at a committed position");
+  });
+  assert.equal(client.recordAcquires.length, 1);
 });
