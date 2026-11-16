@@ -2,7 +2,11 @@
 
 All notable changes to the Cellaflow Python SDK.
 
-## Unreleased
+## 0.11.0
+
+### Compatibility
+
+- Tested with engine 0.3.0: CI's integration tests run against `ghcr.io/cellaflow/cellaflow:0.3.0`.
 
 ### Added
 
