@@ -1,13 +1,19 @@
 # Postgres holds the LangGraph checkpoints. Cellaflow holds the leases.
 # Both arms of the proof run against exactly this, so the only variable is
 # whether the tool call is leased.
+#
+# Host ports are overridable because 50051 is the engine default everywhere. A
+# developer who already has an engine there does not get a refused bind, they
+# get a proof that quietly measured the other engine. Set PROOF_ENGINE_PORT and
+# PROOF_PG_PORT, then point the script at them with CELLAFLOW_TARGET and
+# PROOF_DB_URI. All four have to agree.
 services:
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_PASSWORD: proof
       POSTGRES_DB: proof
-    ports: ["55433:5432"]
+    ports: ["${PROOF_PG_PORT:-55433}:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 1s
@@ -22,4 +28,4 @@ services:
       CELLAFLOW_ALLOW_UNAUTHENTICATED: "true"
       CELLAFLOW_HOST: "::"
       CELLAFLOW_DB_PATH: /data/cellaflow
-    ports: ["50051:50051", "9090:9090"]
+    ports: ["${PROOF_ENGINE_PORT:-50051}:50051", "${PROOF_METRICS_PORT:-9090}:9090"]
