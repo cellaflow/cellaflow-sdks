@@ -29,7 +29,7 @@ import os
 import sys
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List
+from typing import Any, Callable, ContextManager, Dict, Iterator, List
 
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
@@ -47,7 +47,6 @@ ENGINE = os.environ.get("CELLAFLOW_TARGET", "localhost:50051")
 # not entered and nothing is appended.
 SEATS: List[str] = []
 CHARGES: List[str] = []
-_DIE = {"now": True}
 
 # What each arm must produce, asserted per arm rather than only on the pair.
 # Checking only the pair meant `--arm b` returned 0 whatever it counted, which
@@ -75,6 +74,12 @@ def charge_card(booking: str, cents: int) -> Dict[str, Any]:
     return {"kind": "charge", "booking": booking, "cents": cents}
 
 
+# The one thing the two arms vary: a context manager taking the LangGraph
+# config. Arm A's does nothing. Arm B's opens a Cellaflow session, and every
+# @tool called while it is open takes a lease.
+LeaseScope = Callable[[Dict[str, Any]], ContextManager[Any]]
+
+
 @contextlib.contextmanager
 def no_lease(_config: Dict[str, Any]) -> Iterator[None]:
     """Arm A's stand-in for durable_tools: does nothing at all."""
@@ -85,18 +90,32 @@ def run_arm(
     label: str,
     reserve: Callable[[str], Dict[str, Any]],
     charge: Callable[[str, int], Dict[str, Any]],
-    wrap: Callable[..., Any],
+    scope: LeaseScope,
 ) -> int:
+    """Runs one arm twice and returns how many times the card was charged.
+
+    Run 1 is killed the instant after the charge lands. Run 2 resumes the same
+    thread from a fresh saver, the way a restarted pod would.
+
+    `scope` is the only argument the arms differ on: `no_lease` for A, and
+    `durable_tools` bound to the engine for B. `reserve` and `charge` are the
+    same two functions in both arms, handed to B through `@tool`, so neither
+    arm can be doing different work from the other.
+    """
     SEATS.clear()
     CHARGES.clear()
-    _DIE["now"] = True
+
+    # Flipped to False before run 2. `node_pay` reads it on every call rather
+    # than capturing it, so the assignment further down is what turns the crash
+    # off for the resume.
+    die_after_charge = True
 
     def node_reserve(state: Booking) -> Dict[str, Any]:
         return {"seat": reserve(state.booking)}
 
     def node_pay(state: Booking) -> Dict[str, Any]:
         receipt = charge(state.booking, 2499)
-        if _DIE["now"]:
+        if die_after_charge:
             # The money has moved. This run now dies without recording it.
             raise RuntimeError("pod died after charging, before the checkpoint")
         return {"receipt": receipt}
@@ -116,15 +135,15 @@ def run_arm(
     with PostgresSaver.from_conn_string(DB_URI) as cp:
         cp.setup()
         try:
-            with wrap(config):
+            with scope(config):
                 build(cp).invoke(Booking(booking="BK-1"), config)
         except RuntimeError:
             print("      run 1: charged, then the process died")
 
     # A genuinely fresh saver, as a restarted pod would have.
-    _DIE["now"] = False
+    die_after_charge = False
     with PostgresSaver.from_conn_string(DB_URI) as cp:
-        with wrap(config):
+        with scope(config):
             build(cp).invoke(None, config)      # None resumes; input restarts
     print("      run 2: resumed from cold and completed")
 
