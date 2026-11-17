@@ -12,8 +12,8 @@ is killed the instant after the charge lands and before the checkpoint recording
 it is written -- the worst moment for a crash, because the money has moved and
 nothing durable says so. A second run resumes the thread from cold.
 
-Exits non-zero unless arm A charges twice and arm B charges once. A proof that
-cannot fail is not a proof.
+Every arm asserts its own expected count, so `--arm b` on its own still fails
+if the lease stops working. A proof that cannot fail is not a proof.
 
     docker compose up -d
     pip install -r requirements.txt
@@ -48,6 +48,12 @@ ENGINE = os.environ.get("CELLAFLOW_TARGET", "localhost:50051")
 SEATS: List[str] = []
 CHARGES: List[str] = []
 _DIE = {"now": True}
+
+# What each arm must produce, asserted per arm rather than only on the pair.
+# Checking only the pair meant `--arm b` returned 0 whatever it counted, which
+# is a permanent green for anyone who wires a single arm into CI.
+EXPECTED_A = 2  # the charge repeats: the checkpointer never saw it happen
+EXPECTED_B = 1  # the resumed call is answered from the lease's record
 
 
 @dataclass
@@ -162,18 +168,25 @@ def main() -> int:
         print(f"  Arm B   + Cellaflow leased tools ......... {b} charge(s)")
     print("  " + "=" * 58)
 
-    if args.arm != "both":
-        return 0
+    missed = []
+    if a is not None and a != EXPECTED_A:
+        missed.append(f"arm A expected {EXPECTED_A} charge(s), counted {a}")
+    if b is not None and b != EXPECTED_B:
+        missed.append(f"arm B expected {EXPECTED_B} charge(s), counted {b}")
 
-    if a == 2 and b == 1:
+    if missed:
+        print("\n  DID NOT REPRODUCE:")
+        for line in missed:
+            print(f"    {line}")
+        print()
+        return 1
+
+    if args.arm == "both":
         print("\n  The checkpointer worked correctly in both arms -- one seat")
         print("  reserved each time, because the committed node was skipped on")
         print("  resume. Every duplicate came from the pending node's side")
         print("  effect, which is the part a checkpointer does not cover.\n")
-        return 0
-
-    print(f"\n  DID NOT REPRODUCE: expected A=2 B=1, got A={a} B={b}\n")
-    return 1
+    return 0
 
 
 if __name__ == "__main__":

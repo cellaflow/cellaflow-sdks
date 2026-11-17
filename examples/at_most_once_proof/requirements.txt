@@ -1,3 +1,20 @@
-cellaflow[langgraph]>=0.10.0
-langgraph-checkpoint-postgres>=3.1.2
-psycopg[binary]>=3.1
+# Pinned, not floored. The argument this example makes is that you can run it
+# and get the same two numbers, so the dependency set has to be the one the
+# output in the README was produced with. The engine image is deliberately not
+# pinned; see the Versions section of the README for why the two differ.
+#
+# Cellaflow plain, not cellaflow[langgraph]. That extra exists for
+# CellaflowSaver, which this proof deliberately does not use: both arms
+# checkpoint with LangGraph's own PostgresSaver, so the only variable is the
+# lease. `durable_tools` and `tool` are framework-agnostic and import from the
+# base package.
+cellaflow==0.11.0
+
+# Declared directly. It used to arrive through the extra above, so dropping the
+# extra without this line breaks `from langgraph.graph import StateGraph`.
+langgraph==1.2.22
+
+# langgraph-checkpoint is not listed: it arrives through the postgres
+# checkpointer below and nothing here imports it by name.
+langgraph-checkpoint-postgres==3.2.1
+psycopg[binary]==3.3.9
