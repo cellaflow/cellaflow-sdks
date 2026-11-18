@@ -1,0 +1,13 @@
+# Pinned rather than floored, so a clone of this directory runs the code the
+# README describes. Loosen them in your own project; the integration is two
+# imports and does not depend on these exact versions.
+cellaflow==0.11.0
+langgraph==1.2.22
+
+# The base class the scripted model in model.py subclasses. It arrives with
+# langgraph anyway; it is named here because this example imports it directly.
+langchain-core==1.7.7
+
+# Only used when OPENAI_API_KEY is set. Listed so one install covers both paths
+# rather than failing the first time someone exports a key.
+langchain-openai==1.7.4
