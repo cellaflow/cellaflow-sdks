@@ -2,14 +2,41 @@
 
 A refund agent with two tools. The one that moves money is leased.
 
+## Starting the engine
+
+The example needs one running. This is the whole of it:
+
+```bash
+docker run -d --name cellaflow \
+  -p 50051:50051 -p 9090:9090 \
+  -e CELLAFLOW_ALLOW_UNAUTHENTICATED=true \
+  -e CELLAFLOW_DB_PATH=/data/cellaflow \
+  -e CELLAFLOW_HOST=:: \
+  ghcr.io/cellaflow/cellaflow:latest
+```
+
+`CELLAFLOW_ALLOW_UNAUTHENTICATED` is not optional. The engine refuses to start
+without either it or a token, so forgetting to configure auth cannot be how you
+end up serving an open port. Do not carry that setting into anything reachable.
+
+It takes a few seconds to come up. `docker ps` reports `(healthy)` when it is
+ready:
+
+```bash
+docker ps --filter name=cellaflow
+```
+
+Afterwards, `docker rm -f cellaflow` takes it away again.
+
+## Running the example
+
 ```bash
 pip install -r requirements.txt
 python agent.py
 ```
 
-An engine has to be running. See [the examples README](../../README.md) for the
-one-line Docker command, and set `CELLAFLOW_TARGET` if yours is not on
-`localhost:50051`.
+If your engine is somewhere other than `localhost:50051`, set
+`CELLAFLOW_TARGET=host:port` and the example will use it.
 
 ```
   engine: localhost:50051
