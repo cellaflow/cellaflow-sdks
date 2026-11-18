@@ -26,6 +26,4 @@ services:
       # The engine refuses to start without either an auth token or this
       # explicit opt-out, so a demo that omits it serves nothing at all.
       CELLAFLOW_ALLOW_UNAUTHENTICATED: "true"
-      CELLAFLOW_HOST: "::"
-      CELLAFLOW_DB_PATH: /data/cellaflow
     ports: ["${PROOF_ENGINE_PORT:-50051}:50051", "${PROOF_METRICS_PORT:-9090}:9090"]

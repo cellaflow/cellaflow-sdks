@@ -28,10 +28,8 @@ git clone https://github.com/cellaflow/cellaflow-sdks
 cd cellaflow-sdks/examples/multi_agent_idempotency
 
 docker run -d --name cellaflow-demo \
-  -p 50051:50051 -p 9090:9090 \
+  -p 50051:50051 \
   -e CELLAFLOW_ALLOW_UNAUTHENTICATED=true \
-  -e CELLAFLOW_DB_PATH=/data/cellaflow \
-  -e CELLAFLOW_HOST=:: \
   ghcr.io/cellaflow/cellaflow:latest
 
 pip install 'cellaflow[langgraph]'    # scenario 5 needs LangGraph; the rest do not
