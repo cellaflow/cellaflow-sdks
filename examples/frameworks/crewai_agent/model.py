@@ -15,6 +15,7 @@ text format. The tool itself is invoked the same way in both.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any, List, Tuple
 
@@ -44,6 +45,11 @@ def build_model(order_id: str) -> Tuple[Any, str]:
     """Returns the model and a label naming it, for the agent's banner."""
     if os.environ.get("OPENAI_API_KEY"):
         return LLM(model=OPENAI_MODEL), OPENAI_MODEL
+
+    # CrewAI warns on every turn that it is estimating the token count, which it
+    # is, because a scripted model publishes no tokeniser. True and irrelevant
+    # here, and three of them bury the two lines that matter.
+    logging.getLogger("crewai.llms.base_llm").setLevel(logging.ERROR)
 
     scripted = ScriptedLLM(
         model="scripted",

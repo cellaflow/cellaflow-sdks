@@ -11,6 +11,18 @@ An engine has to be running. See [the examples README](../../README.md) for the
 one-line Docker command, and set `CELLAFLOW_TARGET` if yours is not on
 `localhost:50051`.
 
+```
+  engine: localhost:50051
+  model:  scripted (no OPENAI_API_KEY set)
+  thread: refund-289120f0
+
+   lookup_order(ORD-4417)
+   issue_refund(ORD-4417, 2499)  <- the leased call
+
+  agent: Refunded ORD-4417 in full.
+  gateway hits: 1 refund(s)
+```
+
 ## The integration
 
 Two lines, both in `agent.py`.
