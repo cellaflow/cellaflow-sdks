@@ -1,6 +1,6 @@
 # AutoGen
 
-A refund agent with two tools. The one that moves money is leased.
+A dispatch agent with two tools. The one you cannot take back is leased.
 
 ## Starting the engine
 
@@ -39,13 +39,13 @@ If your engine is somewhere other than `localhost:50051`, set
 ```
   engine: localhost:50051
   model:  scripted (no OPENAI_API_KEY set)
-  thread: refund-f523bd54
+  thread: dispatch-b9b08d0f
 
    lookup_order(ORD-4417)
-   issue_refund(ORD-4417, 2499)  <- the leased call
+   dispatch_order(ORD-4417, DHL)  <- the leased call
 
-  agent: Refunded ORD-4417 in full.
-  gateway hits: 1 refund(s)
+  agent: Dispatched ORD-4417 with DHL.
+  courier hits: 1 dispatch(es)
 ```
 
 ## The integration
@@ -56,9 +56,9 @@ Two lines, both in `agent.py`.
 the type hints and the docstring, both of which survive the decorator.
 
 ```python
-@leased(tool_name="issue_refund")
-def issue_refund(order_id: str, cents: int) -> str:
-    """Refunds `cents` to the card that paid for `order_id`. Irreversible."""
+@leased(tool_name="dispatch_order")
+def dispatch_order(order_id: str, courier: str) -> str:
+    """Hands `order_id` to `courier` for delivery. Cannot be recalled."""
 ```
 
 `lookup_order` is not leased, because repeating a read costs nothing and a lease
@@ -69,7 +69,7 @@ one your application already uses is passed straight in.
 
 ```python
 with durable_tools(thread_id, target=ENGINE):
-    result = await agent.run(task="Refund order ORD-4417 in full.")
+    result = await agent.run(task="Dispatch order ORD-4417 to the courier.")
 ```
 
 The same thread always derives the same session, which is what makes the lease
@@ -97,9 +97,9 @@ inside the tool:
 with durable_tools(thread_id, target=ENGINE) as session:
     ...
 
-def issue_refund(order_id: str, cents: int) -> str:
+def dispatch_order(order_id: str, courier: str) -> str:
     with session.bind():
-        return _issue_refund(order_id, cents)
+        return _dispatch_order(order_id, courier)
 ```
 
 LangGraph does not need this; it copies the context into its executor. The
@@ -109,7 +109,7 @@ LangGraph does not need this; it copies the context into its executor. The
 
 `model.py` picks it. With `OPENAI_API_KEY` set the agent runs on `gpt-4o-mini`.
 Without one it runs on AutoGen's own `ReplayChatCompletionClient`, returning a
-fixed sequence of turns: call `lookup_order`, call `issue_refund`, answer.
+fixed sequence of turns: call `lookup_order`, call `dispatch_order`, answer.
 
 The replay client is not part of the integration. The agent really calls the
 tools either way, and the leased tool really takes a lease; the only faked part
@@ -117,12 +117,12 @@ is the thing choosing which tool to call.
 
 `max_tool_iterations` is set to 4 because the default of 1 stops after the first
 batch of tool calls, and the agent needs the lookup result before it can ask for
-the refund.
+the dispatch.
 
 ## What this example does not show
 
 It runs once, cleanly. Nothing crashes, so the output looks the same as it would
 with no lease at all. To see the lease answer a repeated call, run
 [`../../at_most_once_proof`](../../at_most_once_proof), which kills the process
-between the charge and the checkpoint and exits non-zero unless the leased arm
-charges once.
+between the confirmation and the checkpoint and exits non-zero unless the
+leased arm confirms once.

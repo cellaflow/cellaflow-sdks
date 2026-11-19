@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A CrewAI agent whose refund tool is leased by Cellaflow.
+"""A CrewAI agent whose dispatch tool is leased by Cellaflow.
 
     pip install -r requirements.txt
     python agent.py
@@ -9,7 +9,7 @@ scripted model in model.py, which calls the same tools in the same order.
 
 The integration is two things:
 
-    @leased(tool_name="issue_refund")   on the tool that moves money
+    @leased(tool_name="dispatch_order")  on the call you cannot take back
     with durable_tools(thread_id):      around the kickoff
 
 CrewAI runs a tool on the calling context on its synchronous path, which
@@ -35,49 +35,49 @@ ENGINE = os.environ.get("CELLAFLOW_TARGET", "localhost:50051")
 ORDER_ID = "ORD-4417"
 
 ORDERS = {
-    ORDER_ID: {"customer": "A. Okonkwo", "cents": 2499, "status": "delivered"},
+    ORDER_ID: {"customer": "A. Okonkwo", "items": 3, "status": "packed"},
 }
 
-# Appended to inside the tool body, so it counts what the payment gateway was
-# actually asked to do. A leased call answered from its record never enters the
-# body and never lands here.
-REFUNDS: List[str] = []
+# Appended to inside the tool body, so it counts what the courier was actually
+# asked to do. A leased call answered from its record never enters the body and
+# never lands here.
+DISPATCHES: List[str] = []
 
 
 @crewai_tool("lookup_order")
 def lookup_order(order_id: str) -> str:
-    """Returns the customer, amount in cents, and status of an order."""
+    """Returns the customer, item count, and status of an order."""
     order = ORDERS.get(order_id)
     if order is None:
         return f"no such order: {order_id}"
     print(f"   lookup_order({order_id})")
-    return f"{order['customer']}, {order['cents']} cents, {order['status']}"
+    return f"{order['customer']}, {order['items']} items, {order['status']}"
 
 
 # Read bottom-up: Cellaflow leases the call, CrewAI builds the schema the agent
 # sees. Only the irreversible one is leased; `lookup_order` can be repeated all
 # day without consequence, and a lease on it would buy nothing.
-@crewai_tool("issue_refund")
-@leased(tool_name="issue_refund")
-def issue_refund(order_id: str, cents: int) -> str:
-    """Refunds `cents` to the card that paid for `order_id`. Irreversible."""
-    REFUNDS.append(order_id)
-    print(f"   issue_refund({order_id}, {cents})  <- the leased call")
-    return f"refunded {cents} cents for {order_id}"
+@crewai_tool("dispatch_order")
+@leased(tool_name="dispatch_order")
+def dispatch_order(order_id: str, courier: str) -> str:
+    """Hands `order_id` to `courier` for delivery. Cannot be recalled."""
+    DISPATCHES.append(order_id)
+    print(f"   dispatch_order({order_id}, {courier})  <- the leased call")
+    return f"dispatched {order_id} with {courier}"
 
 
 def build_crew(model: object) -> Crew:
     agent = Agent(
-        role="Refunds agent",
-        goal="Refund the order the customer asks about, for the right amount.",
-        backstory="You handle refunds for a shop. You check an order before refunding it.",
-        tools=[lookup_order, issue_refund],
+        role="Dispatch agent",
+        goal="Dispatch the order the customer asks about, with the right courier.",
+        backstory="You handle dispatch for a shop. You check an order before sending it.",
+        tools=[lookup_order, dispatch_order],
         llm=model,
         verbose=False,
     )
     task = Task(
-        description=f"Refund order {ORDER_ID} in full.",
-        expected_output="One sentence confirming the refund.",
+        description=f"Dispatch order {ORDER_ID} to the courier.",
+        expected_output="One sentence confirming the dispatch.",
         agent=agent,
     )
     return Crew(agents=[agent], tasks=[task], verbose=False)
@@ -91,7 +91,7 @@ def main() -> int:
     # derives the tool session from it, so the same thread always reaches the
     # same leases. CrewAI has no config object to carry it, so it is passed
     # straight in as a string.
-    thread_id = f"refund-{uuid.uuid4().hex[:8]}"
+    thread_id = f"dispatch-{uuid.uuid4().hex[:8]}"
 
     print(f"\n  engine: {ENGINE}")
     print(f"  model:  {model_label}")
@@ -101,7 +101,7 @@ def main() -> int:
         result = crew.kickoff()
 
     print(f"\n  agent: {result}")
-    print(f"  gateway hits: {len(REFUNDS)} refund(s)\n")
+    print(f"  courier hits: {len(DISPATCHES)} dispatch(es)\n")
     return 0
 
 

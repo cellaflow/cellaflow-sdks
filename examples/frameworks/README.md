@@ -1,6 +1,6 @@
 # Framework integrations
 
-The same refund agent, wired up three ways. Each directory is self-contained:
+The same dispatch agent, wired up three ways. Each directory is self-contained:
 one `agent.py`, the model it runs on, and a README.
 
 | Example | Framework |
@@ -9,13 +9,13 @@ one `agent.py`, the model it runs on, and a README.
 | [`crewai_agent/`](crewai_agent/) | CrewAI |
 | [`autogen_agent/`](autogen_agent/) | AutoGen |
 
-All three do the same thing. The agent is asked to refund an order, looks it up,
-and refunds it. `lookup_order` is an ordinary function. `issue_refund` moves
-money, so it is leased:
+All three do the same thing. The agent is asked to dispatch an order, looks it
+up, and hands it to a courier. `lookup_order` is an ordinary function.
+`dispatch_order` cannot be recalled once the courier has it, so it is leased:
 
 ```python
-@leased(tool_name="issue_refund")
-def issue_refund(order_id: str, cents: int) -> str:
+@leased(tool_name="dispatch_order")
+def dispatch_order(order_id: str, courier: str) -> str:
     ...
 ```
 
@@ -77,5 +77,5 @@ lease at all. These answer "how do I wire this up", not "what does it buy me".
 
 For the second question, [`../at_most_once_proof`](../at_most_once_proof) runs
 one LangGraph graph twice, identical apart from the lease, kills the process
-between the charge and the checkpoint, and exits non-zero unless the leased arm
-charges once and the unleased arm charges twice.
+between the confirmation and the checkpoint, and exits non-zero unless the
+leased arm confirms once and the unleased arm confirms twice.

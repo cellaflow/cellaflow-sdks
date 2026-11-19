@@ -1,4 +1,4 @@
-# Does a leased tool call actually prevent a duplicate charge?
+# Does a leased tool call actually prevent a duplicate booking?
 
 Run it and see. Two arms, identical in every respect except one.
 
@@ -10,19 +10,19 @@ python proof.py
 
 ```
   ARM A  -  PostgresSaver only, no Cellaflow
-        >>> SEAT RESERVED   BK-1
-        >>> CARD CHARGED    2499 for BK-1
-      run 1: charged, then the process died
-        >>> CARD CHARGED    2499 for BK-1
+        >>> SEAT HELD            BK-1
+        >>> BOOKING CONFIRMED    14A for BK-1
+      run 1: confirmed, then the process died
+        >>> BOOKING CONFIRMED    14A for BK-1
       run 2: resumed from cold and completed
-      gateway hits -> seats=1 charges=2
+      supplier hits -> held=1 confirmed=2
 
   ARM B  -  identical graph, leased with durable_tools
-        >>> SEAT RESERVED   BK-1
-        >>> CARD CHARGED    2499 for BK-1
-      run 1: charged, then the process died
+        >>> SEAT HELD            BK-1
+        >>> BOOKING CONFIRMED    14A for BK-1
+      run 1: confirmed, then the process died
       run 2: resumed from cold and completed
-      gateway hits -> seats=1 charges=1
+      supplier hits -> held=1 confirmed=1
 ```
 
 Each arm asserts its own count, so `--arm a` or `--arm b` on its own still exits
@@ -30,18 +30,22 @@ non-zero if that arm stops behaving. A proof that cannot fail is not a proof.
 
 ## What it does
 
-A two-node LangGraph booking agent. Node one reserves a seat; node two charges a
-card. The process is killed the instant after the charge lands and before the
-checkpoint recording it is written, the worst possible moment, because the money
-has moved and nothing durable says so. A second run then resumes the same thread
-from cold.
+A two-node LangGraph booking agent. Node one holds a seat in local inventory;
+node two confirms that booking with the supplier. The process is killed the
+instant after the confirmation lands and before the checkpoint recording it is
+written, the worst possible moment, because the supplier has the booking and
+nothing durable says so. A second run then resumes the same thread from cold.
+
+The confirmation is the call worth guarding because no header would have saved
+you. A payment API hands you an idempotency key; a seat inventory, a partner
+endpoint or another team's service does not.
 
 Both arms use **`PostgresSaver`** for checkpoints. The only variable is whether the
 tool call holds a lease.
 
-## The number that matters is `seats`
+## The number that matters is `held`
 
-Look at the seats column, not the charges. **One reservation in both arms.**
+Look at the held column, not the confirmed one. **One seat held in both arms.**
 
 That is the checkpointer working exactly as designed: node one had committed, so
 the resumed run correctly skipped it and re-ran only the pending node. Nothing was
@@ -60,7 +64,7 @@ none:
 
 - **Not a performance benchmark.** No throughput, no latency, no comparison of
   storage engines. It is a correctness demonstration and it is deterministic:
-  the charge either repeated or it did not, on any hardware.
+  the confirmation either repeated or it did not, on any hardware.
 - **Not a claim about concurrency.** One writer, one thread, one crash. Replicas
   racing the same node is a different scenario.
 - **Not a general durability claim.** It kills a process. It does not cut power to
@@ -118,8 +122,8 @@ lines. Check them against what you started.
 
 ## Reading the code
 
-`proof.py` is one file, under 200 lines. `run_arm()` takes the two tool functions
-and a context manager; arm A passes `no_lease`, which does nothing, and arm B
-passes `durable_tools`. Everything else (the graph, the crash, the resume, the
+`proof.py` is one file. `run_arm()` takes the two tool functions and a context
+manager; arm A passes `no_lease`, which does nothing, and arm B passes
+`durable_tools`. Everything else (the graph, the crash, the resume, the
 checkpointer) is shared between them, so there is nowhere for a thumb to rest on
 the scale.

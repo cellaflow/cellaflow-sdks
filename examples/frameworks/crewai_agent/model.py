@@ -57,14 +57,14 @@ def build_model(order_id: str) -> Tuple[Any, str]:
             _action(
                 "lookup_order",
                 {"order_id": order_id},
-                "I should look the order up before refunding anything.",
+                "I should look the order up before sending anything.",
             ),
             _action(
-                "issue_refund",
-                {"order_id": order_id, "cents": 2499},
-                "That is the full amount, so I can refund it.",
+                "dispatch_order",
+                {"order_id": order_id, "courier": "DHL"},
+                "It is packed, so I can dispatch it.",
             ),
-            f"Thought: I now know the final answer\nFinal Answer: Refunded {order_id} in full.",
+            f"Thought: I now know the final answer\nFinal Answer: Dispatched {order_id} with DHL.",
         ],
     )
     return scripted, "scripted (no OPENAI_API_KEY set)"

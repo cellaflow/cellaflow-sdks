@@ -1,6 +1,6 @@
 # LangGraph
 
-A refund agent with two tools. The one that moves money is leased.
+A dispatch agent with two tools. The one you cannot take back is leased.
 
 ## Starting the engine
 
@@ -39,13 +39,13 @@ If your engine is somewhere other than `localhost:50051`, set
 ```
   engine: localhost:50051
   model:  scripted (no OPENAI_API_KEY set)
-  thread: refund-c244eccb
+  thread: dispatch-05484de3
 
    lookup_order(ORD-4417)
-   issue_refund(ORD-4417, 2499)  <- the leased call
+   dispatch_order(ORD-4417, DHL)  <- the leased call
 
-  agent: Refunded ORD-4417 in full.
-  gateway hits: 1 refund(s)
+  agent: Dispatched ORD-4417 with DHL.
+  courier hits: 1 dispatch(es)
 ```
 
 ## The integration
@@ -57,9 +57,9 @@ collide with LangChain's decorator of the same name.
 
 ```python
 @langchain_tool
-@leased(tool_name="issue_refund")
-def issue_refund(order_id: str, cents: int) -> str:
-    """Refunds `cents` to the card that paid for `order_id`. Irreversible."""
+@leased(tool_name="dispatch_order")
+def dispatch_order(order_id: str, courier: str) -> str:
+    """Hands `order_id` to `courier` for delivery. Cannot be recalled."""
 ```
 
 Read it bottom-up: Cellaflow leases the call, then LangChain gives the model its
@@ -69,7 +69,7 @@ a lease on it would buy nothing.
 **Around the run.**
 
 ```python
-config = {"configurable": {"thread_id": "refund-c244eccb"}}
+config = {"configurable": {"thread_id": "dispatch-05484de3"}}
 
 with durable_tools(config, target=ENGINE):
     app.invoke({"messages": [...]}, config)
@@ -91,7 +91,7 @@ where the context does not survive.
 
 `model.py` picks it. With `OPENAI_API_KEY` set the agent runs on `gpt-4o-mini`.
 Without one it runs on a scripted model that returns a fixed sequence of turns:
-call `lookup_order`, call `issue_refund`, answer.
+call `lookup_order`, call `dispatch_order`, answer.
 
 The scripted model is not part of the integration. The agent really calls the
 tools either way, and the leased tool really takes a lease; the only faked part
@@ -103,5 +103,5 @@ without an account, which the rest of `examples/` also does.
 It runs once, cleanly. Nothing crashes, so the output looks the same as it would
 with no lease at all. To see the lease answer a repeated call, run
 [`../../at_most_once_proof`](../../at_most_once_proof), which kills the process
-between the charge and the checkpoint and exits non-zero unless the leased arm
-charges once.
+between the confirmation and the checkpoint and exits non-zero unless the
+leased arm confirms once.
