@@ -6,9 +6,9 @@ Five, in the order they are worth reading.
 | --- | --- |
 | [`quickstart/`](quickstart/) | One file. An order is placed, the process dies, and the resumed run is handed the original confirmation instead of placing the order again. |
 | [`multi_agent_idempotency/`](multi_agent_idempotency/) | Five agents race to place the same customer order. One order reaches the shop; the others receive its confirmation. Five scenarios, including agents that disagree about the total and a LangGraph node killed after placing the order. |
-| [`at_most_once_proof/`](at_most_once_proof/) | The same LangGraph graph run twice, identical apart from the lease. Arm A charges twice, arm B once. It exits non-zero unless it reproduces that. |
+| [`at_most_once_proof/`](at_most_once_proof/) | The same LangGraph graph run twice, identical apart from the lease. Arm A confirms the booking twice, arm B once. It exits non-zero unless it reproduces that. |
 | [`crash_benchmark/`](crash_benchmark/) | Four ways to guard an irreversible tool call, measured against six failures. Two of them do not work, and the row where a lease does not help either is in the table. |
-| [`frameworks/`](frameworks/) | The same refund agent wired up on LangGraph, CrewAI and AutoGen. One run each, no crash: these answer how to wire it up, not what it buys you. |
+| [`frameworks/`](frameworks/) | The same dispatch agent wired up on LangGraph, CrewAI and AutoGen. One run each, no crash: these answer how to wire it up, not what it buys you. |
 
 Each directory has its own README. All of them need a running engine:
 

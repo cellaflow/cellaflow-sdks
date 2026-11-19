@@ -69,13 +69,13 @@ def build_model(order_id: str) -> Tuple[BaseChatModel, str]:
                 content="",
                 tool_calls=[
                     {
-                        "name": "issue_refund",
-                        "args": {"order_id": order_id, "cents": 2499},
-                        "id": "call_refund",
+                        "name": "dispatch_order",
+                        "args": {"order_id": order_id, "courier": "DHL"},
+                        "id": "call_dispatch",
                     }
                 ],
             ),
-            AIMessage(content=f"Refunded {order_id} in full."),
+            AIMessage(content=f"Dispatched {order_id} with DHL."),
         ]
     )
     return scripted, "scripted (no OPENAI_API_KEY set)"

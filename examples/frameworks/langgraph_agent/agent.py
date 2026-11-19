@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A LangGraph agent whose refund tool is leased by Cellaflow.
+"""A LangGraph agent whose dispatch tool is leased by Cellaflow.
 
     pip install -r requirements.txt
     python agent.py
@@ -9,7 +9,7 @@ scripted model in model.py, which calls the same tools in the same order.
 
 The integration is two things:
 
-    @leased(tool_name="issue_refund")   on the tool that moves money
+    @leased(tool_name="dispatch_order")  on the call you cannot take back
     with durable_tools(config):         around invoke
 
 LangGraph copies the calling context into the executor it runs a node on, so a
@@ -36,38 +36,38 @@ ENGINE = os.environ.get("CELLAFLOW_TARGET", "localhost:50051")
 ORDER_ID = "ORD-4417"
 
 ORDERS = {
-    ORDER_ID: {"customer": "A. Okonkwo", "cents": 2499, "status": "delivered"},
+    ORDER_ID: {"customer": "A. Okonkwo", "items": 3, "status": "packed"},
 }
 
-# Appended to inside the tool body, so it counts what the payment gateway was
-# actually asked to do. A leased call answered from its record never enters the
-# body and never lands here.
-REFUNDS: List[str] = []
+# Appended to inside the tool body, so it counts what the courier was actually
+# asked to do. A leased call answered from its record never enters the body and
+# never lands here.
+DISPATCHES: List[str] = []
 
 
 @langchain_tool
 def lookup_order(order_id: str) -> str:
-    """Returns the customer, amount in cents, and status of an order."""
+    """Returns the customer, item count, and status of an order."""
     order = ORDERS.get(order_id)
     if order is None:
         return f"no such order: {order_id}"
     print(f"   lookup_order({order_id})")
-    return f"{order['customer']}, {order['cents']} cents, {order['status']}"
+    return f"{order['customer']}, {order['items']} items, {order['status']}"
 
 
 # Read bottom-up: Cellaflow leases the call, LangChain gives the model its
 # schema. Only the irreversible one is leased; `lookup_order` can be repeated
 # all day without consequence, and a lease on it would buy nothing.
 @langchain_tool
-@leased(tool_name="issue_refund")
-def issue_refund(order_id: str, cents: int) -> str:
-    """Refunds `cents` to the card that paid for `order_id`. Irreversible."""
-    REFUNDS.append(order_id)
-    print(f"   issue_refund({order_id}, {cents})  <- the leased call")
-    return f"refunded {cents} cents for {order_id}"
+@leased(tool_name="dispatch_order")
+def dispatch_order(order_id: str, courier: str) -> str:
+    """Hands `order_id` to `courier` for delivery. Cannot be recalled."""
+    DISPATCHES.append(order_id)
+    print(f"   dispatch_order({order_id}, {courier})  <- the leased call")
+    return f"dispatched {order_id} with {courier}"
 
 
-TOOLS = [lookup_order, issue_refund]
+TOOLS = [lookup_order, dispatch_order]
 
 
 def build_agent(model: Any) -> Any:
@@ -93,7 +93,7 @@ def main() -> int:
     # Any id the application already uses for the conversation works. Cellaflow
     # derives the tool session from it, so the same thread always reaches the
     # same leases.
-    config = {"configurable": {"thread_id": f"refund-{uuid.uuid4().hex[:8]}"}}
+    config = {"configurable": {"thread_id": f"dispatch-{uuid.uuid4().hex[:8]}"}}
 
     print(f"\n  engine: {ENGINE}")
     print(f"  model:  {model_label}")
@@ -101,12 +101,12 @@ def main() -> int:
 
     with durable_tools(config, target=ENGINE):
         result = app.invoke(
-            {"messages": [("user", f"Refund order {ORDER_ID} in full.")]},
+            {"messages": [("user", f"Dispatch order {ORDER_ID} to the courier.")]},
             config,
         )
 
     print(f"\n  agent: {result['messages'][-1].content}")
-    print(f"  gateway hits: {len(REFUNDS)} refund(s)\n")
+    print(f"  courier hits: {len(DISPATCHES)} dispatch(es)\n")
     return 0
 
 

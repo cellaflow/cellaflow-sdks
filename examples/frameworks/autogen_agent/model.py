@@ -47,8 +47,8 @@ def build_model(order_id: str) -> Tuple[ChatCompletionClient, str]:
     scripted = ReplayChatCompletionClient(
         [
             _call("lookup_order", {"order_id": order_id}, "call_lookup"),
-            _call("issue_refund", {"order_id": order_id, "cents": 2499}, "call_refund"),
-            f"Refunded {order_id} in full.",
+            _call("dispatch_order", {"order_id": order_id, "courier": "DHL"}, "call_dispatch"),
+            f"Dispatched {order_id} with DHL.",
         ],
         model_info=ModelInfo(
             vision=False,

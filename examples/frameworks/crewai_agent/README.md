@@ -1,6 +1,6 @@
 # CrewAI
 
-A refund agent with two tools. The one that moves money is leased.
+A dispatch agent with two tools. The one you cannot take back is leased.
 
 ## Starting the engine
 
@@ -39,13 +39,13 @@ If your engine is somewhere other than `localhost:50051`, set
 ```
   engine: localhost:50051
   model:  scripted (no OPENAI_API_KEY set)
-  thread: refund-289120f0
+  thread: dispatch-ddb2f74c
 
    lookup_order(ORD-4417)
-   issue_refund(ORD-4417, 2499)  <- the leased call
+   dispatch_order(ORD-4417, DHL)  <- the leased call
 
-  agent: Refunded ORD-4417 in full.
-  gateway hits: 1 refund(s)
+  agent: Dispatched ORD-4417 with DHL.
+  courier hits: 1 dispatch(es)
 ```
 
 ## The integration
@@ -56,10 +56,10 @@ Two lines, both in `agent.py`.
 collide with CrewAI's decorator of the same name.
 
 ```python
-@crewai_tool("issue_refund")
-@leased(tool_name="issue_refund")
-def issue_refund(order_id: str, cents: int) -> str:
-    """Refunds `cents` to the card that paid for `order_id`. Irreversible."""
+@crewai_tool("dispatch_order")
+@leased(tool_name="dispatch_order")
+def dispatch_order(order_id: str, courier: str) -> str:
+    """Hands `order_id` to `courier` for delivery. Cannot be recalled."""
 ```
 
 Read it bottom-up: Cellaflow leases the call, then CrewAI builds the schema the
@@ -92,9 +92,9 @@ tool to name its own:
 with durable_tools(thread_id, target=ENGINE) as session:
     ...
 
-def issue_refund(order_id: str, cents: int) -> str:
+def dispatch_order(order_id: str, courier: str) -> str:
     with session.bind():
-        return _issue_refund(order_id, cents)
+        return _dispatch_order(order_id, courier)
 ```
 
 The [AutoGen example](../autogen_agent/) next door needs that fallback for every
@@ -127,5 +127,5 @@ turns it off, as does `OTEL_SDK_DISABLED=true`.
 It runs once, cleanly. Nothing crashes, so the output looks the same as it would
 with no lease at all. To see the lease answer a repeated call, run
 [`../../at_most_once_proof`](../../at_most_once_proof), which kills the process
-between the charge and the checkpoint and exits non-zero unless the leased arm
-charges once.
+between the confirmation and the checkpoint and exits non-zero unless the
+leased arm confirms once.
