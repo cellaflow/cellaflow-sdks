@@ -457,23 +457,41 @@ class CellaflowClient:
         when refused. Both fields are optional on the wire; omitting `sequence`
         keeps the position unguarded.
         """
-        req = idempotency_pb2.CheckCacheRequest(
-            agent_id=agent_id,
-            idempotency_key=idempotency_key,
+        req = _check_request(
+            agent_id,
+            idempotency_key,
+            wait_timeout_ms,
+            lease_ttl_ms,
+            session_id,
+            sequence,
         )
-        if wait_timeout_ms is not None:
-            req.wait_timeout_ms = wait_timeout_ms
-        if lease_ttl_ms is not None:
-            req.lease_ttl_ms = lease_ttl_ms
-        if session_id is not None:
-            req.session_id = session_id
-        if sequence is not None:
-            req.sequence = sequence
-
         return cast(
             idempotency_pb2.CheckCacheResponse,
             self.stub.CheckIdempotencyCache(req, timeout=timeout),
         )
+
+    def check_idempotency_cache_future(
+        self,
+        agent_id: str,
+        idempotency_key: str,
+        wait_timeout_ms: Optional[int] = None,
+        lease_ttl_ms: Optional[int] = None,
+        session_id: Optional[str] = None,
+        sequence: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> "grpc.Future":
+        """As `check_idempotency_cache`, without blocking: returns the call as a
+        `grpc.Future`, which can be cancelled. Lets a caller wait while the engine
+        holds the request without holding a thread for it."""
+        req = _check_request(
+            agent_id,
+            idempotency_key,
+            wait_timeout_ms,
+            lease_ttl_ms,
+            session_id,
+            sequence,
+        )
+        return self.stub.CheckIdempotencyCache.future(req, timeout=timeout)
 
     def renew_lease(
         self,
@@ -525,3 +543,28 @@ class CellaflowClient:
 
     def close(self) -> None:
         self.channel.close()
+
+
+def _check_request(
+    agent_id: str,
+    idempotency_key: str,
+    wait_timeout_ms: Optional[int],
+    lease_ttl_ms: Optional[int],
+    session_id: Optional[str],
+    sequence: Optional[int],
+) -> idempotency_pb2.CheckCacheRequest:
+    """The request `check_idempotency_cache` sends; the optional fields are left
+    unset when not given."""
+    req = idempotency_pb2.CheckCacheRequest(
+        agent_id=agent_id,
+        idempotency_key=idempotency_key,
+    )
+    if wait_timeout_ms is not None:
+        req.wait_timeout_ms = wait_timeout_ms
+    if lease_ttl_ms is not None:
+        req.lease_ttl_ms = lease_ttl_ms
+    if session_id is not None:
+        req.session_id = session_id
+    if sequence is not None:
+        req.sequence = sequence
+    return req

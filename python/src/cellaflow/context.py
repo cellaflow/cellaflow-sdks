@@ -956,7 +956,9 @@ class WorkflowContext:
             )
         agent_id = pending["agent_id"]
         unreleased = pending.get("unreleased")
-        if unreleased is not None:
+        # Without its token (a grant whose answer was lost) the lease cannot be
+        # released, only waited out.
+        if unreleased is not None and unreleased["token"]:
             # The failed step's own lease still claims this position, so the
             # engine would refuse the record. Try the release again first.
             try:
@@ -974,6 +976,12 @@ class WorkflowContext:
                     # Already released or lapsed: nothing is left to free.
                     pending["unreleased"] = None
         try:
+            # Asked without a wait, unlike a call's own lease. This runs under
+            # the session's lock, which also guards every call's bookkeeping,
+            # so a request the engine held for seconds would stall them all. A
+            # held record is rare (an earlier attempt that could not release
+            # it, or a replica writing the same record): the caller sleeps on
+            # `_RecordHeld` outside the lock and asks again.
             resp = self.client.check_idempotency_cache(
                 agent_id=agent_id,
                 idempotency_key=key,
@@ -989,6 +997,9 @@ class WorkflowContext:
             if (
                 unreleased is not None
                 and exc.code() == grpc.StatusCode.FAILED_PRECONDITION
+                # A committed position never takes the record, whatever lease
+                # once claimed it, so there is nothing to wait out.
+                and "is already committed" not in _details(exc)
             ):
                 remaining = unreleased["lapses_at"] + _LAPSE_GRACE_S - time.monotonic()
                 if remaining > 0:
@@ -1157,3 +1168,9 @@ def set_context(context: WorkflowContext) -> contextvars.Token[WorkflowContext]:
 
 def reset_context(token: contextvars.Token[WorkflowContext]) -> None:
     _current_context.reset(token)
+
+
+def _details(exc: grpc.RpcError) -> str:
+    """An engine error's message, or "" for an error that carries none."""
+    details = getattr(exc, "details", None)
+    return (details() if callable(details) else None) or ""
