@@ -5,10 +5,18 @@ import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { failureIdempotencyKey, recordIdempotencyKey } from "./idempotency.js";
 import { checkLeaseTtlMs } from "./lease.js";
 import {
+  ENGINE_WAIT_DEADLINE_SECS,
+  ENGINE_WAIT_MS,
+  MAX_UNANSWERED,
+  RELEASE_DEADLINE_SECS,
+  afterInProgress,
+} from "./wait.js";
+import {
   errorCode,
   hasStatusCode,
   isFailedPrecondition,
   isNotFound,
+  isPositionCommitted,
   isRetryable,
 } from "./errors.js";
 
@@ -39,6 +47,7 @@ interface PendingHit {
 export interface UnreleasedLease {
   agentId: string;
   key: string;
+  /** 0 when the lease's token is unknown: a grant whose answer was lost. */
   token: number;
   /** How long it can still last, from when the heartbeat stopped. */
   lapsesInMs: number;
@@ -448,22 +457,29 @@ export class WorkflowContext {
         ? failureIdempotencyKey(this.sessionId, pending.sequence, pending.name, pending.receivedKey)
         : recordIdempotencyKey(this.sessionId, pending.sequence, pending.receivedKey);
     let token = 0;
+    let unanswered = 0;
     for (;;) {
       await this.retryRelease(pending);
       let resp;
+      const sentAt = performance.now();
       try {
         resp = await this.client.checkIdempotencyCache(
           pending.agentId,
           key,
-          undefined,
+          // Wait in the engine behind a live lease on the record, as a call
+          // waits behind its holder.
+          ENGINE_WAIT_MS,
           // The same TTL as the call it records.
           pending.leaseTtlMs,
           this.sessionId,
           pending.sequence,
+          ENGINE_WAIT_DEADLINE_SECS,
         );
       } catch (err) {
         const held = pending.unreleased;
-        if (held && isFailedPrecondition(err)) {
+        // A committed position never takes the record, whatever lease once
+        // claimed it, so there is nothing to wait out.
+        if (held && isFailedPrecondition(err) && !isPositionCommitted(err)) {
           const remaining = (held.lapsesAt ?? 0) - Date.now();
           if (remaining > 0) {
             // Refused because of that lease, which lapses on its own: wait for
@@ -474,18 +490,26 @@ export class WorkflowContext {
           // Lapsed, so the refusal is someone else's claim.
           pending.unreleased = undefined;
         }
+        if (isRetryable(err) && unanswered < MAX_UNANSWERED) {
+          // No answer: the engine may have granted it, and asking again with
+          // the same key waits that lease out, as a call does.
+          unanswered += 1;
+          await sleep(200 * unanswered);
+          continue;
+        }
         // Anything else, including an error that may pass, keeps the lease, so
         // the next attempt still retries the release or waits for the lapse.
         throw err;
       }
+      unanswered = 0;
       // Written by an earlier attempt whose answer was lost.
       if (resp.status === CacheStatus.HIT) return;
       if (resp.status === CacheStatus.IN_PROGRESS) {
         // A live lease on this record: an earlier attempt that could not release
-        // it, or a replica writing the same record. It commits or lapses, so wait
-        // and ask again. The await leaves the event loop free; only this session's
-        // calls wait, behind the record, as they must.
-        await sleep(Number(resp.retryAfterMs ?? 1000n));
+        // it, or a replica writing the same record. It commits or lapses, and the
+        // engine has waited for that; ask again. The await leaves the event loop
+        // free; only this session's calls wait, behind the record, as they must.
+        await afterInProgress(sentAt, ENGINE_WAIT_MS, resp.retryAfterMs);
         continue;
       }
       if (resp.status !== CacheStatus.ACQUIRED) {
@@ -506,7 +530,7 @@ export class WorkflowContext {
         pending.coordinationId,
       );
     } catch (err) {
-      await this.client.releaseLease(pending.agentId, key, token, "TOOL_ERROR").catch(() => {
+      await this.client.releaseLease(pending.agentId, key, token, "TOOL_ERROR", RELEASE_DEADLINE_SECS).catch(() => {
         // The lease lapses on its own. Losing the release is not worth masking the
         // error that caused it.
       });
@@ -521,13 +545,15 @@ export class WorkflowContext {
    */
   private async retryRelease(pending: PendingHit): Promise<void> {
     const unreleased = pending.unreleased;
-    if (!unreleased) return;
+    // Without its token the lease cannot be released, only waited out.
+    if (!unreleased || unreleased.token === 0) return;
     try {
       await this.client.releaseLease(
         unreleased.agentId,
         unreleased.key,
         unreleased.token,
         "TOOL_ERROR",
+        RELEASE_DEADLINE_SECS,
       );
       pending.unreleased = undefined;
     } catch (err) {

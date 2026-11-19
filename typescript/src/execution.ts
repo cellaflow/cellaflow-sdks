@@ -5,6 +5,7 @@ import { CellaflowClient } from "./client.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { LeaseHeartbeat } from "./lease.js";
 import type { LeaseEvent } from "./lease.js";
+import { RELEASE_DEADLINE_SECS } from "./wait.js";
 
 const DEFAULT_TTL_MS = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
@@ -397,7 +398,17 @@ export async function executionLease<T>(
   try {
     const acquiredSentAt = performance.now();
     const acquiredSentWallAt = Date.now();
-    const resp = await client.checkIdempotencyCache(workerId, key, waitMs, ttlMs);
+    // A waiting request gets a deadline past its wait, so a connection that
+    // dies while the engine holds it fails the block rather than hanging it.
+    const resp = await client.checkIdempotencyCache(
+      workerId,
+      key,
+      waitMs,
+      ttlMs,
+      undefined,
+      undefined,
+      waitMs > 0 ? (waitMs + 5_000) / 1000 : undefined,
+    );
 
     if (resp.status === CacheStatus.HIT) {
       throw new LeaseNotAcquired(
@@ -459,23 +470,10 @@ export async function executionLease<T>(
         }
       },
     });
-    if (waitMs > 0) {
-      // The engine may have waited before granting, so the lease can be much
-      // younger than the request that won it, and a deadline counted from that
-      // request would read a fresh lease as nearly expired. A renewal sent now
-      // gives a deadline counted from a known time. One failed attempt is not a
-      // loss, so try a few, backing off, while the lease, counted from when the
-      // grant arrived, could still be live. If none is confirmed, the deadline
-      // counted from the request still bounds the lease from below (the grant
-      // came after it), so the block runs only if that has not passed.
-      const windowEnd = performance.now() + ttlMs - hb.marginMs;
-      for (let attempt = 0; attempt < 3 && !hb.lost; attempt++) {
-        if (await hb.renewNow()) break;
-        const pause = Math.min(100 * 2 ** attempt, windowEnd - performance.now());
-        if (pause <= 0) break;
-        await new Promise((resolve) => setTimeout(resolve, pause));
-      }
-    }
+    // The engine may have waited before granting, so the lease can be much
+    // younger than the request that won it. The block runs only if the
+    // deadline that leaves has not passed.
+    if (waitMs > 0) await hb.confirmGrant();
     // A lease already lost before the block starts must not run it: a block
     // that acts before its first check() would act on a lease this side has
     // already given up.
@@ -495,7 +493,7 @@ export async function executionLease<T>(
     await hb?.stop();
     if (fencingToken > 0) {
       await client
-        .releaseLease(workerId, key, fencingToken, "BLOCK_EXIT")
+        .releaseLease(workerId, key, fencingToken, "BLOCK_EXIT", RELEASE_DEADLINE_SECS)
         .then((released) => {
           // Only a release the engine confirms: if another worker holds the
           // lease by now, there was nothing of this worker's to release.
