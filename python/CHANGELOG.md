@@ -21,7 +21,8 @@ All notable changes to the Cellaflow Python SDK.
   request run for at least 15 s. An engine that answers at once without waiting is asked again
   after its `retry_after_ms`, as before. The lease that records a shared result or failure in the
   session still asks without waiting: it is requested under the session's lock, and a held record
-  is rare.
+  is rare. A test double standing in for `CellaflowClient` now receives `wait_timeout_ms`
+  and `timeout` on `check_idempotency_cache`.
 - **A lease granted after a wait is counted from when it was granted.** The lease can be much younger
   than the request that won it, so the call sends a renewal before the body starts and counts the
   lease from that. A grant that comes back within half a renewal interval (an eighth of the TTL)

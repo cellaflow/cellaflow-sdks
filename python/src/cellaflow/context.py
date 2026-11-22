@@ -65,9 +65,10 @@ _REFUSAL_COPY = "_cellaflow_refusal_copy"
 _FINAL_HELD_WAIT_S = 5.0
 #: How long the last failure record keeps retrying errors that may pass, in a
 #: row, before it is dropped. Longer than the default lease lapses it may wait
-#: for (about 27 s at the engine's 20 s TTL), so those runs wait as they always
-#: have, while a long `lease_ttl_ms` cannot hold the return through an outage.
-_FINAL_ERROR_WAIT_S = 30.0
+#: for (about 38 s at the engine's 20 s TTL, for a call cancelled while its
+#: request could still be granted), so those runs wait as they always have,
+#: while a long `lease_ttl_ms` cannot hold the return through an outage.
+_FINAL_ERROR_WAIT_S = 45.0
 #: Between tries of the last failure record after an error that may pass.
 _FINAL_RETRY_S = 0.5
 #: How long after its estimated lapse a failed step's unreleased lease is still

@@ -2,6 +2,7 @@ import functools
 import inspect
 import uuid
 import asyncio
+import concurrent.futures
 import time
 import threading
 import logging
@@ -718,6 +719,47 @@ def _unconfirmed(name: str, handed_back: int, hb: LeaseHeartbeat) -> LeaseNotAcq
     )
 
 
+#: The client's own request methods, as shipped, so a patch on the class or the
+#: instance is recognised as an override.
+_STOCK_CHECK = CellaflowClient.check_idempotency_cache
+_STOCK_FUTURE = CellaflowClient.check_idempotency_cache_future
+
+
+def _sends_its_own_future(client: Any) -> bool:
+    """Whether `client.check_idempotency_cache_future` is the request an async
+    step should wait on: true of a `CellaflowClient` whose blocking request is
+    not overridden, on its class or on the instance. One that overrides only the
+    blocking request (instrumentation, a fake) would be bypassed by the future."""
+    cls = type(client)
+    instance = getattr(client, "__dict__", {})
+    if "check_idempotency_cache" in instance:
+        return False
+    if getattr(cls, "check_idempotency_cache", None) is _STOCK_CHECK:
+        return getattr(cls, "check_idempotency_cache_future", None) is not None
+    # The blocking request is overridden: the future goes along only if it is
+    # overridden too.
+    future = getattr(cls, "check_idempotency_cache_future", None)
+    return future not in (None, _STOCK_FUTURE)
+
+
+def _blocking_request(
+    call: Callable[..., Any], kwargs: Dict[str, Any]
+) -> "concurrent.futures.Future[Any]":
+    """Runs a blocking request on a daemon thread of its own, as a future the
+    async bridge waits on like a gRPC one."""
+    future: "concurrent.futures.Future[Any]" = concurrent.futures.Future()
+    future.set_running_or_notify_cancel()
+
+    def run() -> None:
+        try:
+            future.set_result(call(**kwargs))
+        except BaseException as exc:
+            future.set_exception(exc)
+
+    threading.Thread(target=run, daemon=True).start()
+    return future
+
+
 async def _arbitrate_async(
     ctx: WorkflowContext,
     agent_id: str,
@@ -738,9 +780,9 @@ async def _arbitrate_async(
     TTL. Whatever it is granted is handed back, since nothing will run the body
     under it.
 
-    A client that does not return a `grpc.Future` (a test double), or that
-    overrides `check_idempotency_cache` but not `check_idempotency_cache_future`,
-    is asked from a worker thread instead."""
+    A client that does not return a future (a test double), or that overrides
+    `check_idempotency_cache` but not `check_idempotency_cache_future`, is asked
+    on a thread of its own, through the same bridge."""
     kwargs: Dict[str, Any] = dict(
         agent_id=agent_id,
         idempotency_key=ikey,
@@ -753,20 +795,16 @@ async def _arbitrate_async(
         sequence=seq,
         timeout=_ENGINE_WAIT_DEADLINE_S,
     )
-    send = getattr(ctx.client, "check_idempotency_cache_future", None)
-    cls = type(ctx.client)
-    if (
-        getattr(cls, "check_idempotency_cache", None)
-        is not CellaflowClient.check_idempotency_cache
-        and getattr(cls, "check_idempotency_cache_future", None)
-        is CellaflowClient.check_idempotency_cache_future
-    ):
-        # A client that overrides the blocking request but not this one (to
-        # instrument it, or to fake it) would be bypassed by the future.
-        send = None
-    request = send(**kwargs) if send is not None else None
-    if not isinstance(request, grpc.Future):
-        return await asyncio.to_thread(ctx.client.check_idempotency_cache, **kwargs)
+    request: Any = None
+    if _sends_its_own_future(ctx.client):
+        request = ctx.client.check_idempotency_cache_future(**kwargs)
+    if not isinstance(request, (grpc.Future, concurrent.futures.Future)):
+        # A test double, or a client whose blocking request is overridden (to
+        # instrument it, or to fake it), which the future would bypass. It is
+        # asked on a thread of its own rather than the loop's default
+        # executor, which heartbeats renew through: a crowd of waiters there
+        # would starve a holder's renewals.
+        request = _blocking_request(ctx.client.check_idempotency_cache, kwargs)
 
     loop = asyncio.get_running_loop()
     answer: "asyncio.Future[Any]" = loop.create_future()

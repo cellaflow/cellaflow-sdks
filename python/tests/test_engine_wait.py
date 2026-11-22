@@ -876,3 +876,109 @@ async def test_an_async_step_uses_a_clients_own_blocking_request() -> None:
     with session(client).bind():
         assert await step(charge_card)() == "charged"
     assert len(client.acquires) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_blocking_only_client_does_not_wait_on_the_default_executor() -> None:
+    # The loop's default executor is busy (as heartbeats and other waiters can
+    # make it). A waiting request run there would queue behind it; asked on a
+    # thread of its own, it doesn't.
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
+    busy = loop.run_in_executor(None, time.sleep, 2.0)
+    client = BlockingOnly([Answer(acquired(7), blocks_s=0.1)])
+
+    async def charge_card() -> str:
+        return "charged"
+
+    started = time.monotonic()
+    with session(client).bind():
+        assert await step(charge_card)() == "charged"
+    assert time.monotonic() - started < 1.0
+    await busy
+
+
+@pytest.mark.asyncio
+async def test_a_blocking_request_patched_on_the_instance_is_used() -> None:
+    client = WaitClient([Answer(acquired(7))])
+    seen: List[str] = []
+    original = client.check_idempotency_cache
+
+    def counting(**kw: Any) -> Any:
+        seen.append(kw["idempotency_key"])
+        return original(**kw)
+
+    client.check_idempotency_cache = counting  # type: ignore[method-assign]
+
+    async def charge_card() -> str:
+        return "charged"
+
+    with session(client).bind():
+        assert await step(charge_card)() == "charged"
+    assert len(seen) == 1
+    assert client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_an_async_refusal_for_a_claimed_position_is_a_divergent_step() -> None:
+    from cellaflow.decorators import DivergentStepError
+
+    client = WaitClient([Answer(None, raises=Refused())])
+
+    async def charge_card() -> str:
+        return "charged"
+
+    with session(client).bind():
+        with pytest.raises(DivergentStepError):
+            await step(charge_card)()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_waiters_record_waits_for_its_request_to_end() -> None:
+    # Its request runs on to its deadline, so the lease it may be granted can
+    # come that much later: the record waits for that too.
+    client = WaitClient([Answer(acquired(9), blocks_s=1.0)])
+
+    async def charge_card() -> str:
+        return "charged"
+
+    ctx = session(client)
+    with ctx.bind():
+        task = asyncio.ensure_future(step(charge_card, lease_ttl_ms=3000)())
+        await until(lambda: bool(client.requests))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        pending = ctx._pending_hit
+        assert pending is not None and pending["unreleased"] is not None
+        assert pending["unreleased"]["lapses_in_s"] >= 3.0 + 15.0
+
+
+def test_a_lost_answer_keeps_the_longer_wait_of_a_kept_lease(clocks: Clocks) -> None:
+    # A late grant is handed back but its release fails, so the call keeps it.
+    # The next request's answer is lost. The record must wait out whichever
+    # lapses later.
+    client = WaitClient(
+        [
+            Answer(acquired(7, 750), waited_s=10.0, expires_in_ms=2900),
+            Answer(None, raises=DeadlineExceeded()),
+            Answer(None, raises=Unavailable()),
+            Answer(None, raises=Unavailable()),
+        ],
+        clocks,
+        fail_renewals=lambda token: True,
+        fail_releases=True,
+    )
+
+    def charge_card() -> str:
+        return "charged"
+
+    ctx = session(client)
+    with ctx.bind():
+        with pytest.raises(grpc.RpcError):
+            step(charge_card, lease_ttl_ms=3000)()
+        pending = ctx._pending_hit
+        assert pending is not None and pending["unreleased"] is not None
+        # The kept lease lasts a renewal's timeout (1 s) plus its TTL (3 s)
+        # plus 1 s; the lost answer alone would be 3 s plus 1 s.
+        assert pending["unreleased"]["lapses_in_s"] > 4.5
