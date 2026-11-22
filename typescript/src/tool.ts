@@ -3,9 +3,28 @@ import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { getContext, type UnreleasedLease, type WorkflowContext } from "./context.js";
 import { IdempotencyScope, deriveIdempotencyKey, normalizeCoordinationId } from "./idempotency.js";
-import { LeaseHandle, LeaseLostError, runUnderLease, runWithoutLease } from "./execution.js";
+import { LeaseHandle, LeaseLostError, LeaseNotAcquired, runUnderLease, runWithoutLease } from "./execution.js";
 import { LeaseHeartbeat, checkLeaseTtlMs } from "./lease.js";
 import { deserialize, serialize } from "./serialization.js";
+import {
+  ENGINE_WAIT_DEADLINE_SECS,
+  ENGINE_WAIT_MS,
+  MAX_UNANSWERED,
+  RELEASE_DEADLINE_SECS,
+  afterInProgress,
+} from "./wait.js";
+
+/**
+ * How many granted leases a call hands back, unconfirmed, before it fails
+ * rather than asking again. A healthy engine needs none: a lease released at
+ * once is granted again at once, so the next grant is not late.
+ */
+const MAX_HAND_BACKS = 3;
+
+/** The engine's default lease TTL, for a call that asked for none. */
+const ENGINE_DEFAULT_TTL_MS = 20_000;
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * Raised when the engine refuses a lease because another agent already owns the
@@ -80,8 +99,6 @@ export interface ToolOptions {
 export type LeasedTool<A extends unknown[], R> = ((...args: A) => Promise<R>) & {
   withCoordinationId(coordinationId: string): (...args: A) => Promise<R>;
 };
-
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * Wraps a function so the engine runs it at most once per idempotency key, and
@@ -261,6 +278,8 @@ export function tool<A extends unknown[], R>(
 
     // Arbitrate. Loop because IN_PROGRESS means another worker holds it and the
     // right move is to wait for their result rather than to act.
+    let handedBack = 0;
+    let unanswered = 0;
     for (;;) {
       let resp;
       const acquiredSentAt = performance.now();
@@ -269,13 +288,18 @@ export function tool<A extends unknown[], R>(
         resp = await ctx.client.checkIdempotencyCache(
           agentId,
           ikey,
-          0,
+          // Wait in the engine while another worker holds the call: it answers
+          // the moment that worker commits, or grants the lease the moment it
+          // is released or lapses, and every waiter on the key shares one
+          // watcher there instead of each polling.
+          ENGINE_WAIT_MS,
           leaseTtlMs,
           ctx.sessionId,
           // Tell the engine where this call intends to write, so a lease at an
           // already-committed position is refused before the body runs rather
           // than after.
           seq,
+          ENGINE_WAIT_DEADLINE_SECS,
         );
       } catch (err) {
         if (isFailedPrecondition(err)) {
@@ -285,8 +309,29 @@ export function tool<A extends unknown[], R>(
             err,
           );
         }
+        if (isRetryable(err)) {
+          // The engine may have granted the request, a lease nobody here knows
+          // the token of, which claims this position until it lapses. Kept
+          // until a grant shows it is gone, so whatever fails the call from
+          // here leaves the failure record waiting it out rather than refused
+          // by it.
+          known.unreleased = {
+            agentId,
+            key: ikey,
+            token: 0,
+            lapsesInMs: (leaseTtlMs ?? ENGINE_DEFAULT_TTL_MS) + 1000,
+          };
+          if (unanswered < MAX_UNANSWERED) {
+            unanswered += 1;
+            await sleep(200 * unanswered);
+            continue;
+          }
+        }
         throw err;
       }
+
+      // An answer: only failures since the last one count towards giving up.
+      unanswered = 0;
 
       if (resp.status === CacheStatus.HIT) {
         // A hit returns without executing. When nothing is recorded at `seq` yet,
@@ -312,11 +357,14 @@ export function tool<A extends unknown[], R>(
       }
 
       if (resp.status === CacheStatus.IN_PROGRESS) {
-        await sleep(Number(resp.retryAfterMs ?? 1000n));
+        await afterInProgress(acquiredSentAt, ENGINE_WAIT_MS, resp.retryAfterMs);
         continue;
       }
 
       if (resp.status === CacheStatus.ACQUIRED) {
+        // A lease handed back below and not released has lapsed or been
+        // released by now, or the engine would not grant the key again.
+        known.unreleased = undefined;
         fencingToken = Number(resp.fencingToken ?? 0n);
         const engineInterval = Number(resp.heartbeatIntervalMs ?? 0n);
         const suggested = engineInterval > 0 ? engineInterval : 5000;
@@ -338,6 +386,11 @@ export function tool<A extends unknown[], R>(
           ikey,
         );
         handle = leaseHandle;
+        // A grant that came back after more than half an interval came after a
+        // wait in the engine, so it can be much younger than the request, and
+        // is counted from a renewal instead (below). Up to that, counting from
+        // the request costs the lease less than its margin.
+        const late = performance.now() - acquiredSentAt > intervalMs / 2;
         hb = new LeaseHeartbeat({
           client: ctx.client,
           agentId,
@@ -350,13 +403,48 @@ export function tool<A extends unknown[], R>(
           leaseTtlMs,
           acquiredSentAt,
           acquiredSentWallAt,
-          acquiredExpiresAtMs: resp.leaseExpiresAtMs !== undefined ? Number(resp.leaseExpiresAtMs) : undefined,
+          // Read against the request's send time, so only for a grant that
+          // answered at once.
+          acquiredExpiresAtMs:
+            !late && resp.leaseExpiresAtMs !== undefined ? Number(resp.leaseExpiresAtMs) : undefined,
           onLeaseLost: (detail) => {
             if (releasing) return;
             if (committing) lossDuringCommit = detail;
             else leaseHandle.markLost(detail);
           },
         });
+        if (late) await hb.confirmGrant();
+        if (leaseHandle.isLost) {
+          // Neither the renewal nor the request can show the lease is still
+          // held, so the body must not start under it: it would act on a lease
+          // this side has already given up. Nothing has run, so hand the lease
+          // back and ask again, which finds the call's result, waits behind its
+          // holder, or grants a lease this side can count on.
+          const lapsesInMs = hb.lastsAtMostMs + 1000;
+          const token = fencingToken;
+          const detail = hb.lostDetail ?? "no renewal was confirmed";
+          await hb.stop();
+          await ctx.client.releaseLease(agentId, ikey, token, "LEASE_UNCONFIRMED", RELEASE_DEADLINE_SECS).catch(() => {
+            // It lapses on its own, and asking again waits that out. Until it
+            // does, it still claims this position, so if the call fails, the
+            // failure record there retries the release or waits for it.
+            known.unreleased = { agentId, key: ikey, token, lapsesInMs };
+          });
+          hb = undefined;
+          handle = undefined;
+          fencingToken = 0;
+          handedBack += 1;
+          if (handedBack >= MAX_HAND_BACKS) {
+            // Every grant comes too late to count on and no renewal confirms
+            // one: the engine grants leases but will not renew them. Waiting
+            // longer only repeats that, so the call fails and says why.
+            throw new LeaseNotAcquired(
+              `Tool '${toolName}' could not confirm any of ${handedBack} leases the ` +
+                `engine granted it, so its body did not run: ${detail}.`,
+            );
+          }
+          continue;
+        }
         hb.start();
       }
       break;
@@ -462,7 +550,7 @@ export function tool<A extends unknown[], R>(
       if (fencingToken > 0 && !known.lost) {
         releasing = true;
         await ctx.client
-          .releaseLease(agentId, ikey, fencingToken, "TOOL_ERROR")
+          .releaseLease(agentId, ikey, fencingToken, "TOOL_ERROR", RELEASE_DEADLINE_SECS)
           .then((released) => {
             // Not released: the lease was no longer this call's to release.
             if (!released.released) known.lost = true;

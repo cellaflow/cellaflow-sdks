@@ -215,6 +215,11 @@ export class CellaflowClient {
    * afterwards once the side effect has happened. The engine raises
    * `FAILED_PRECONDITION` when refused. Both fields are optional on the wire;
    * omitting `sequence` keeps the position unguarded.
+   *
+   * @param timeoutSecs - Bounds the RPC in **seconds**. A caller that asks the
+   *   engine to wait must supply one longer than the wait: without a deadline,
+   *   a connection that dies while the engine holds the request leaves the
+   *   call waiting for an answer that never comes.
    */
   async checkIdempotencyCache(
     agentId: string,
@@ -222,7 +227,8 @@ export class CellaflowClient {
     waitTimeoutMs?: number,
     leaseTtlMs?: number,
     sessionId?: string,
-    sequence?: number
+    sequence?: number,
+    timeoutSecs?: number
   ): Promise<CheckCacheResponse> {
     const req: MessageInitShape<typeof CheckCacheRequestSchema> = { agentId, idempotencyKey };
     // These proto fields are uint64 → bigint; convert from the JS number API.
@@ -239,7 +245,9 @@ export class CellaflowClient {
       req.sequence = BigInt(sequence);
     }
 
-    return await this.client.checkIdempotencyCache(req);
+    return await this.client.checkIdempotencyCache(req, {
+      timeoutMs: deadlineMs(timeoutSecs),
+    });
   }
 
   /**
@@ -268,10 +276,7 @@ export class CellaflowClient {
       // Guard against timeout=0 which would cause an instant timeout.
       // Whole milliseconds: the grpc-timeout header carries an integer, and a
       // fractional value is dropped by the server rather than rounded.
-      timeoutMs:
-        timeoutSecs !== undefined && timeoutSecs > 0
-          ? Math.max(1, Math.round(timeoutSecs * 1000))
-          : undefined,
+      timeoutMs: deadlineMs(timeoutSecs),
     });
   }
 
@@ -297,10 +302,7 @@ export class CellaflowClient {
     }
 
     return await this.client.releaseLease(req, {
-      timeoutMs:
-        timeoutSecs !== undefined && timeoutSecs > 0
-          ? Math.max(1, Math.round(timeoutSecs * 1000))
-          : undefined,
+      timeoutMs: deadlineMs(timeoutSecs),
     });
   }
 
@@ -316,4 +318,20 @@ export class CellaflowClient {
   close(): void {
     // No-op: Connect-ES does not provide a transport.close() API.
   }
+}
+
+/**
+ * The longest deadline a timer can hold. Node runs a longer one at once, so a
+ * deadline past it would fail the call immediately instead of never.
+ */
+const MAX_DEADLINE_MS = 2 ** 31 - 1;
+
+/**
+ * A call's deadline in whole milliseconds, or none. Whole: the grpc-timeout
+ * header carries an integer, and a fractional value is dropped by the server
+ * rather than rounded. Capped at what a timer can hold.
+ */
+function deadlineMs(timeoutSecs: number | undefined): number | undefined {
+  if (timeoutSecs === undefined || !(timeoutSecs > 0)) return undefined;
+  return Math.min(MAX_DEADLINE_MS, Math.max(1, Math.round(timeoutSecs * 1000)));
 }

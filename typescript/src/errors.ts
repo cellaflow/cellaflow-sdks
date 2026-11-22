@@ -38,6 +38,19 @@ export function isCommittedElsewhere(err: unknown): boolean {
 }
 
 /**
+ * Whether a lease was refused because its position is already committed. No
+ * lease's claim on the position explains that refusal, so it never passes by
+ * waiting.
+ */
+export function isPositionCommitted(err: unknown): boolean {
+  if (!isFailedPrecondition(err)) return false;
+  const message = (err as { message?: unknown } | undefined)?.message;
+  // Anchored on the engine's own wording, so an id or key quoted in another
+  // refusal cannot match it.
+  return typeof message === "string" && /' is already committed; the session is at \d+/.test(message);
+}
+
+/**
  * Status codes for a failure that may pass if the call is sent again. INTERNAL is
  * how the engine reports a failed storage write, which it does not retry itself,
  * and CANCELLED is the call being abandoned rather than refused.
