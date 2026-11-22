@@ -2,7 +2,12 @@
 
 All notable changes to the Cellaflow TypeScript SDK.
 
-## Unreleased
+## 0.12.0
+
+### Compatibility
+
+- Tested with engine 0.3.0: CI's integration tests run against `ghcr.io/cellaflow/cellaflow:0.3.0`.
+  CI also runs the tests on Node.js 18.14.1, the lowest version supported.
 
 ### Changed
 
