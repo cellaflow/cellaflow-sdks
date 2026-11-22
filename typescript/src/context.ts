@@ -483,7 +483,8 @@ export class WorkflowContext {
           const remaining = (held.lapsesAt ?? 0) - Date.now();
           if (remaining > 0) {
             // Refused because of that lease, which lapses on its own: wait for
-            // it, as for any held record.
+            // it, as for any held record. A refusal is an answer.
+            unanswered = 0;
             await sleep(Math.min(1000, remaining));
             continue;
           }

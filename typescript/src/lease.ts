@@ -403,6 +403,8 @@ export class LeaseHeartbeat {
     const windowEnd = performance.now() + this.opts.leaseTtlMs - this.marginMs;
     for (let attempt = 0; attempt < 3 && !this.lost; attempt++) {
       if (await this.renewNow()) return;
+      // Refused: there is nothing to retry.
+      if (this.lost) return;
       // No pause after the last attempt: it would only delay the body, or
       // the hand-back, while the lease runs down.
       if (attempt === 2) return;

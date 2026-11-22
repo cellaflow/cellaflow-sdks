@@ -10,7 +10,11 @@ import { RELEASE_DEADLINE_SECS } from "./wait.js";
 const DEFAULT_TTL_MS = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
 
-/** Raised when the requested execution lease cannot be acquired. */
+/**
+ * Raised when a lease cannot be acquired: by `executionLease` when another
+ * worker holds it, and by `tool()` when none of the leases the engine granted
+ * could be confirmed.
+ */
 export class LeaseNotAcquired extends Error {
   constructor(message: string) {
     super(message);

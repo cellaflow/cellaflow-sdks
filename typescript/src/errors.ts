@@ -45,7 +45,9 @@ export function isCommittedElsewhere(err: unknown): boolean {
 export function isPositionCommitted(err: unknown): boolean {
   if (!isFailedPrecondition(err)) return false;
   const message = (err as { message?: unknown } | undefined)?.message;
-  return typeof message === "string" && /is already committed/i.test(message);
+  // Anchored on the engine's own wording, so an id or key quoted in another
+  // refusal cannot match it.
+  return typeof message === "string" && /' is already committed; the session is at \d+/.test(message);
 }
 
 /**

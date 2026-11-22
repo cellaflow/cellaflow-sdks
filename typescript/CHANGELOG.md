@@ -16,7 +16,8 @@ All notable changes to the Cellaflow TypeScript SDK.
   unavailable, a dropped connection) is asked again, and after three in a row the call fails, so a
   lost connection to the engine is noticed. A proxy between the SDK and the engine must let a
   request run for at least 15 s. Releases get a 5 s deadline. An engine that answers at once
-  without waiting is asked again after its `retryAfterMs`, as before.
+  without waiting is asked again after its `retryAfterMs`, as before, now kept between 50 ms and
+  60 s.
 - **A lease granted after a wait is counted from when it was granted.** The lease can be much younger
   than the request that won it, so the call sends a renewal before the body starts and counts the
   lease from that, as `executionLease` already did with `waitMs`. A grant that comes back within half

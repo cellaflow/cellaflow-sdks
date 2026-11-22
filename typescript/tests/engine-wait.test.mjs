@@ -552,7 +552,10 @@ test("a call failed by a refusal after an unanswered request still leaves its re
 test("a record refused at a committed position does not wait out a lost lease", async () => {
   // The lost answer's lease may still claim the position, but a committed
   // position never takes the record whatever claims it: waiting is wasted.
-  const committed = { throws: 9, message: "Sequence 1 in session 's-wait' is already committed" };
+  const committed = {
+    throws: 9,
+    message: "Sequence 1 in session 's-wait' is already committed; the session is at 1.",
+  };
   const client = scriptedClient([{ throws: 14 }, { throws: 14 }, { throws: 14 }, acquired(9n)], {
     recordAnswers: [committed],
   });
@@ -565,4 +568,40 @@ test("a record refused at a committed position does not wait out a lost lease", 
     assert.ok(performance.now() - started < 1000, "the record waited for a lease at a committed position");
   });
   assert.equal(client.recordAcquires.length, 1);
+});
+
+test("a refusal while the record waits out a lease counts as an answer", async () => {
+  // Lost answers spread between refusals must not add up to giving up.
+  const claimed = {
+    throws: 9,
+    message: "Sequence 1 in session 's-wait' is already claimed by a different step identity",
+  };
+  const lost = { throws: 14 };
+  const client = scriptedClient([{ throws: 14 }, { throws: 14 }, { throws: 14 }, acquired(9n)], {
+    recordAnswers: [lost, claimed, lost, claimed, lost],
+  });
+  const charge = tool(async () => "charged", { toolName: "charge_card", ttlMs: 1000 });
+  const next = tool(async () => "next", { toolName: "next_step" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), (err) => err.code === 14);
+    assert.equal(await next(), "next");
+  });
+  assert.equal(client.recordAcquires.length, 6);
+});
+
+test("a claim refusal that quotes the committed wording is not read as a committed position", async () => {
+  const { isPositionCommitted } = await import("../dist/errors.js");
+  const committed = Object.assign(
+    new Error("Sequence 4 in session 's-1' is already committed; the session is at 4."),
+    { code: 9 },
+  );
+  const claimed = Object.assign(
+    new Error(
+      "Sequence 4 in session 's-1' is already claimed by a different step identity " +
+        "(key 'x is already committed', holder 'h')",
+    ),
+    { code: 9 },
+  );
+  assert.equal(isPositionCommitted(committed), true);
+  assert.equal(isPositionCommitted(claimed), false);
 });

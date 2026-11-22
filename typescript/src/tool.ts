@@ -21,11 +21,7 @@ import {
  */
 const MAX_HAND_BACKS = 3;
 
-/**
- * The engine's default lease TTL, for a call that asked for none: what engines
- * 0.2.0 and 0.3.0 grant. An engine configured with a longer default lets a lost
- * grant outlast this estimate, and the failure record then stops waiting early.
- */
+/** The engine's default lease TTL, for a call that asked for none. */
 const ENGINE_DEFAULT_TTL_MS = 20_000;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
