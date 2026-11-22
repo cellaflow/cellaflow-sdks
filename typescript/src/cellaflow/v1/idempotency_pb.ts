@@ -12,14 +12,17 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file cellaflow/v1/idempotency.proto.
  */
 export const file_cellaflow_v1_idempotency: GenFile = /*@__PURE__*/
-  fileDesc("Ch5jZWxsYWZsb3cvdjEvaWRlbXBvdGVuY3kucHJvdG8SDGNlbGxhZmxvdy52MSLoAQoRQ2hlY2tDYWNoZVJlcXVlc3QSEAoIYWdlbnRfaWQYASABKAkSFwoPaWRlbXBvdGVuY3lfa2V5GAIgASgJEhwKD3dhaXRfdGltZW91dF9tcxgDIAEoBEgAiAEBEhkKDGxlYXNlX3R0bF9tcxgEIAEoBEgBiAEBEhcKCnNlc3Npb25faWQYBSABKAlIAogBARIVCghzZXF1ZW5jZRgGIAEoBEgDiAEBQhIKEF93YWl0X3RpbWVvdXRfbXNCDwoNX2xlYXNlX3R0bF9tc0INCgtfc2Vzc2lvbl9pZEILCglfc2VxdWVuY2UixwMKEkNoZWNrQ2FjaGVSZXNwb25zZRIpCgZzdGF0dXMYASABKA4yGS5jZWxsYWZsb3cudjEuQ2FjaGVTdGF0dXMSNAoNY2FjaGVkX3Jlc3VsdBgCIAEoCzIYLmNlbGxhZmxvdy52MS5TdGVwUmVzdWx0SACIAQESGgoNZmVuY2luZ190b2tlbhgDIAEoBEgBiAEBEiAKE2xlYXNlX2V4cGlyZXNfYXRfbXMYBCABKARIAogBARIiChVoZWFydGJlYXRfaW50ZXJ2YWxfbXMYBSABKARIA4gBARIbCg5yZXRyeV9hZnRlcl9tcxgGIAEoBEgEiAEBEh4KEWN1cnJlbnRfaG9sZGVyX2lkGAcgASgJSAWIAQESHQoQY3VycmVudF9zZXF1ZW5jZRgIIAEoBEgGiAEBQhAKDl9jYWNoZWRfcmVzdWx0QhAKDl9mZW5jaW5nX3Rva2VuQhYKFF9sZWFzZV9leHBpcmVzX2F0X21zQhgKFl9oZWFydGJlYXRfaW50ZXJ2YWxfbXNCEQoPX3JldHJ5X2FmdGVyX21zQhQKEl9jdXJyZW50X2hvbGRlcl9pZEITChFfY3VycmVudF9zZXF1ZW5jZSJoChFSZW5ld0xlYXNlUmVxdWVzdBIQCghhZ2VudF9pZBgBIAEoCRIXCg9pZGVtcG90ZW5jeV9rZXkYAiABKAkSFQoNZmVuY2luZ190b2tlbhgDIAEoBBIRCglleHRlbmRfbXMYBCABKAQirQEKElJlbmV3TGVhc2VSZXNwb25zZRIPCgdyZW5ld2VkGAEgASgIEh4KEW5ld19leHBpcmVzX2F0X21zGAIgASgESACIAQESPQoOZmFpbHVyZV9yZWFzb24YAyABKA4yIC5jZWxsYWZsb3cudjEuUmVuZXdGYWlsdXJlUmVhc29uSAGIAQFCFAoSX25ld19leHBpcmVzX2F0X21zQhEKD19mYWlsdXJlX3JlYXNvbiJ3ChNSZWxlYXNlTGVhc2VSZXF1ZXN0EhAKCGFnZW50X2lkGAEgASgJEhcKD2lkZW1wb3RlbmN5X2tleRgCIAEoCRIVCg1mZW5jaW5nX3Rva2VuGAMgASgEEhMKBnJlYXNvbhgEIAEoCUgAiAEBQgkKB19yZWFzb24iKAoUUmVsZWFzZUxlYXNlUmVzcG9uc2USEAoIcmVsZWFzZWQYASABKAgqcAoQSWRlbXBvdGVuY3lTY29wZRIVChFTQ09QRV9VTlNQRUNJRklFRBAAEhYKElNDT1BFX1NFU1NJT05fV0lERRABEhcKE1NDT1BFX0FHRU5UX1BSSVZBVEUQAhIUChBTQ09QRV9TVEVQX0xPQ0FMEAMqegoLQ2FjaGVTdGF0dXMSHAoYQ0FDSEVfU1RBVFVTX1VOU1BFQ0lGSUVEEAASFAoQQ0FDSEVfU1RBVFVTX0hJVBABEhkKFUNBQ0hFX1NUQVRVU19BQ1FVSVJFRBACEhwKGENBQ0hFX1NUQVRVU19JTl9QUk9HUkVTUxADKvkBChJSZW5ld0ZhaWx1cmVSZWFzb24SJAogUkVORVdfRkFJTFVSRV9SRUFTT05fVU5TUEVDSUZJRUQQABIgChxSRU5FV19GQUlMVVJFX1JFQVNPTl9FWFBJUkVEEAESIwofUkVORVdfRkFJTFVSRV9SRUFTT05fU1VQRVJTRURFRBACEiIKHlJFTkVXX0ZBSUxVUkVfUkVBU09OX05PVF9GT1VORBADEiIKHlJFTkVXX0ZBSUxVUkVfUkVBU09OX0NPTVBMRVRFRBAEEi4KKlJFTkVXX0ZBSUxVUkVfUkVBU09OX01BWF9MSUZFVElNRV9FWENFRURFRBAFKrYBChdJZGVtcG90ZW5jeUNvbW1pdFN0YXR1cxIiCh5JREVNUE9URU5DWV9DT01NSVRfVU5TUEVDSUZJRUQQABIgChxJREVNUE9URU5DWV9DT01NSVRfQ09NTUlUVEVEEAESKAokSURFTVBPVEVOQ1lfQ09NTUlUX0FMUkVBRFlfQ09NTUlUVEVEEAISKwonSURFTVBPVEVOQ1lfQ09NTUlUX1NUQUxFX0xFQVNFX1JFSkVDVEVEEANiBnByb3RvMw", [file_cellaflow_v1_common]);
+  fileDesc("Ch5jZWxsYWZsb3cvdjEvaWRlbXBvdGVuY3kucHJvdG8SDGNlbGxhZmxvdy52MSLoAQoRQ2hlY2tDYWNoZVJlcXVlc3QSEAoIYWdlbnRfaWQYASABKAkSFwoPaWRlbXBvdGVuY3lfa2V5GAIgASgJEhwKD3dhaXRfdGltZW91dF9tcxgDIAEoBEgAiAEBEhkKDGxlYXNlX3R0bF9tcxgEIAEoBEgBiAEBEhcKCnNlc3Npb25faWQYBSABKAlIAogBARIVCghzZXF1ZW5jZRgGIAEoBEgDiAEBQhIKEF93YWl0X3RpbWVvdXRfbXNCDwoNX2xlYXNlX3R0bF9tc0INCgtfc2Vzc2lvbl9pZEILCglfc2VxdWVuY2Ui9QMKEkNoZWNrQ2FjaGVSZXNwb25zZRIpCgZzdGF0dXMYASABKA4yGS5jZWxsYWZsb3cudjEuQ2FjaGVTdGF0dXMSNAoNY2FjaGVkX3Jlc3VsdBgCIAEoCzIYLmNlbGxhZmxvdy52MS5TdGVwUmVzdWx0SACIAQESGgoNZmVuY2luZ190b2tlbhgDIAEoBEgBiAEBEiAKE2xlYXNlX2V4cGlyZXNfYXRfbXMYBCABKARIAogBARIiChVoZWFydGJlYXRfaW50ZXJ2YWxfbXMYBSABKARIA4gBARIbCg5yZXRyeV9hZnRlcl9tcxgGIAEoBEgEiAEBEh0KEGN1cnJlbnRfc2VxdWVuY2UYCCABKARIBYgBARI2Cg5jdXJyZW50X2hvbGRlchgJIAEoCzIZLmNlbGxhZmxvdy52MS5MZWFzZUhvbGRlckgGiAEBQhAKDl9jYWNoZWRfcmVzdWx0QhAKDl9mZW5jaW5nX3Rva2VuQhYKFF9sZWFzZV9leHBpcmVzX2F0X21zQhgKFl9oZWFydGJlYXRfaW50ZXJ2YWxfbXNCEQoPX3JldHJ5X2FmdGVyX21zQhMKEV9jdXJyZW50X3NlcXVlbmNlQhEKD19jdXJyZW50X2hvbGRlckoECAcQCFIRY3VycmVudF9ob2xkZXJfaWQifQoLTGVhc2VIb2xkZXISEAoIYWdlbnRfaWQYASABKAkSEQoJaG9sZGVyX2lkGAIgASgJEhYKDmFjcXVpcmVkX2F0X21zGAMgASgEEhUKDWV4cGlyZXNfYXRfbXMYBCABKAQSGgoSaGFyZF9leHBpcmVzX2F0X21zGAUgASgEImgKEVJlbmV3TGVhc2VSZXF1ZXN0EhAKCGFnZW50X2lkGAEgASgJEhcKD2lkZW1wb3RlbmN5X2tleRgCIAEoCRIVCg1mZW5jaW5nX3Rva2VuGAMgASgEEhEKCWV4dGVuZF9tcxgEIAEoBCKtAQoSUmVuZXdMZWFzZVJlc3BvbnNlEg8KB3JlbmV3ZWQYASABKAgSHgoRbmV3X2V4cGlyZXNfYXRfbXMYAiABKARIAIgBARI9Cg5mYWlsdXJlX3JlYXNvbhgDIAEoDjIgLmNlbGxhZmxvdy52MS5SZW5ld0ZhaWx1cmVSZWFzb25IAYgBAUIUChJfbmV3X2V4cGlyZXNfYXRfbXNCEQoPX2ZhaWx1cmVfcmVhc29uIncKE1JlbGVhc2VMZWFzZVJlcXVlc3QSEAoIYWdlbnRfaWQYASABKAkSFwoPaWRlbXBvdGVuY3lfa2V5GAIgASgJEhUKDWZlbmNpbmdfdG9rZW4YAyABKAQSEwoGcmVhc29uGAQgASgJSACIAQFCCQoHX3JlYXNvbiIoChRSZWxlYXNlTGVhc2VSZXNwb25zZRIQCghyZWxlYXNlZBgBIAEoCCpwChBJZGVtcG90ZW5jeVNjb3BlEhUKEVNDT1BFX1VOU1BFQ0lGSUVEEAASFgoSU0NPUEVfU0VTU0lPTl9XSURFEAESFwoTU0NPUEVfQUdFTlRfUFJJVkFURRACEhQKEFNDT1BFX1NURVBfTE9DQUwQAyp6CgtDYWNoZVN0YXR1cxIcChhDQUNIRV9TVEFUVVNfVU5TUEVDSUZJRUQQABIUChBDQUNIRV9TVEFUVVNfSElUEAESGQoVQ0FDSEVfU1RBVFVTX0FDUVVJUkVEEAISHAoYQ0FDSEVfU1RBVFVTX0lOX1BST0dSRVNTEAMq+QEKElJlbmV3RmFpbHVyZVJlYXNvbhIkCiBSRU5FV19GQUlMVVJFX1JFQVNPTl9VTlNQRUNJRklFRBAAEiAKHFJFTkVXX0ZBSUxVUkVfUkVBU09OX0VYUElSRUQQARIjCh9SRU5FV19GQUlMVVJFX1JFQVNPTl9TVVBFUlNFREVEEAISIgoeUkVORVdfRkFJTFVSRV9SRUFTT05fTk9UX0ZPVU5EEAMSIgoeUkVORVdfRkFJTFVSRV9SRUFTT05fQ09NUExFVEVEEAQSLgoqUkVORVdfRkFJTFVSRV9SRUFTT05fTUFYX0xJRkVUSU1FX0VYQ0VFREVEEAUqtgEKF0lkZW1wb3RlbmN5Q29tbWl0U3RhdHVzEiIKHklERU1QT1RFTkNZX0NPTU1JVF9VTlNQRUNJRklFRBAAEiAKHElERU1QT1RFTkNZX0NPTU1JVF9DT01NSVRURUQQARIoCiRJREVNUE9URU5DWV9DT01NSVRfQUxSRUFEWV9DT01NSVRURUQQAhIrCidJREVNUE9URU5DWV9DT01NSVRfU1RBTEVfTEVBU0VfUkVKRUNURUQQA2IGcHJvdG8z", [file_cellaflow_v1_common]);
 
 /**
  * @generated from message cellaflow.v1.CheckCacheRequest
  */
 export type CheckCacheRequest = Message<"cellaflow.v1.CheckCacheRequest"> & {
   /**
-   * Opaque caller-supplied label, carried for logging and diagnostics.
+   * Caller-supplied label. A granted lease records it, and every caller refused
+   * that lease is shown it (current_holder.agent_id), so it should not carry
+   * anything private. Over 1024 bytes, or containing a control character
+   * (Unicode Cc), is refused with INVALID_ARGUMENT.
    *
    * Not parsed into the idempotency key: key derivation is an SDK concern and the
    * engine treats the key as opaque.
@@ -36,12 +39,19 @@ export type CheckCacheRequest = Message<"cellaflow.v1.CheckCacheRequest"> & {
   idempotencyKey: string;
 
   /**
+   * How long to wait for a lease another caller holds. Unset or 0, answer at
+   * once. When the wait runs out the engine tries once more before answering, so
+   * the answer can come one storage round trip after it, and can be ACQUIRED or
+   * HIT as well as IN_PROGRESS: set the call's deadline above the wait.
+   *
    * @generated from field: optional uint64 wait_timeout_ms = 3;
    */
   waitTimeoutMs?: bigint | undefined;
 
   /**
-   * Crash-detection window; defaults to engine config
+   * Crash-detection window. Unset, the engine's configured default. Under 4 ms
+   * is refused with INVALID_ARGUMENT; above the maximum lease lifetime the lease
+   * is granted the maximum, which lease_expires_at_ms in the answer shows.
    *
    * @generated from field: optional uint64 lease_ttl_ms = 4;
    */
@@ -114,7 +124,7 @@ export type CheckCacheResponse = Message<"cellaflow.v1.CheckCacheResponse"> & {
   fencingToken?: bigint | undefined;
 
   /**
-   * Present iff ACQUIRED or IN_PROGRESS
+   * Present iff ACQUIRED or IN_PROGRESS (then current_holder.expires_at_ms)
    *
    * @generated from field: optional uint64 lease_expires_at_ms = 4;
    */
@@ -135,13 +145,6 @@ export type CheckCacheResponse = Message<"cellaflow.v1.CheckCacheResponse"> & {
   retryAfterMs?: bigint | undefined;
 
   /**
-   * Present iff IN_PROGRESS (for distributed tracing)
-   *
-   * @generated from field: optional string current_holder_id = 7;
-   */
-  currentHolderId?: string | undefined;
-
-  /**
    * The requested session's highest committed sequence, or 0 if it has
    * none. Present whenever `session_id` was supplied — on every status, not only
    * on HIT.
@@ -157,6 +160,13 @@ export type CheckCacheResponse = Message<"cellaflow.v1.CheckCacheResponse"> & {
    * @generated from field: optional uint64 current_sequence = 8;
    */
   currentSequence?: bigint | undefined;
+
+  /**
+   * Who holds the lease. Present iff IN_PROGRESS.
+   *
+   * @generated from field: optional cellaflow.v1.LeaseHolder current_holder = 9;
+   */
+  currentHolder?: LeaseHolder | undefined;
 };
 
 /**
@@ -165,6 +175,65 @@ export type CheckCacheResponse = Message<"cellaflow.v1.CheckCacheResponse"> & {
  */
 export const CheckCacheResponseSchema: GenMessage<CheckCacheResponse> = /*@__PURE__*/
   messageDesc(file_cellaflow_v1_idempotency, 1);
+
+/**
+ * Who holds a lease, as the engine last read it: recorded when the lease was
+ * granted, with the expiry renewals have since moved it to.
+ *
+ * The fencing token is not sent. A token is all that renew, release and commit
+ * check, and it is not secret: on some backends it is a small counter, and on
+ * others these times narrow it down. Nothing may rely on a refused caller not
+ * knowing it.
+ *
+ * @generated from message cellaflow.v1.LeaseHolder
+ */
+export type LeaseHolder = Message<"cellaflow.v1.LeaseHolder"> & {
+  /**
+   * The agent_id the holder sent when it acquired the lease. Not authenticated:
+   * it is what that caller said it was, and every caller refused the lease sees
+   * it. Empty for a lease recorded by an engine that did not store it.
+   *
+   * @generated from field: string agent_id = 1;
+   */
+  agentId: string;
+
+  /**
+   * The engine's id for this grant of the lease, kept through its renewals; a
+   * reclaim is a new grant with a new id. It identifies the grant, not the
+   * worker (that is agent_id), and tells apart two grants to the same agent_id.
+   *
+   * @generated from field: string holder_id = 2;
+   */
+  holderId: string;
+
+  /**
+   * Epoch ms, engine clock. 0 if not recorded
+   *
+   * @generated from field: uint64 acquired_at_ms = 3;
+   */
+  acquiredAtMs: bigint;
+
+  /**
+   * When the lease lapses unless renewed (epoch ms)
+   *
+   * @generated from field: uint64 expires_at_ms = 4;
+   */
+  expiresAtMs: bigint;
+
+  /**
+   * Ceiling independent of renewals; 0 means none
+   *
+   * @generated from field: uint64 hard_expires_at_ms = 5;
+   */
+  hardExpiresAtMs: bigint;
+};
+
+/**
+ * Describes the message cellaflow.v1.LeaseHolder.
+ * Use `create(LeaseHolderSchema)` to create a new message.
+ */
+export const LeaseHolderSchema: GenMessage<LeaseHolder> = /*@__PURE__*/
+  messageDesc(file_cellaflow_v1_idempotency, 2);
 
 /**
  * @generated from message cellaflow.v1.RenewLeaseRequest
@@ -186,6 +255,11 @@ export type RenewLeaseRequest = Message<"cellaflow.v1.RenewLeaseRequest"> & {
   fencingToken: bigint;
 
   /**
+   * How long the lease lasts from this renewal. Under 4 ms (including 0, the
+   * value when unset) is refused with INVALID_ARGUMENT. Above the maximum lease
+   * lifetime it is granted the maximum, and never past the lease's ceiling;
+   * new_expires_at_ms in the answer shows what was granted.
+   *
    * @generated from field: uint64 extend_ms = 4;
    */
   extendMs: bigint;
@@ -196,7 +270,7 @@ export type RenewLeaseRequest = Message<"cellaflow.v1.RenewLeaseRequest"> & {
  * Use `create(RenewLeaseRequestSchema)` to create a new message.
  */
 export const RenewLeaseRequestSchema: GenMessage<RenewLeaseRequest> = /*@__PURE__*/
-  messageDesc(file_cellaflow_v1_idempotency, 2);
+  messageDesc(file_cellaflow_v1_idempotency, 3);
 
 /**
  * @generated from message cellaflow.v1.RenewLeaseResponse
@@ -229,7 +303,7 @@ export type RenewLeaseResponse = Message<"cellaflow.v1.RenewLeaseResponse"> & {
  * Use `create(RenewLeaseResponseSchema)` to create a new message.
  */
 export const RenewLeaseResponseSchema: GenMessage<RenewLeaseResponse> = /*@__PURE__*/
-  messageDesc(file_cellaflow_v1_idempotency, 3);
+  messageDesc(file_cellaflow_v1_idempotency, 4);
 
 /**
  * @generated from message cellaflow.v1.ReleaseLeaseRequest
@@ -263,7 +337,7 @@ export type ReleaseLeaseRequest = Message<"cellaflow.v1.ReleaseLeaseRequest"> & 
  * Use `create(ReleaseLeaseRequestSchema)` to create a new message.
  */
 export const ReleaseLeaseRequestSchema: GenMessage<ReleaseLeaseRequest> = /*@__PURE__*/
-  messageDesc(file_cellaflow_v1_idempotency, 4);
+  messageDesc(file_cellaflow_v1_idempotency, 5);
 
 /**
  * @generated from message cellaflow.v1.ReleaseLeaseResponse
@@ -280,7 +354,7 @@ export type ReleaseLeaseResponse = Message<"cellaflow.v1.ReleaseLeaseResponse"> 
  * Use `create(ReleaseLeaseResponseSchema)` to create a new message.
  */
 export const ReleaseLeaseResponseSchema: GenMessage<ReleaseLeaseResponse> = /*@__PURE__*/
-  messageDesc(file_cellaflow_v1_idempotency, 5);
+  messageDesc(file_cellaflow_v1_idempotency, 6);
 
 /**
  * Key construction scope used by SDKs during key auto-derivation.

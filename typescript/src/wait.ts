@@ -4,9 +4,10 @@
  * A caller that asks with a positive `waitTimeoutMs` is held by the engine
  * until the holder commits (answered `HIT`), the lease is released or lapses
  * (the engine tries to grant it again before answering), or the wait runs out
- * (answered `IN_PROGRESS`). The engine checks the holder every 100 ms on behalf
- * of every caller waiting on the key, rather than each caller asking once a
- * second.
+ * (the engine tries once more, so the answer is `IN_PROGRESS` naming the
+ * current holder, or `ACQUIRED` or `HIT` if that changed at the last moment).
+ * The engine checks the holder every 100 ms on behalf of every caller waiting
+ * on the key, rather than each caller asking once a second.
  */
 
 /**

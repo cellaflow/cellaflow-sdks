@@ -205,6 +205,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start the engines
+        id: engines
         run: |
           docker run -d --name engine -p 50051:50051 \
             -e CELLAFLOW_ALLOW_UNAUTHENTICATED=true "$ENGINE_IMAGE"
@@ -242,7 +243,11 @@ jobs:
         working-directory: ./python
         run: pytest --no-cov tests/integration
 
+      # These two run even when the Python tests failed, so a failure in one
+      # language does not hide the other's results, but not without engines.
       - name: Set up Node.js
+        id: node
+        if: ${{ !cancelled() && steps.engines.outcome == 'success' }}
         uses: actions/setup-node@v4
         with:
           node-version: "18.x"
@@ -250,6 +255,7 @@ jobs:
           cache-dependency-path: typescript/package-lock.json
 
       - name: TypeScript integration tests
+        if: ${{ !cancelled() && steps.node.outcome == 'success' }}
         working-directory: ./typescript
         run: |
           npm ci

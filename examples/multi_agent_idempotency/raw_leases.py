@@ -85,7 +85,8 @@ def main() -> int:
         reply(
             f"status={CACHE_STATUS_NAMES[rb.status]} "
             f"retry_after_ms={rb.retry_after_ms} "
-            f"current_holder_id={rb.current_holder_id}"
+            f"held by agent_id={rb.current_holder.agent_id!r} "
+            f"holder_id={rb.current_holder.holder_id}"
         )
         if rb.status != CACHE_STATUS_IN_PROGRESS:
             print("\nExpected IN_PROGRESS for the second caller. Aborting.")

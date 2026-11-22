@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file cellaflow/v1/internal.proto.
  */
 export const file_cellaflow_v1_internal: GenFile = /*@__PURE__*/
-  fileDesc("ChtjZWxsYWZsb3cvdjEvaW50ZXJuYWwucHJvdG8SFWNlbGxhZmxvdy52MS5pbnRlcm5hbCKKAQoLQ2FjaGVSZWNvcmQSNAoGbGVhc2VkGAEgASgLMiIuY2VsbGFmbG93LnYxLmludGVybmFsLkxlYXNlUmVjb3JkSAASOwoJY29tcGxldGVkGAIgASgLMiYuY2VsbGFmbG93LnYxLmludGVybmFsLkNvbXBsZXRlZFJlY29yZEgAQggKBnJlY29yZCK4AQoLTGVhc2VSZWNvcmQSFQoNZmVuY2luZ190b2tlbhgBIAEoBBIRCglob2xkZXJfaWQYAiABKAkSFgoOYWNxdWlyZWRfYXRfbXMYAyABKAQSFQoNZXhwaXJlc19hdF9tcxgEIAEoBBIaChJjbGFpbWVkX3Nlc3Npb25faWQYBSABKAkSGAoQY2xhaW1lZF9zZXF1ZW5jZRgGIAEoBBIaChJoYXJkX2V4cGlyZXNfYXRfbXMYByABKAQibwoTU2VxdWVuY2VDbGFpbVJlY29yZBIXCg9pZGVtcG90ZW5jeV9rZXkYASABKAkSFQoNZmVuY2luZ190b2tlbhgCIAEoBBIRCglob2xkZXJfaWQYAyABKAkSFQoNZXhwaXJlc19hdF9tcxgEIAEoBCKHAQoPQ29tcGxldGVkUmVjb3JkEigKBnJlc3VsdBgBIAEoCzIYLmNlbGxhZmxvdy52MS5TdGVwUmVzdWx0EhcKD2NvbXBsZXRlZF9hdF9tcxgCIAEoBBIVCg1mZW5jaW5nX3Rva2VuGAMgASgEEhoKEmNvbW1pdHRlZF9zZXF1ZW5jZRgEIAEoBGIGcHJvdG8z", [file_cellaflow_v1_common]);
+  fileDesc("ChtjZWxsYWZsb3cvdjEvaW50ZXJuYWwucHJvdG8SFWNlbGxhZmxvdy52MS5pbnRlcm5hbCKKAQoLQ2FjaGVSZWNvcmQSNAoGbGVhc2VkGAEgASgLMiIuY2VsbGFmbG93LnYxLmludGVybmFsLkxlYXNlUmVjb3JkSAASOwoJY29tcGxldGVkGAIgASgLMiYuY2VsbGFmbG93LnYxLmludGVybmFsLkNvbXBsZXRlZFJlY29yZEgAQggKBnJlY29yZCLKAQoLTGVhc2VSZWNvcmQSFQoNZmVuY2luZ190b2tlbhgBIAEoBBIRCglob2xkZXJfaWQYAiABKAkSFgoOYWNxdWlyZWRfYXRfbXMYAyABKAQSFQoNZXhwaXJlc19hdF9tcxgEIAEoBBIaChJjbGFpbWVkX3Nlc3Npb25faWQYBSABKAkSGAoQY2xhaW1lZF9zZXF1ZW5jZRgGIAEoBBIaChJoYXJkX2V4cGlyZXNfYXRfbXMYByABKAQSEAoIYWdlbnRfaWQYCCABKAkibwoTU2VxdWVuY2VDbGFpbVJlY29yZBIXCg9pZGVtcG90ZW5jeV9rZXkYASABKAkSFQoNZmVuY2luZ190b2tlbhgCIAEoBBIRCglob2xkZXJfaWQYAyABKAkSFQoNZXhwaXJlc19hdF9tcxgEIAEoBCKHAQoPQ29tcGxldGVkUmVjb3JkEigKBnJlc3VsdBgBIAEoCzIYLmNlbGxhZmxvdy52MS5TdGVwUmVzdWx0EhcKD2NvbXBsZXRlZF9hdF9tcxgCIAEoBBIVCg1mZW5jaW5nX3Rva2VuGAMgASgEEhoKEmNvbW1pdHRlZF9zZXF1ZW5jZRgEIAEoBGIGcHJvdG8z", [file_cellaflow_v1_common]);
 
 /**
  * Internal storage record persisted in RocksDB's idempotency_cache Column Family.
@@ -60,7 +60,7 @@ export type LeaseRecord = Message<"cellaflow.v1.internal.LeaseRecord"> & {
   fencingToken: bigint;
 
   /**
-   * Opaque per-attempt identifier for observability
+   * The engine's id for this grant, reported as LeaseHolder.holder_id
    *
    * @generated from field: string holder_id = 2;
    */
@@ -110,6 +110,15 @@ export type LeaseRecord = Message<"cellaflow.v1.internal.LeaseRecord"> & {
    * @generated from field: uint64 hard_expires_at_ms = 7;
    */
   hardExpiresAtMs: bigint;
+
+  /**
+   * The agent_id the holder sent when it acquired the lease, reported to a
+   * caller refused while it holds it. Empty on a record written before this
+   * field existed.
+   *
+   * @generated from field: string agent_id = 8;
+   */
+  agentId: string;
 };
 
 /**
@@ -144,7 +153,7 @@ export type SequenceClaimRecord = Message<"cellaflow.v1.internal.SequenceClaimRe
   fencingToken: bigint;
 
   /**
-   * Opaque per-attempt id, for diagnostics
+   * The owning lease's holder_id, for diagnostics
    *
    * @generated from field: string holder_id = 3;
    */

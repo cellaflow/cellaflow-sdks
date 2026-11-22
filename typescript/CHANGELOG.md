@@ -2,6 +2,35 @@
 
 All notable changes to the Cellaflow TypeScript SDK.
 
+## Unreleased
+
+### Behaviour changes
+
+- **`CheckCacheResponse.currentHolderId` is removed.** It was the engine's opaque id for the
+  holder's grant of the lease, which `CellaflowClient.checkIdempotencyCache` returned on
+  `IN_PROGRESS`. The same value is now `currentHolder.holderId`, and `currentHolder.agentId` is the
+  worker that holds the lease. Code that read `currentHolderId` no longer compiles; in JavaScript it
+  reads `undefined`.
+
+### Compatibility
+
+- `holder` on `LeaseNotAcquired` needs an engine that reports it, newer than 0.3.0; with 0.3.0 it is
+  always absent. That engine also refuses a `workerId` (or a tool's agent id) longer than 1024 bytes
+  or containing control characters.
+
+### Added
+
+- **A refused lease says who holds it.** When `executionLease` (or `taskLease`) is refused because
+  another worker holds the lease, `LeaseNotAcquired` carries `holder`, a `LeaseHolderInfo`
+  (exported): `workerId`, the id that worker acquired the lease with; `holderId`, the engine's id
+  for that grant of the lease; `acquiredAtMs`; `expiresAtMs`, when the lease lapses unless renewed;
+  and `hardExpiresAtMs`, its ceiling. Times are epoch milliseconds on the engine's clock. The
+  `workerId` is what that worker said it was, not an authenticated identity. `workerId`,
+  `acquiredAtMs` and `hardExpiresAtMs` are absent rather than empty or 0 when the engine did not
+  record them, and `holder` itself is absent for a key that is already committed, for a `tool()`
+  call whose granted leases could not be confirmed, and when the engine is too old to report it. The
+  message now names the holder's `workerId` instead of the engine's opaque id.
+
 ## 0.12.0
 
 ### Compatibility
