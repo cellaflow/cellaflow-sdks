@@ -157,6 +157,8 @@ class LeaseHeartbeat:
         self._set_deadline(sent, self.lease_ttl_ms / 1000.0)
         # Set once the lease is known or judged lost; `on_lease_lost` runs once.
         self.lost = False
+        # Why it was lost, the first time.
+        self.lost_detail: Optional[str] = None
         self._lost_lock = threading.Lock()
         # Set once the heartbeat is told to stop: the lease is then being let
         # go, not lost, and the clock no longer judges it.
@@ -244,6 +246,7 @@ class LeaseHeartbeat:
                 logger.info("Lease %s: %s", self.idempotency_key, detail)
                 return
             self.lost = True
+            self.lost_detail = detail
         logger.warning("Lease %s lost: %s", self.idempotency_key, detail)
         if self.on_lease_lost is None:
             return
@@ -263,6 +266,57 @@ class LeaseHeartbeat:
         """
         elapsed_ms = (time.monotonic() - self._last_confirmed) * 1000.0
         return elapsed_ms >= self.lease_ttl_ms
+
+    def confirm_grant(self) -> None:
+        """Counts the lease from a renewal rather than from the request that
+        won it. Called before the heartbeat starts.
+
+        After the engine waited before granting, the lease can be much younger
+        than that request, and a deadline counted from it would read a fresh
+        lease as nearly expired. A renewal sent now gives a deadline counted
+        from a known time. One failed attempt is not a loss, so this tries a
+        few, backing off, while the lease, counted from when the grant arrived,
+        could still be live. If none is confirmed, the deadline counted from the
+        request still bounds the lease from below, since the grant came after
+        it. A refusal declares the lease lost.
+        """
+        window_end = time.monotonic() + self.lease_ttl_ms / 1000.0 - self.margin_sec
+        for attempt in range(3):
+            # Told to stop: the call was cancelled, and the lease handed back.
+            if self.lost or self._stopped:
+                return
+            sent = (time.monotonic(), time.time())
+            try:
+                resp = self.client.renew_lease(
+                    agent_id=self.agent_id,
+                    idempotency_key=self.idempotency_key,
+                    fencing_token=self.fencing_token,
+                    extend_ms=self.extend_ms,
+                    timeout=self.rpc_timeout_sec,
+                )
+            except Exception as e:
+                logger.info(
+                    "Lease %s: renewal after the grant failed: %s",
+                    self.idempotency_key,
+                    e,
+                )
+            else:
+                if not resp.renewed:
+                    self._notify_lost(_renew_failure_detail(resp.failure_reason))
+                    return
+                self._last_confirmed = time.monotonic()
+                self._set_deadline(
+                    sent, self._renewal_duration(sent[1], resp.new_expires_at_ms)
+                )
+                return
+            # No pause after the last attempt: it would only delay the body,
+            # or the hand-back, while the lease runs down.
+            if attempt == 2:
+                return
+            pause = min(0.1 * 2**attempt, window_end - time.monotonic())
+            if pause <= 0:
+                return
+            time.sleep(pause)
 
     def start_sync(self) -> None:
         """Starts a daemon thread for synchronous execution."""

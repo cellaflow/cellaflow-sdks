@@ -950,6 +950,7 @@ class LeasingMockClient(MockCellaflowClient):
         lease_ttl_ms: Optional[int] = None,
         session_id: Optional[str] = None,
         sequence: Optional[int] = None,
+        timeout: Optional[float] = None,
     ) -> Any:
         resp = MagicMock()
         resp.HasField.return_value = False

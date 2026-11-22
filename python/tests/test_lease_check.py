@@ -328,12 +328,15 @@ def test_a_body_raising_after_a_local_loss_is_released_and_recorded(
 
     @tool
     def nxt() -> str:
-        clocks.offset = 0.0
         return "next"
 
     with session(client).bind():
         with pytest.raises(LeaseLostError):
             charge_card()
+        # Back before the next call is granted its lease: shifted, the lease
+        # module's clock would read that lease as lost on arrival too, and the
+        # call would hand it back rather than start its body.
+        clocks.offset = 0.0
         nxt()
     assert len(client.releases) == 1
     assert any(":failure:" in a["idempotency_key"] for a in client.acquires)
