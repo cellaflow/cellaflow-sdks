@@ -10,6 +10,7 @@ import time
 
 import grpc
 
+from cellaflow.allowance import AllowanceExceeded
 from cellaflow.client import CellaflowClient
 from cellaflow.history import GRAPH_PAGE, latest_session_sequence
 from cellaflow.failures import (
@@ -79,7 +80,9 @@ _LAPSE_GRACE_S = 1.0
 #: Failures writing a hit's record that may succeed if sent again. The record is
 #: kept for the next step to retry; any other failure drops it. INTERNAL is how
 #: the engine reports a failed storage write, which it does not retry itself, and
-#: CANCELLED is the call being abandoned rather than refused.
+#: CANCELLED is the call being abandoned rather than refused. RESOURCE_EXHAUSTED
+#: is a session's full mailbox, unless it is an allowance refusal; see
+#: `_may_pass`.
 _RETRYABLE_CODES = frozenset(
     {
         grpc.StatusCode.UNAVAILABLE,
@@ -90,6 +93,21 @@ _RETRYABLE_CODES = frozenset(
         grpc.StatusCode.CANCELLED,
     }
 )
+
+
+def _may_pass(exc: BaseException) -> bool:
+    """Whether an engine call's failure may pass if the call is sent again:
+    one of `_RETRYABLE_CODES`, and not an allowance refusal.
+
+    The engine refuses an org over its allowance with RESOURCE_EXHAUSTED too,
+    and gives the same answer to every request until the allowance resets. That
+    is an answer, not a call that went unanswered: nothing was granted, so there
+    is no lost grant to wait out, and asking again gains nothing. Every retry
+    decision goes through here, so none sends it again.
+    """
+    if isinstance(exc, AllowanceExceeded):
+        return False
+    return isinstance(exc, grpc.RpcError) and exc.code() in _RETRYABLE_CODES
 
 
 @dataclass
@@ -246,7 +264,7 @@ class WorkflowContext:
                 self.client, self.session_id, limit=GRAPH_PAGE, missing_ok=False
             )
         except grpc.RpcError as exc:
-            if exc.code() not in _RETRYABLE_CODES:
+            if not _may_pass(exc):
                 raise
             logger.warning(
                 "Cellaflow: could not read where session %s is (%s); this call "
@@ -804,7 +822,10 @@ class WorkflowContext:
                         failing_since, last_try = None, False
                 except Exception as exc:
                     code = exc.code() if isinstance(exc, grpc.RpcError) else None
-                    if code is None or code not in _RETRYABLE_CODES:
+                    # An allowance refusal is dropped at once, its message
+                    # naming the allowance: asking again for the rest of the
+                    # time would only hold up the return for the same answer.
+                    if code is None or not _may_pass(exc):
                         self._drop_final_record(
                             pending, f"{type(exc).__name__}: {exc}"
                         )
@@ -881,9 +902,13 @@ class WorkflowContext:
                 raise
             except Exception as exc:
                 code = exc.code() if isinstance(exc, grpc.RpcError) else None
-                if code in _RETRYABLE_CODES:
+                if _may_pass(exc) or isinstance(exc, AllowanceExceeded):
                     # Kept, so the step that hit this is retried with it. If the
                     # write did land, sending it again finds its completed entry.
+                    # An allowance refusal is kept too, but not retried: the step
+                    # that found it fails with it, and a call made after the
+                    # allowance resets writes the record before it claims its own
+                    # position.
                     raise
                 # The record will not be accepted: another writer in this session
                 # took the position first, the engine refused the write itself, or
@@ -972,8 +997,12 @@ class WorkflowContext:
                 )
                 pending["unreleased"] = None
             except Exception as exc:
-                code = exc.code() if isinstance(exc, grpc.RpcError) else None
-                if code not in _RETRYABLE_CODES:
+                if isinstance(exc, AllowanceExceeded):
+                    # Refused, so not sent again. The lease still claims the
+                    # position until it lapses, which the record waits out, as
+                    # for a lease whose token it never knew.
+                    pending["unreleased"] = dict(unreleased, token=0)
+                elif not _may_pass(exc):
                     # Already released or lapsed: nothing is left to free.
                     pending["unreleased"] = None
         try:

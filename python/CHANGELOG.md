@@ -2,6 +2,54 @@
 
 All notable changes to the Cellaflow Python SDK.
 
+## Unreleased
+
+### Added
+
+- **An org over its allowance gets a clear, final error.** A hosted engine refuses an org that
+  has used up its allowance (its free steps, say) with RESOURCE_EXHAUSTED and status details
+  saying so. The SDK raises that as `AllowanceExceeded` (exported), at once, wherever the engine's
+  error surfaced before: a `@workflow` or `durable_tools` session start, a `@tool` or `@step` call,
+  `execution_lease`, `async_execution_lease`, `@task_lease`, `CellaflowSaver`, and every
+  `CellaflowClient` request, `check_idempotency_cache_future` included. It carries `subject`, what
+  the allowance is for (`cellaflow.steps` today); `resets_at`, when it resets, as a UTC `datetime`;
+  and `limit`, what is blocked until then (`new_sessions_blocked` or `writes_blocked`). The last
+  two are `None` when the engine did not say. Its message says the org is over its allowance, for
+  what, and when it resets, then the engine's own message. It is a `grpc.RpcError`, so
+  `except grpc.RpcError` still catches it: `code()` is RESOURCE_EXHAUSTED, `details()` the
+  engine's message and `trailing_metadata()` what the engine sent, and the engine's error is its
+  `__cause__`. It can be pickled. See "When the org is over its allowance" in the README.
+
+### Behaviour changes
+
+- **An allowance refusal is never sent again.** Every RESOURCE_EXHAUSTED counted as an error that
+  may pass, so an over-allowance `@tool` or `@step` call was asked for twice more and then failed
+  with the engine's error, kept as a lease that might have been granted, and the failure recorded
+  as a workflow returned was retried for up to 45 s. Now the call fails at once, with nothing kept
+  to wait out, and nothing in the SDK resends a request the engine refused this way: not a lease,
+  a commit, a renewal, a release, a history read, or a record of the SDK's own. A renewal refused
+  this way ends the lease as a refused renewal does (`check()` fails, `on_lease_lost` runs, and an
+  `async_execution_lease` caller is cancelled), and a call whose lease was refused its first
+  renewal hands it back and fails with the refusal rather than asking for another. A plain
+  RESOURCE_EXHAUSTED, such as a session's full mailbox, is retried as before.
+- **A step stopped by an allowance refusal is not recorded as failed**, even when the workflow
+  catches the refusal, so a resume runs the step again rather than raising the refusal after the
+  allowance has reset. Its position is given back, so the next call takes it. A cache hit's result
+  or a caught failure waiting to be recorded when the next step starts is kept but not retried:
+  that step raises the refusal, and the first call after the reset writes the record. One recorded
+  as a workflow returns is dropped at once with a warning naming the allowance, and a re-run runs
+  that step again.
+- **`CellaflowSaver` raises a session start the engine refuses for the allowance**, where it logged
+  any refused start and went on to the commit.
+
+### Compatibility
+
+- Defines what the SDK reads ahead of the engine: no engine sends an allowance refusal yet, and
+  against one that does not, nothing changes. The TypeScript SDK reads the same details the same
+  way. They are decoded with protobuf alone, in a descriptor pool of the SDK's own, so the package
+  needs no new dependency, and an application that also uses `googleapis-common-protos` does not
+  find the `google.rpc` types defined twice.
+
 ## 0.13.0
 
 ### Behaviour changes

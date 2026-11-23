@@ -20,9 +20,10 @@ from typing import (
 
 import grpc
 
+from cellaflow.allowance import AllowanceExceeded
 from cellaflow.client import CellaflowClient, _check_api_key_argument
 from cellaflow.context import (
-    _RETRYABLE_CODES,
+    _may_pass,
     WorkflowContext,
     set_context,
     reset_context,
@@ -428,7 +429,7 @@ def _release_after_failure(
             # step's event loop, for as long as TCP takes to give up.
             timeout=hb.rpc_timeout_sec,
         )
-    except Exception:
+    except Exception as exc:
         # The lease lapses on its own. Losing the release is not worth
         # replacing the error that caused it.
         logger.warning(
@@ -443,7 +444,10 @@ def _release_after_failure(
         return {
             "agent_id": agent_id,
             "key": ikey,
-            "token": fencing_token,
+            # Refused for the allowance: the record does not send it again, and
+            # waits for the lapse instead, as for a lease whose token it never
+            # knew.
+            "token": 0 if isinstance(exc, AllowanceExceeded) else fencing_token,
             "lapses_in_s": hb.rpc_timeout_sec + hb.lease_ttl_ms / 1000.0 + 1.0,
         }, None
     return None, bool(getattr(resp, "released", True))
@@ -479,6 +483,15 @@ def _note_failure(
     """
     try:
         if isinstance(exc, DivergentStepError):
+            return
+        if isinstance(exc, AllowanceExceeded):
+            # Says nothing about the step: the org is over its allowance, and
+            # once it resets the step can run. Recorded, it would be raised
+            # again at this position by every resume, even after that. So it
+            # is not recorded, as a process exit is not, and the position is
+            # given back: calling the step again after the reset takes it, and
+            # a re-run runs the step.
+            ctx.give_back_position(seq)
             return
         if isinstance(exc, asyncio.CancelledError) and is_async:
             ctx.defer_cancellation_record(
@@ -670,11 +683,15 @@ def _hand_back(
             # the connection is most likely bad.
             timeout=hb.rpc_timeout_sec if hb is not None else _HAND_BACK_TIMEOUT_S,
         )
-    except Exception:
+    except Exception as exc:
         logger.info("Could not hand back the lease on %s; it lapses on its own", ikey)
         if hb is None:
             return None
-        return _held(agent_id, ikey, fencing_token, hb)
+        held = _held(agent_id, ikey, fencing_token, hb)
+        if isinstance(exc, AllowanceExceeded):
+            # Not sent again; see `_release_after_failure`.
+            held["token"] = 0
+        return held
     return None
 
 
@@ -909,10 +926,10 @@ def _is_stale_lease(exc: BaseException) -> bool:
 
 def _unanswered(exc: BaseException) -> bool:
     """Whether a call got no answer either way: a transport error, or one that
-    may pass, rather than a refusal."""
+    may pass, rather than a refusal. An allowance refusal is an answer."""
     if not isinstance(exc, grpc.RpcError):
         return True
-    return exc.code() in _RETRYABLE_CODES
+    return _may_pass(exc)
 
 
 def _is_committed_elsewhere(exc: BaseException) -> bool:
@@ -1281,7 +1298,11 @@ def step(
                             f"Step '{actual_tool_name}' at sequence {seq} was refused: "
                             f"{exc.details()}"
                         ) from exc
-                    if exc.code() in _RETRYABLE_CODES:
+                    # An allowance refusal is not one of these: it is an
+                    # answer. Nothing was granted, so nothing is kept to wait
+                    # out, and asking again gets the same answer until the
+                    # allowance resets.
+                    if _may_pass(exc):
                         # Kept until an answer, so a failure or cancellation
                         # before one leaves the record waiting it out.
                         unreleased = _lost_answer(agent_id, ikey, ttl_ms, unreleased)
@@ -1370,8 +1391,14 @@ def step(
                         )
                         handed_back += 1
                         unconfirmed = _unconfirmed(actual_tool_name, handed_back, hb)
+                        refusal = hb.allowance_refusal
                         call.handle = None
                         handle, hb, fencing_token = None, None, 0
+                        if refusal is not None:
+                            # The engine refused the renewal for the allowance,
+                            # and would refuse the next lease's the same way, so
+                            # the call fails with it now instead of asking again.
+                            raise refusal
                         if handed_back >= _MAX_HAND_BACKS:
                             raise unconfirmed
                         continue
@@ -1434,11 +1461,13 @@ def step(
                             call.mark_taken_over()
                 # Only for an error: an interrupt (Ctrl-C, SystemExit) is on its
                 # way out and must not be swallowed by a resend that succeeds.
+                # Nor for an allowance refusal of the commit, which did not
+                # land: sending it again only gets the same answer.
                 if (
                     call.lost
                     and call.returned
                     and isinstance(e, Exception)
-                    and not isinstance(e, LeaseLostError)
+                    and not isinstance(e, (LeaseLostError, AllowanceExceeded))
                 ):
                     if _resend_commit(
                         ctx,
@@ -1586,7 +1615,9 @@ def step(
                             f"Step '{actual_tool_name}' at sequence {seq} was refused: "
                             f"{exc.details()}"
                         ) from exc
-                    if exc.code() in _RETRYABLE_CODES:
+                    # An allowance refusal is not one of these; see the
+                    # async wrapper.
+                    if _may_pass(exc):
                         # Kept until an answer, so a failure before one leaves
                         # the record waiting it out.
                         unreleased = _lost_answer(agent_id, ikey, ttl_ms, unreleased)
@@ -1654,8 +1685,12 @@ def step(
                         )
                         handed_back += 1
                         unconfirmed = _unconfirmed(actual_tool_name, handed_back, hb)
+                        refusal = hb.allowance_refusal
                         call.handle = None
                         handle, hb, fencing_token = None, None, 0
+                        if refusal is not None:
+                            # See the async wrapper.
+                            raise refusal
                         if handed_back >= _MAX_HAND_BACKS:
                             raise unconfirmed
                         continue
@@ -1716,11 +1751,13 @@ def step(
                             call.mark_taken_over()
                 # Only for an error: an interrupt (Ctrl-C, SystemExit) is on its
                 # way out and must not be swallowed by a resend that succeeds.
+                # Nor for an allowance refusal of the commit, which did not
+                # land: sending it again only gets the same answer.
                 if (
                     call.lost
                     and call.returned
                     and isinstance(e, Exception)
-                    and not isinstance(e, LeaseLostError)
+                    and not isinstance(e, (LeaseLostError, AllowanceExceeded))
                 ):
                     if _resend_commit(
                         ctx,

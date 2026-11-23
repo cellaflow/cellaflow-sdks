@@ -595,6 +595,27 @@ Or pass it explicitly. Every entry point that talks to the engine takes `api_key
 - **Without TLS:** a key is never sent in plaintext to anything but this machine unless you allow it. With `secure=False` and another host as the target, the client refuses, naming the target, so forgetting TLS cannot be how a key crosses the network. On a network you trust (a Compose network, a Kubernetes service), set `CELLAFLOW_ALLOW_PLAINTEXT_KEY=true` (or, building a `CellaflowClient` yourself, pass `allow_plaintext_key=True`); each target then logs a warning once. A target on this machine is checked by gRPC as well as by name: the channel bypasses any `https_proxy`, and refuses a connection whose peer is not this machine, so a name that only looks local fails to connect rather than send the key. That failure is gRPC's UNAVAILABLE, "Endpoint is neither UDS or TCP loopback address": the name resolved somewhere other than this machine, and the opt-in does not override it. Use the machine's real address, or TLS. An allowed remote target still goes through `https_proxy` if one is set, so the key crosses the proxy too; add the engine's host to `no_proxy` (or `no_grpc_proxy`) if that matters.
 - **Your own CA:** `secure=True` trusts the public root certificates gRPC ships with. For an engine whose certificate comes from your own CA, or is self-signed, set `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/path/to/ca.pem`, which gRPC then trusts instead.
 
+### When the org is over its allowance
+
+A hosted Cellaflow engine refuses new work from an org that has used up its allowance (its free steps, say) until the allowance resets. The SDK raises that refusal as `AllowanceExceeded`, at once, wherever the call was made: a `@workflow` or `durable_tools` session start, a `@tool` or `@step` call, an `execution_lease`, `CellaflowSaver` or `CellaflowClient`. Nothing in the SDK sends the request again or waits for the refusal to pass: until the reset, the engine gives the same answer.
+
+```python
+from cellaflow import AllowanceExceeded
+
+try:
+    checkout(order, _session_id=order.id)
+except AllowanceExceeded as e:
+    # e.subject:   what the allowance is for, such as "cellaflow.steps"
+    # e.resets_at: when it resets, a UTC datetime, or None if the engine did not say
+    # e.limit:     what is blocked until then, "new_sessions_blocked" or "writes_blocked", or None
+    retry_later(order, at=e.resets_at)
+```
+
+- **It is still a `grpc.RpcError`:** `code()` is RESOURCE_EXHAUSTED and `details()` the engine's message, so code that catches gRPC errors catches it too. Its message says the org is over its allowance, for what, and when it resets. A plain RESOURCE_EXHAUSTED, such as a session's full mailbox, is still retried as before; only one carrying the engine's allowance details is final.
+- **A step it stops is not recorded as failed.** The refusal says nothing about the step, so a resume does not raise it again: running the workflow again with the same `_session_id` after the reset runs that step. Its position is given back, so a workflow that catches the refusal and calls the step again later puts it where it would have been.
+- **The SDK's own records wait for the reset.** A cache hit's result or a caught failure that the SDK records when the next step starts stays pending, and that step raises `AllowanceExceeded`; the first call after the reset writes it. One recorded as the workflow returns is dropped with a warning, so a re-run runs that step again.
+- **A refused renewal ends the lease**, as any refused renewal does: `check()` fails, `on_lease_lost` runs, and an `async_execution_lease` caller is cancelled.
+
 ### `@workflow(version="1.0.0", target="localhost:50051", secure=False, api_key=None)`
 Marks the entry point for a durable workflow execution:
 - **Automatic Client Management**: Transparently initializes the underlying gRPC client and session state.

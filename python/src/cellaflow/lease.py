@@ -4,6 +4,7 @@ import threading
 import logging
 import time
 from typing import Callable, List, Optional, Any, Tuple
+from cellaflow.allowance import AllowanceExceeded
 from cellaflow.client import CellaflowClient
 
 logger = logging.getLogger(__name__)
@@ -159,6 +160,9 @@ class LeaseHeartbeat:
         self.lost = False
         # Why it was lost, the first time.
         self.lost_detail: Optional[str] = None
+        # The engine's refusal of a renewal because the org is over its
+        # allowance, if that is how it was lost. See `confirm_grant`.
+        self.allowance_refusal: Optional[AllowanceExceeded] = None
         self._lost_lock = threading.Lock()
         # Set once the heartbeat is told to stop: the lease is then being let
         # go, not lost, and the clock no longer judges it.
@@ -255,6 +259,14 @@ class LeaseHeartbeat:
         except Exception as e:
             logger.error("on_lease_lost callback raised an error: %s", e)
 
+    def _refused_for_allowance(self, refusal: AllowanceExceeded) -> None:
+        """Ends the lease on a renewal refused because the org is over its
+        allowance, as on any refused renewal. Not an error that may pass:
+        renewing again before the allowance resets gets the same answer, and
+        the lease lapses in the meantime."""
+        self.allowance_refusal = refusal
+        self._notify_lost(f"the engine refused to renew it: {refusal}")
+
     def _ttl_exhausted(self) -> bool:
         """True once the lease can no longer be assumed held.
 
@@ -278,7 +290,10 @@ class LeaseHeartbeat:
         few, backing off, while the lease, counted from when the grant arrived,
         could still be live. If none is confirmed, the deadline counted from the
         request still bounds the lease from below, since the grant came after
-        it. A refusal declares the lease lost.
+        it. A refusal declares the lease lost, and so does an allowance
+        refusal, which is kept in `allowance_refusal` for the call to fail
+        with: every renewal would get the same answer until the allowance
+        resets.
         """
         window_end = time.monotonic() + self.lease_ttl_ms / 1000.0 - self.margin_sec
         for attempt in range(3):
@@ -294,6 +309,9 @@ class LeaseHeartbeat:
                     extend_ms=self.extend_ms,
                     timeout=self.rpc_timeout_sec,
                 )
+            except AllowanceExceeded as e:
+                self._refused_for_allowance(e)
+                return
             except Exception as e:
                 logger.info(
                     "Lease %s: renewal after the grant failed: %s",
@@ -372,6 +390,9 @@ class LeaseHeartbeat:
                 self._set_deadline(
                     sent, self._renewal_duration(sent[1], resp.new_expires_at_ms)
                 )
+            except AllowanceExceeded as e:
+                self._refused_for_allowance(e)
+                break
             except Exception as e:
                 logger.error("Lease renewal error for %s: %s", self.idempotency_key, e)
                 if self._ttl_exhausted():
@@ -475,6 +496,9 @@ class LeaseHeartbeat:
                     )
                 except asyncio.CancelledError:
                     raise
+                except AllowanceExceeded as e:
+                    self._refused_for_allowance(e)
+                    break
                 except Exception as e:
                     logger.error(
                         "Lease renewal error for %s: %s", self.idempotency_key, e

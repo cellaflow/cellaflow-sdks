@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING, Any
 
+from cellaflow.allowance import AllowanceExceeded
 from cellaflow.client import (
     ALLOW_PLAINTEXT_KEY_ENV_VAR,
     API_KEY_ENV_VAR,
@@ -62,6 +63,7 @@ __all__ = [
     "LeaseHolderInfo",
     "LeaseNotAcquired",
     "LeaseLostError",
+    "AllowanceExceeded",
     "MIN_LEASE_TTL_MS",
     "MAX_LEASE_TTL_MS",
 ]
