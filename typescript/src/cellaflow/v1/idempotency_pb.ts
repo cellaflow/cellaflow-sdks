@@ -41,8 +41,10 @@ export type CheckCacheRequest = Message<"cellaflow.v1.CheckCacheRequest"> & {
   /**
    * How long to wait for a lease another caller holds. Unset or 0, answer at
    * once. When the wait runs out the engine tries once more before answering, so
-   * the answer can come one storage round trip after it, and can be ACQUIRED or
-   * HIT as well as IN_PROGRESS: set the call's deadline above the wait.
+   * the answer can come a few storage round trips after it, and is whatever that
+   * attempt gets: ACQUIRED, HIT or IN_PROGRESS, or the errors any attempt can
+   * return (FAILED_PRECONDITION when the position is claimed or committed,
+   * UNAVAILABLE while the node halts). Set the call's deadline above the wait.
    *
    * @generated from field: optional uint64 wait_timeout_ms = 3;
    */
@@ -180,10 +182,9 @@ export const CheckCacheResponseSchema: GenMessage<CheckCacheResponse> = /*@__PUR
  * Who holds a lease, as the engine last read it: recorded when the lease was
  * granted, with the expiry renewals have since moved it to.
  *
- * The fencing token is not sent. A token is all that renew, release and commit
- * check, and it is not secret: on some backends it is a small counter, and on
- * others these times narrow it down. Nothing may rely on a refused caller not
- * knowing it.
+ * The fencing token is not sent, but it is not a credential either: renew,
+ * release and commit check it to order grants, not to authenticate the caller.
+ * Nothing may rely on a refused caller not knowing it.
  *
  * @generated from message cellaflow.v1.LeaseHolder
  */

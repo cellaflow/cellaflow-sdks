@@ -217,6 +217,36 @@ def test_refusal_from_a_plain_test_double_has_no_holder() -> None:
     assert err.holder is None
 
 
+def test_refusal_from_a_mock_response_has_no_holder() -> None:
+    """A MagicMock, specced or not, or an autospec of the response, is still a
+    refusal with no holder, never an AttributeError or a holder of mocks."""
+    from unittest.mock import create_autospec
+
+    doubles = [
+        MagicMock(status=idempotency_pb2.CACHE_STATUS_IN_PROGRESS),
+        MagicMock(
+            spec=idempotency_pb2.CheckCacheResponse,
+            status=idempotency_pb2.CACHE_STATUS_IN_PROGRESS,
+        ),
+    ]
+    autospec = create_autospec(idempotency_pb2.CheckCacheResponse, instance=True)
+    autospec.status = idempotency_pb2.CACHE_STATUS_IN_PROGRESS
+    doubles.append(autospec)
+    for double in doubles:
+        err = _refusal(double)
+        assert err.holder is None, double
+
+
+def test_a_double_carrying_a_real_holder_message_reports_it() -> None:
+    double = MagicMock(status=idempotency_pb2.CACHE_STATUS_IN_PROGRESS)
+    double.HasField.return_value = True
+    double.current_holder = idempotency_pb2.LeaseHolder(
+        agent_id="agent-a", holder_id="holder-1", expires_at_ms=2
+    )
+    holder = _refusal(double).holder
+    assert holder is not None and holder.worker_id == "agent-a"
+
+
 def test_completed_key_has_no_holder() -> None:
     # A holder in the answer too, so this fails if a HIT were read for one.
     resp = idempotency_pb2.CheckCacheResponse(status=idempotency_pb2.CACHE_STATUS_HIT)

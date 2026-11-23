@@ -63,8 +63,10 @@ message CheckCacheRequest {
   string idempotency_key = 2;       // Fully formed, opaque composite key
   // How long to wait for a lease another caller holds. Unset or 0, answer at
   // once. When the wait runs out the engine tries once more before answering, so
-  // the answer can come one storage round trip after it, and can be ACQUIRED or
-  // HIT as well as IN_PROGRESS: set the call's deadline above the wait.
+  // the answer can come a few storage round trips after it, and is whatever that
+  // attempt gets: ACQUIRED, HIT or IN_PROGRESS, or the errors any attempt can
+  // return (FAILED_PRECONDITION when the position is claimed or committed,
+  // UNAVAILABLE while the node halts). Set the call's deadline above the wait.
   optional uint64 wait_timeout_ms = 3;
   // Crash-detection window. Unset, the engine's configured default. Under 4 ms
   // is refused with INVALID_ARGUMENT; above the maximum lease lifetime the lease
@@ -131,10 +133,9 @@ message CheckCacheResponse {
 // Who holds a lease, as the engine last read it: recorded when the lease was
 // granted, with the expiry renewals have since moved it to.
 //
-// The fencing token is not sent. A token is all that renew, release and commit
-// check, and it is not secret: on some backends it is a small counter, and on
-// others these times narrow it down. Nothing may rely on a refused caller not
-// knowing it.
+// The fencing token is not sent, but it is not a credential either: renew,
+// release and commit check it to order grants, not to authenticate the caller.
+// Nothing may rely on a refused caller not knowing it.
 message LeaseHolder {
   // The agent_id the holder sent when it acquired the lease. Not authenticated:
   // it is what that caller said it was, and every caller refused the lease sees

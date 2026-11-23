@@ -2,7 +2,6 @@
 first holds the lease is told the first worker's id, and once the first
 releases it a third worker takes the lease with nothing to refuse."""
 
-import time
 import uuid
 
 import pytest
@@ -13,7 +12,6 @@ from cellaflow import LeaseNotAcquired, execution_lease
 def test_a_refused_worker_learns_who_holds_the_lease(target: str) -> None:
     key = f"task:{uuid.uuid4()}"
     first = f"agent-a-{uuid.uuid4().hex[:8]}"
-    before = int(time.time() * 1000)
 
     with execution_lease(key, worker_id=first, target=target, ttl_ms=10_000):
         with pytest.raises(LeaseNotAcquired) as excinfo:
@@ -24,9 +22,9 @@ def test_a_refused_worker_learns_who_holds_the_lease(target: str) -> None:
     assert holder is not None
     assert holder.worker_id == first
     assert holder.holder_id
+    # Times are on the engine's clock, which need not be this one, so they are
+    # checked against each other rather than against time.time().
     assert holder.acquired_at_ms is not None
-    # Engine clock against this one: the same host, so within a few seconds.
-    assert abs(holder.acquired_at_ms - before) < 5_000
     # The holder's own lease: its 10 s TTL (plus a renewal, every 2.5 s, on a
     # slow runner), not the refused worker's 30 s default, under the ceiling.
     assert 9_000 <= holder.expires_at_ms - holder.acquired_at_ms <= 14_000

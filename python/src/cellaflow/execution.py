@@ -550,12 +550,22 @@ def current_lease() -> LeaseHandle:
 
 
 def _holder_of(resp: Any) -> Optional[LeaseHolderInfo]:
-    """The holder an IN_PROGRESS answer names, if the engine sent one. A
-    stand-in response without ``HasField`` (a plain object) names none."""
-    has_field = getattr(resp, "HasField", None)
-    if callable(has_field) and has_field("current_holder"):
-        return LeaseHolderInfo._from_proto(resp.current_holder)
-    return None
+    """The holder an IN_PROGRESS answer names, if the engine sent one.
+
+    A stand-in response names none unless it carries a real ``LeaseHolder``
+    message: a plain object, a ``MagicMock`` or an autospec of
+    ``CheckCacheResponse`` must still give ``LeaseNotAcquired``, as it did
+    before the holder existed, never an error from reading a field it lacks.
+    """
+    try:
+        if not resp.HasField("current_holder"):
+            return None
+        holder = resp.current_holder
+    except Exception:
+        return None
+    if not isinstance(holder, idempotency_pb2.LeaseHolder):
+        return None
+    return LeaseHolderInfo._from_proto(holder)
 
 
 def _acquire(

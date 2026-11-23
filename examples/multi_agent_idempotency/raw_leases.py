@@ -82,11 +82,21 @@ def main() -> int:
 
         step(3, "worker-b", "CheckIdempotencyCache -- same key, while a is working")
         rb = b.check_idempotency_cache(agent_id="worker-b", idempotency_key=key)
+        # An older engine does not send the holder, and an older SDK does not
+        # know the field, so say so rather than print an empty one.
+        if (
+            "current_holder" in rb.DESCRIPTOR.fields_by_name
+            and rb.HasField("current_holder")
+        ):
+            held_by = (
+                f"held by agent_id={rb.current_holder.agent_id!r} "
+                f"holder_id={rb.current_holder.holder_id}"
+            )
+        else:
+            held_by = "holder not reported by this engine and SDK"
         reply(
             f"status={CACHE_STATUS_NAMES[rb.status]} "
-            f"retry_after_ms={rb.retry_after_ms} "
-            f"held by agent_id={rb.current_holder.agent_id!r} "
-            f"holder_id={rb.current_holder.holder_id}"
+            f"retry_after_ms={rb.retry_after_ms} {held_by}"
         )
         if rb.status != CACHE_STATUS_IN_PROGRESS:
             print("\nExpected IN_PROGRESS for the second caller. Aborting.")

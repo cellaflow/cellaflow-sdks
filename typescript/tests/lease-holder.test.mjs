@@ -59,9 +59,21 @@ test("the message names the worker holding the lease", async () => {
   );
   assert.equal(
     err.message,
-    "Could not acquire execution lease 'task:4417' (held by agent-a). Another worker is running it. " +
+    "Could not acquire execution lease 'task:4417' (held by \"agent-a\"). Another worker is running it. " +
       "Raise waitMs to wait for them, or treat this as the signal that the work is already in hand.",
   );
+});
+
+test("the message quotes the worker id, escapes what cannot be seen, and cuts it short", async () => {
+  const workerId = "agent-\u202eevil-" + "x".repeat(100);
+  const err = await refusal(
+    inProgress({ agentId: workerId, holderId: "holder-1", acquiredAtMs: 1n, expiresAtMs: 2n, hardExpiresAtMs: 0n }),
+  );
+  const shown = `"agent-\\u{202e}evil-${"x".repeat(52)}..."`;  // 64 characters, then ...
+  assert.ok(err.message.includes(`(held by ${shown})`), err.message);
+  assert.doesNotMatch(err.message, /\u202e/);
+  // The full id is still on the holder.
+  assert.equal(err.holder.workerId, workerId);
 });
 
 test("what the engine did not record is absent, not empty or 0", async () => {

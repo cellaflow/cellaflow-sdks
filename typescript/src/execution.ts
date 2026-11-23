@@ -61,6 +61,21 @@ export class LeaseNotAcquired extends Error {
   }
 }
 
+/**
+ * A holder's `workerId` as a refusal message shows it. The holder chose that
+ * string and it is not authenticated, and a message often reaches a model, so
+ * it is quoted, invisible format characters are escaped, and it is cut to 64
+ * characters. The full id stays on `holder.workerId`.
+ */
+function shownWorkerId(id: string): string {
+  const chars = Array.from(id);
+  const cut = chars.length > 64 ? `${chars.slice(0, 64).join("")}...` : id;
+  return JSON.stringify(cut).replace(
+    /\p{Cf}/gu,
+    (c) => `\\u{${(c.codePointAt(0) ?? 0).toString(16)}}`,
+  );
+}
+
 /** The SDK's view of the engine's `LeaseHolder`: numbers, and absent rather than empty or 0. */
 function holderInfo(holder: LeaseHolder | undefined): LeaseHolderInfo | undefined {
   if (!holder) return undefined;
@@ -477,7 +492,7 @@ export async function executionLease<T>(
     }
     if (resp.status !== CacheStatus.ACQUIRED) {
       const holder = holderInfo(resp.currentHolder);
-      const by = holder?.workerId ? ` (held by ${holder.workerId})` : "";
+      const by = holder?.workerId ? ` (held by ${shownWorkerId(holder.workerId)})` : "";
       throw new LeaseNotAcquired(
         `Could not acquire execution lease '${key}'${by}. Another worker is ` +
           "running it. Raise waitMs to wait for them, or treat this as the " +

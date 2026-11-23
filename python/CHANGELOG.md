@@ -9,13 +9,15 @@ All notable changes to the Cellaflow Python SDK.
 - **`CheckCacheResponse.current_holder_id` is removed.** It was the engine's opaque id for the
   holder's grant of the lease, which `CellaflowClient.check_idempotency_cache` returned on
   `IN_PROGRESS`. The same value is now `current_holder.holder_id`, and `current_holder.agent_id` is
-  the worker that holds the lease. Code that read `current_holder_id` raises `AttributeError`.
+  the worker that holds the lease. Code that read `current_holder_id` raises `AttributeError`, and
+  `HasField("current_holder_id")` or `CheckCacheResponse(current_holder_id=...)`, in a test double
+  for instance, raises `ValueError`.
 
 ### Compatibility
 
-- `holder` on `LeaseNotAcquired` needs an engine that reports it, newer than 0.3.0; with 0.3.0 it is
-  always `None`. That engine also refuses a `worker_id` (or a step's agent id) longer than 1024 bytes
-  or containing control characters.
+- `holder` on `LeaseNotAcquired` needs an engine that reports it. Engines up to and including 0.4.0
+  do not, and with them it is always `None`. An engine that reports it also refuses a `worker_id`
+  (or a step's agent id) longer than 1024 bytes or containing control characters.
 
 ### Added
 
@@ -30,7 +32,8 @@ All notable changes to the Cellaflow Python SDK.
   `holder` itself is `None` for a key that is already completed, for a `@tool` or `@step` call whose
   granted leases could not be confirmed, and when the engine is too old to report it.
   `LeaseNotAcquired` is still a `RuntimeError`, takes the same positional arguments, and its message
-  is unchanged. When a step raises the refusal and the workflow catches it, the recorded failure
+  is unchanged. A test double standing in for the engine's answer (a `MagicMock`, specced or not)
+  still gives a refusal, with `holder` as `None`. When a step raises the refusal and the workflow catches it, the recorded failure
   keeps the holder, so a resumed run reads the same one.
 
 ## 0.12.0
