@@ -1,5 +1,5 @@
 # Pinned rather than floored, so a clone of this directory runs the code the
 # README describes. Loosen them in your own project; the integration is two
 # imports and does not depend on these exact versions.
-cellaflow==0.11.0
+cellaflow==0.12.0
 crewai==1.15.41
