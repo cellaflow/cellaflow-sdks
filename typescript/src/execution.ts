@@ -552,6 +552,10 @@ export async function executionLease<T>(
     // younger than the request that won it. The block runs only if the
     // deadline that leaves has not passed.
     if (waitMs > 0) await hb.confirmGrant();
+    // A renewal refused because the org is over its allowance is refused again
+    // until it is not, so the block would run under a lease that cannot be
+    // kept. It does not start, and the caller hears the refusal.
+    if (hb.allowanceRefusal) throw hb.allowanceRefusal;
     // A lease already lost before the block starts must not run it: a block
     // that acts before its first check() would act on a lease this side has
     // already given up.

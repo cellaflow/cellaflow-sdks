@@ -12,6 +12,7 @@ import {
   afterInProgress,
 } from "./wait.js";
 import {
+  AllowanceExceededError,
   errorCode,
   hasStatusCode,
   isFailedPrecondition,
@@ -411,6 +412,11 @@ export class WorkflowContext {
       // Kept, so the next call sends it again. If the write did land, sending it
       // again finds its completed entry.
       if (isRetryable(err)) throw err;
+      // Kept too when refused because the org is over its allowance: the record
+      // is still owed, and a caller that catches the refusal and carries on once
+      // the allowance is back writes it then. Nothing here asks again or waits
+      // for that.
+      if (err instanceof AllowanceExceededError) throw err;
       // The record will not be accepted: another writer in this session took the
       // position first, the engine refused the write itself, or it failed before
       // reaching the engine and would fail the same way on every retry. Read where
@@ -558,6 +564,11 @@ export class WorkflowContext {
       );
       pending.unreleased = undefined;
     } catch (err) {
+      // Refused because the org is over its allowance, so the lease is still
+      // there, and so is the record's need to wait for it. Leasing the record
+      // now would be refused for the same reason or for that lease, so the
+      // write fails at once, keeping both, rather than wait.
+      if (err instanceof AllowanceExceededError) throw err;
       // Already released or lapsed: nothing is left to free.
       if (!isRetryable(err)) pending.unreleased = undefined;
     }

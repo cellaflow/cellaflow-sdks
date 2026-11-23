@@ -1,6 +1,166 @@
+import { Code, ConnectError } from "@connectrpc/connect";
+import { ErrorInfoSchema, QuotaFailureSchema } from "./google/rpc/error_details_pb.js";
+
 /** The gRPC status code of an engine call's error, as a number or a name. */
 function codeOf(err: unknown): unknown {
   return (err as { code?: unknown } | undefined)?.code;
+}
+
+/**
+ * Raised when the engine refuses a call because the Cellaflow org it runs
+ * under is over its allowance, such as the free step allowance of a hosted
+ * engine.
+ *
+ * It is final. The engine also answers RESOURCE_EXHAUSTED when a session's
+ * mailbox is full, which passes, so the SDK asks again; this refusal lasts
+ * until the allowance resets or the plan changes, so nothing in the SDK asks
+ * again, waits for it, or records it as the failure of the step it stopped.
+ *
+ * It is a `ConnectError` with code `Code.ResourceExhausted`, the refusal it
+ * stands for, so code that checks either still matches it. `cause` is the
+ * engine's error as it arrived, and `details` and `metadata` are that error's.
+ */
+export class AllowanceExceededError extends ConnectError {
+  /** What the org is over its allowance of, as the engine names it, such as `cellaflow.steps`. */
+  declare readonly subject: string;
+  /** When the allowance resets. Absent when the engine did not say, or said it in a form that does not parse. */
+  declare readonly resetsAt?: Date;
+  /**
+   * What the engine stops while the org is over its allowance, as it names it:
+   * `new_sessions_blocked` or `writes_blocked`. Absent when it did not say.
+   */
+  declare readonly limit?: string;
+
+  /**
+   * @param init.message The engine's message, kept at the end of this error's.
+   * @param init.cause The engine's error, as it arrived.
+   */
+  constructor(init: {
+    subject: string;
+    resetsAt?: Date;
+    limit?: string;
+    message?: string;
+    cause?: unknown;
+    metadata?: ConstructorParameters<typeof ConnectError>[2];
+    details?: ConnectError["details"];
+  }) {
+    super(
+      allowanceMessage(init.subject, init.resetsAt, init.message ?? ""),
+      Code.ResourceExhausted,
+      init.metadata,
+      undefined,
+      init.cause,
+    );
+    // Set as Connect sets a received error's: its constructor takes only
+    // details to send.
+    if (init.details) this.details = init.details;
+    this.subject = init.subject;
+    if (init.resetsAt) this.resetsAt = init.resetsAt;
+    if (init.limit) this.limit = init.limit;
+    // The name stays ConnectError's, unlike this SDK's other errors: Connect
+    // recognises its errors by name as well as by class, so another name would
+    // make `instanceof ConnectError` false, and Connect would wrap this error
+    // in an unknown one on its way out of the transport. Node's inspector still
+    // shows the class.
+  }
+
+  /**
+   * Only an instance of this class. The check inherited from ConnectError
+   * accepts anything shaped like a ConnectError, so that one from another copy
+   * of the package matches too, and so would take every ConnectError for this.
+   */
+  static [Symbol.hasInstance](value: unknown): boolean {
+    return Function.prototype[Symbol.hasInstance].call(this, value);
+  }
+}
+
+/** The plain words of an {@link AllowanceExceededError}. */
+function allowanceMessage(subject: string, resetsAt: Date | undefined, engineMessage: string): string {
+  let text = `The Cellaflow org is over its allowance for ${subject}, so the engine refused this call.`;
+  if (resetsAt) text += ` The allowance resets at ${resetsAt.toISOString().replace(".000Z", "Z")}.`;
+  if (engineMessage) text += ` The engine said: ${engineMessage}`;
+  return text;
+}
+
+/** A QuotaFailure subject with this prefix is what makes a refusal an allowance refusal. */
+const ALLOWANCE_SUBJECT_PREFIX = "cellaflow.";
+/** The ErrorInfo that says when the allowance resets and what it stops. */
+const ALLOWANCE_DOMAIN = "cellaflow.com";
+const ALLOWANCE_REASON = "ALLOWANCE_EXCEEDED";
+
+/**
+ * The allowance refusal `err` is, or undefined for any other error.
+ *
+ * An allowance refusal is RESOURCE_EXHAUSTED whose status details hold a
+ * `google.rpc.QuotaFailure` with a violation whose subject starts with
+ * `cellaflow.`; the first such violation names it. A `google.rpc.ErrorInfo`
+ * from domain `cellaflow.com` with reason `ALLOWANCE_EXCEEDED`, if there is
+ * one, says when it resets (`resets_at`) and what it stops (`limit`). Details
+ * are matched by their type's name, as Connect's `findDetails` does.
+ *
+ * Never throws. Anything else, including details that do not decode, is not an
+ * allowance refusal, so it is the RESOURCE_EXHAUSTED it always was, and an
+ * ErrorInfo that is missing, from another domain, or with a `resets_at` that
+ * does not parse leaves `resetsAt` and `limit` unknown.
+ */
+export function allowanceRefusal(err: unknown): AllowanceExceededError | undefined {
+  try {
+    if (err instanceof AllowanceExceededError) return err;
+    if (!(err instanceof ConnectError) || err.code !== Code.ResourceExhausted) return undefined;
+    const violation = err
+      .findDetails(QuotaFailureSchema)
+      .flatMap((failure) => failure.violations)
+      .find((v) => v.subject.startsWith(ALLOWANCE_SUBJECT_PREFIX));
+    if (!violation) return undefined;
+    const info = err
+      .findDetails(ErrorInfoSchema)
+      .find((i) => i.domain === ALLOWANCE_DOMAIN && i.reason === ALLOWANCE_REASON);
+    return new AllowanceExceededError({
+      subject: violation.subject,
+      resetsAt: parseTimestamp(info?.metadata.resets_at),
+      limit: info?.metadata.limit || undefined,
+      message: err.rawMessage,
+      cause: err,
+      metadata: err.metadata,
+      details: err.details,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+/** An RFC 3339 timestamp: date, `T`, time, optional fraction, and `Z` or an offset. */
+const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/;
+
+/**
+ * An RFC 3339 timestamp as a Date, or undefined if it is not one. Stricter than
+ * `Date.parse`, which also reads other formats, some in local time, and rolls
+ * an impossible date such as February 30 over into the next month.
+ */
+function parseTimestamp(value: string | undefined): Date | undefined {
+  const m = value === undefined ? null : RFC3339.exec(value);
+  if (!m) return undefined;
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number);
+  const offsetHours = Number(m[9] ?? 0);
+  const offsetMinutes = Number(m[10] ?? 0);
+  if (offsetHours > 23 || offsetMinutes > 59) return undefined;
+  const at = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  // Date.UTC rolls a field out of range over into the next one, so a time
+  // that does not read back as written was not a real one. A year before 100
+  // reads back as 19xx, so it is refused too.
+  if (
+    at.getUTCFullYear() !== year ||
+    at.getUTCMonth() !== month - 1 ||
+    at.getUTCDate() !== day ||
+    at.getUTCHours() !== hour ||
+    at.getUTCMinutes() !== minute ||
+    at.getUTCSeconds() !== second
+  ) {
+    return undefined;
+  }
+  const millis = m[7] ? Number(m[7].slice(0, 3).padEnd(3, "0")) : 0;
+  const offsetMs = (m[8] === "-" ? -1 : 1) * (offsetHours * 60 + offsetMinutes) * 60_000;
+  return new Date(at.getTime() + millis - offsetMs);
 }
 
 /**
@@ -54,6 +214,8 @@ export function isPositionCommitted(err: unknown): boolean {
  * Status codes for a failure that may pass if the call is sent again. INTERNAL is
  * how the engine reports a failed storage write, which it does not retry itself,
  * and CANCELLED is the call being abandoned rather than refused.
+ * RESOURCE_EXHAUSTED is a session's full mailbox, unless it is an
+ * {@link AllowanceExceededError}, which {@link isRetryable} checks first.
  */
 const RETRYABLE_CODES = new Set<unknown>([
   1, "canceled", "cancelled",
@@ -100,9 +262,12 @@ const NETWORK_ERROR_CODES = new Set<unknown>([
  * of the retryable status codes, or a network failure Node reports with its own
  * code. Anything else, including an error with no code at all, was thrown before
  * the call reached the engine, such as a payload that does not serialize, and
- * fails the same way every time.
+ * fails the same way every time. So does an {@link AllowanceExceededError},
+ * until the allowance resets, though its code is RESOURCE_EXHAUSTED: it is the
+ * engine's answer, not a call that went unanswered.
  */
 export function isRetryable(err: unknown): boolean {
+  if (err instanceof AllowanceExceededError) return false;
   const code = codeOf(err);
   if (hasStatusCode(err)) return RETRYABLE_CODES.has(code);
   return NETWORK_ERROR_CODES.has(code);

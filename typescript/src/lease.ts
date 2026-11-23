@@ -1,5 +1,6 @@
 import type { CellaflowClient } from "./client.js";
 import { RenewFailureReason } from "./cellaflow/v1/idempotency_pb.js";
+import { AllowanceExceededError } from "./errors.js";
 
 /** Why the engine refused to renew, in words a caller can act on. */
 function renewFailureDetail(reason: RenewFailureReason | undefined): string {
@@ -137,8 +138,9 @@ export interface LeaseEvent {
  * Passing the deadline is reported, but renewing carries on: the engine may
  * still hold the lease, and work that went ahead anyway (a `tool()` body that
  * did not check) keeps it for as long as the engine agrees, so its result can
- * still be recorded. Renewing stops only when the engine refuses a renewal, or
- * on `stop()`.
+ * still be recorded. Renewing stops only when the engine refuses a renewal
+ * (answering that the lease is gone, or that the org is over its allowance),
+ * or on `stop()`.
  *
  * Near the engine's maximum lease lifetime a renewal is granted less than it
  * asked for. The engine's expiry on each renewal is mapped onto the local
@@ -191,6 +193,11 @@ export class LeaseHeartbeat {
   /** Set once the lease is known to be lost. Read by `LeaseHandle.check()`. */
   lost = false;
   lostDetail?: string;
+  /**
+   * Set when the engine refused a renewal because the org is over its
+   * allowance. Renewing stops there; see {@link beat}.
+   */
+  allowanceRefusal?: AllowanceExceededError;
 
   /**
    * The longest the engine can still hold the lease after the last renewal this
@@ -274,7 +281,10 @@ export class LeaseHeartbeat {
     if (this.stopped) return false;
     if (performance.now() >= this.deadline || Date.now() >= this.wallDeadline) {
       this.notifyLost(
-        `no renewal was confirmed in time: the lease may already belong to another worker`,
+        this.allowanceRefusal
+          ? "no renewal was confirmed in time, because the engine refused them: the org is over its " +
+              `allowance for ${this.allowanceRefusal.subject}. The lease may already belong to another worker`
+          : `no renewal was confirmed in time: the lease may already belong to another worker`,
         false,
       );
       return true;
@@ -311,7 +321,7 @@ export class LeaseHeartbeat {
   }
 
   start(): void {
-    if (this.timer || this.stopped) return;
+    if (this.timer || this.stopped || this.allowanceRefusal) return;
     this.armDeadline();
     this.timer = setInterval(() => {
       // Never overlap renewals: a slow RPC would otherwise queue them and each
@@ -404,7 +414,7 @@ export class LeaseHeartbeat {
     for (let attempt = 0; attempt < 3 && !this.lost; attempt++) {
       if (await this.renewNow()) return;
       // Refused: there is nothing to retry.
-      if (this.lost) return;
+      if (this.lost || this.allowanceRefusal) return;
       // No pause after the last attempt: it would only delay the body, or
       // the hand-back, while the lease runs down.
       if (attempt === 2) return;
@@ -460,6 +470,17 @@ export class LeaseHeartbeat {
       // the deadline it would be judged against is the one known to be stale.
       const msg = err instanceof Error ? err.message : String(err);
       this.emit({ type: "renew_failed", detail: msg });
+      if (err instanceof AllowanceExceededError) {
+        // Refused because the org is over its allowance: an answer, which the
+        // engine gives every renewal until the allowance is back, so renewing
+        // stops here rather than be refused every interval. The lease is not
+        // lost yet: it lasts until its deadline, which still reports the loss.
+        this.allowanceRefusal = err;
+        if (this.timer) {
+          clearInterval(this.timer);
+          this.timer = undefined;
+        }
+      }
       if (!force) this.pastDeadline();
       return false;
     }

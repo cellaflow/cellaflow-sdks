@@ -2,6 +2,40 @@
 
 All notable changes to the Cellaflow TypeScript SDK.
 
+## Unreleased
+
+### Behaviour changes
+
+- **A refusal because the org is over its allowance is final.** Every `RESOURCE_EXHAUSTED` used to
+  be taken for a full session mailbox, which passes, and asked again, so an agent over its allowance
+  retried each call until it gave up and then failed without saying why. A `RESOURCE_EXHAUSTED`
+  whose details say the org is over its allowance (below) is now raised at once as
+  `AllowanceExceededError`, and nothing in the SDK asks it again or waits for it: tool calls, their
+  commits, the records a session owes, session starts, `executionLease`, and lease renewals, which
+  stop at the first one refused, so the lease lasts until its deadline. A refused tool call is not
+  recorded as the tool's failure, even when the refusal comes from a call its body made, and the
+  next call takes its position. A record the session owes is kept for the next call that gets
+  through. A `RESOURCE_EXHAUSTED` without those details is asked again as before.
+
+### Compatibility
+
+- Nothing changes with an engine that does not send these details. No new dependencies: the two
+  `google.rpc` messages are generated from a vendored subset of `error_details.proto`, which the
+  package does not export.
+
+### Added
+
+- **`AllowanceExceededError` (exported)**, raised by every `CellaflowClient` call, and so by
+  everything built on it, when the engine refuses it with `RESOURCE_EXHAUSTED` and status details
+  holding a `google.rpc.QuotaFailure` with a violation whose subject starts with `cellaflow.`.
+  `subject` is the first such subject, such as `cellaflow.steps`. A `google.rpc.ErrorInfo` from
+  domain `cellaflow.com` with reason `ALLOWANCE_EXCEEDED` gives `resetsAt`, a `Date` read from its
+  `resets_at` (RFC 3339), and `limit` (`new_sessions_blocked` or `writes_blocked`); both are absent
+  when it is missing or they do not parse. The message says the org is over its allowance, of what,
+  and when it resets, followed by the engine's message, and `cause` is the engine's error. It is a
+  `ConnectError` with code `Code.ResourceExhausted`, so code that checks either still matches it,
+  and so its `name` is `ConnectError`. See "When the org is over its allowance" in the README.
+
 ## 0.13.0
 
 ### Behaviour changes

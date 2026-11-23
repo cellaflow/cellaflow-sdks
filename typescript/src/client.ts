@@ -1,6 +1,7 @@
 import { createClient, Client, Interceptor, Transport } from "@connectrpc/connect";
 import { createGrpcTransport } from "@connectrpc/connect-node";
 import { checkedApiKey, checkPlaintext } from "./apikey.js";
+import { allowanceRefusal } from "./errors.js";
 import type { MessageInitShape } from "@bufbuild/protobuf";
 import { WorkflowEngineService } from "./cellaflow/v1/service_pb.js";
 import type {
@@ -51,6 +52,20 @@ function bearerKey(apiKey: string): Interceptor {
   };
 }
 
+/**
+ * Raises a refusal because the org is over its allowance as
+ * `AllowanceExceededError`. Done here, where every call goes out, so every
+ * layer above sees it as the final answer it is, never as the
+ * RESOURCE_EXHAUSTED of a full mailbox, which it would ask again.
+ */
+const allowanceRefusals: Interceptor = (next) => async (req) => {
+  try {
+    return await next(req);
+  } catch (err) {
+    throw allowanceRefusal(err) ?? err;
+  }
+};
+
 export class CellaflowClient {
   /**
    * gRPC Client for the Cellaflow Engine (Connect-ES transport).
@@ -66,7 +81,7 @@ export class CellaflowClient {
     const baseUrl = secure ? `https://${target}` : `http://${target}`;
 
     const apiKey = checkedApiKey(options.apiKey);
-    const interceptors: Interceptor[] = [];
+    const interceptors: Interceptor[] = [allowanceRefusals];
     if (apiKey !== undefined) {
       if (!secure) checkPlaintext(target, options.allowPlaintextKey);
       interceptors.push(bearerKey(apiKey));

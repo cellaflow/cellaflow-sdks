@@ -1,4 +1,11 @@
-import { hasStatusCode, isCommittedElsewhere, isFailedPrecondition, isRetryable, isStaleLease } from "./errors.js";
+import {
+  AllowanceExceededError,
+  hasStatusCode,
+  isCommittedElsewhere,
+  isFailedPrecondition,
+  isRetryable,
+  isStaleLease,
+} from "./errors.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { getContext, type UnreleasedLease, type WorkflowContext } from "./context.js";
@@ -195,6 +202,16 @@ export function tool<A extends unknown[], R>(
         // The call's outcome belongs to the lease's new holder, so nothing is
         // recorded here in its name. The position goes back, so calling the
         // tool again claims it and finds that holder's result.
+        ctx.giveBackPosition(seq);
+        throw err;
+      }
+      if (err instanceof AllowanceExceededError) {
+        // Refused because the org is over its allowance, by this call's own
+        // request or by one its body made. That says nothing about the step,
+        // so it is not recorded as its failure: a resume that replays the
+        // record would raise it again after the allowance is back. Nothing is
+        // recorded and the position goes back, as for a takeover, so calling
+        // the tool again once the allowance allows claims it and runs the call.
         ctx.giveBackPosition(seq);
         throw err;
       }
@@ -414,7 +431,12 @@ export function tool<A extends unknown[], R>(
           },
         });
         if (late) await hb.confirmGrant();
-        if (leaseHandle.isLost) {
+        // A renewal refused because the org is over its allowance is refused
+        // again until it is not, so the body would run under a lease that
+        // cannot be kept. The lease goes back as below, and the call fails
+        // with the refusal instead of asking again.
+        const refusal = hb.allowanceRefusal;
+        if (leaseHandle.isLost || refusal) {
           // Neither the renewal nor the request can show the lease is still
           // held, so the body must not start under it: it would act on a lease
           // this side has already given up. Nothing has run, so hand the lease
@@ -433,6 +455,7 @@ export function tool<A extends unknown[], R>(
           hb = undefined;
           handle = undefined;
           fencingToken = 0;
+          if (refusal) throw refusal;
           handedBack += 1;
           if (handedBack >= MAX_HAND_BACKS) {
             // Every grant comes too late to count on and no renewal confirms
@@ -570,7 +593,10 @@ export function tool<A extends unknown[], R>(
             };
           });
       }
-      if (known.lost && returned && !(err instanceof LeaseLostError)) {
+      // A commit refused because the org is over its allowance did not land,
+      // so a lease that would not be released is no longer this call's, and
+      // the same commit sent again would only be refused again.
+      if (known.lost && returned && !(err instanceof LeaseLostError) && !(err instanceof AllowanceExceededError)) {
         // The commit failed and the lease would not be released. Either the
         // commit landed and only its answer was lost, which completed the key
         // under this call's own token, or another worker holds the call. The

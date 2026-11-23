@@ -211,6 +211,30 @@ try {
 }
 ```
 
+## When the org is over its allowance
+
+A hosted Cellaflow engine refuses new work once your org has used its allowance, such as the free step allowance. The SDK raises that refusal as `AllowanceExceededError`, at once, from the call that was refused: starting a `durableTools` block, a tool call, `executionLease` or `taskLease`, or a `CellaflowClient` method. It is final until the allowance resets or the plan changes, so nothing in the SDK asks again or waits for it.
+
+```typescript
+import { AllowanceExceededError, durableTools } from "@cellaflow/sdk";
+
+try {
+  await durableTools(threadId, async () => {
+    await chargeCard(order);
+  });
+} catch (err) {
+  if (!(err instanceof AllowanceExceededError)) throw err;
+  const until = err.resetsAt ? `until ${err.resetsAt.toISOString()}` : "for now";
+  console.log(`Over the ${err.subject} allowance ${until}.`);
+}
+```
+
+- **What it says:** `subject` is what the org is over, such as `cellaflow.steps`; `resetsAt`, a `Date`, is when the allowance resets; `limit` is what the engine stops meanwhile, `new_sessions_blocked` or `writes_blocked`. `resetsAt` and `limit` are absent when the engine does not say. The message says the same in words, followed by the engine's own, and `cause` is the engine's error as it arrived.
+- **Still a `ConnectError`:** its `code` is `Code.ResourceExhausted` (8), so code that checks either keeps matching it. For the same reason its `name` is `ConnectError`: check for it with `instanceof AllowanceExceededError`.
+- **Not a full mailbox:** the engine also answers `RESOURCE_EXHAUSTED` when a session's mailbox is full, which passes, and the SDK asks again as before. Only a refusal whose details say the org is over its allowance is final.
+- **Nothing is recorded for it.** A refused tool call is not recorded as the tool's failure, even when the refusal comes from a call its body made, since it says nothing about the tool, and the next call takes its position. Once the allowance allows, calling the tool again runs it. If the refusal came after the body ran, when its result was to be recorded, that runs the body again: send the call's key to the destination, as above. A result or failure the session still owes a record for is kept, and written by the next call that gets through.
+- **Leases:** a renewal refused this way is not sent again, so the lease lasts until its deadline, as if the engine were unreachable. A tool call or `executionLease` whose lease was granted after a wait does not start its body if the renewal that confirms it is refused.
+
 ## Features
 
 - **Built on Connect-ES**: Uses HTTP/2 for high performance and strict gRPC semantics.
