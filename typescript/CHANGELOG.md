@@ -11,11 +11,26 @@ All notable changes to the Cellaflow TypeScript SDK.
   retried each call until it gave up and then failed without saying why. A `RESOURCE_EXHAUSTED`
   whose details say the org is over its allowance (below) is now raised at once as
   `AllowanceExceededError`, and nothing in the SDK asks it again or waits for it: tool calls, their
-  commits, the records a session owes, session starts, `executionLease`, and lease renewals, which
-  stop at the first one refused, so the lease lasts until its deadline. A refused tool call is not
-  recorded as the tool's failure, even when the refusal comes from a call its body made, and the
-  next call takes its position. A record the session owes is kept for the next call that gets
-  through. A `RESOURCE_EXHAUSTED` without those details is asked again as before.
+  commits, the records a session owes, session starts, `executionLease`, and lease renewals. A
+  `RESOURCE_EXHAUSTED` without those details is asked again as before. A refusal that did not come
+  through this copy's client, such as a raw `ConnectError` with those details or one raised by
+  another copy of the SDK, is treated as final too.
+- **A refused tool call is not recorded as the tool's failure**, and the next call takes its
+  position. That holds when the refusal comes from a call the body made, and when the body raises
+  its own error with the refusal in its `cause` chain (up to 8 links) or an `AggregateError`
+  holding it, at any depth within that bound; the caller still gets the body's own error. A commit
+  that got no answer and was refused over the allowance when sent again raises the refusal, not
+  the first commit's error.
+- **A renewal refused over the allowance stops the renewals**, so the lease lasts until its
+  deadline. A body that finishes before then is recorded as usual. Past it, `LeaseHandle.check()`
+  throws, and `signal` aborts with, a `LeaseLostError` that names the allowance and has the refusal
+  as its `cause`: `executionLease` rejects with it, and a tool call fails with the refusal itself,
+  recording nothing. A lease granted after a wait whose confirming renewal is refused is released,
+  and its body does not run.
+- **A record the session owes is kept** for the next call that gets through when its write is
+  refused over the allowance. A failed call's lease that could not be released is released again
+  first; if that is refused over the allowance, the record waits for the next call while the lease
+  is live, and goes on without it once it has lapsed.
 
 ### Compatibility
 
@@ -30,11 +45,16 @@ All notable changes to the Cellaflow TypeScript SDK.
   holding a `google.rpc.QuotaFailure` with a violation whose subject starts with `cellaflow.`.
   `subject` is the first such subject, such as `cellaflow.steps`. A `google.rpc.ErrorInfo` from
   domain `cellaflow.com` with reason `ALLOWANCE_EXCEEDED` gives `resetsAt`, a `Date` read from its
-  `resets_at` (RFC 3339), and `limit` (`new_sessions_blocked` or `writes_blocked`); both are absent
-  when it is missing or they do not parse. The message says the org is over its allowance, of what,
-  and when it resets, followed by the engine's message, and `cause` is the engine's error. It is a
-  `ConnectError` with code `Code.ResourceExhausted`, so code that checks either still matches it,
-  and so its `name` is `ConnectError`. See "When the org is over its allowance" in the README.
+  `resets_at` (RFC 3339, years from 100 on), and `limit`, typed `AllowanceLimit` (exported):
+  `"new_sessions_blocked" | "writes_blocked"`, or any other name a later engine sends. Both are
+  absent when the ErrorInfo is missing or they do not parse. The message says the org is over its
+  allowance, of what, and when it resets (in UTC, to the second, with milliseconds only when it has
+  them), followed by the engine's message; `rawMessage` holds the same, and the engine's own text is
+  `cause.rawMessage`, `cause` being the engine's error. It is a `ConnectError` with code
+  `Code.ResourceExhausted`, so code that checks either still matches it, and so its `name` is
+  `ConnectError`. See "When the org is over its allowance" in the README.
+- **`LeaseLostError` has a `cause`** when the lease was lost because its renewals were refused over
+  the allowance: the `AllowanceExceededError`.
 
 ## 0.13.0
 

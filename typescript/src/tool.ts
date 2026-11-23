@@ -1,6 +1,7 @@
 import {
-  AllowanceExceededError,
+  carriesAllowanceRefusal,
   hasStatusCode,
+  isAllowanceRefusal,
   isCommittedElsewhere,
   isFailedPrecondition,
   isRetryable,
@@ -205,13 +206,17 @@ export function tool<A extends unknown[], R>(
         ctx.giveBackPosition(seq);
         throw err;
       }
-      if (err instanceof AllowanceExceededError) {
+      if (carriesAllowanceRefusal(err)) {
         // Refused because the org is over its allowance, by this call's own
         // request or by one its body made. That says nothing about the step,
         // so it is not recorded as its failure: a resume that replays the
         // record would raise it again after the allowance is back. Nothing is
         // recorded and the position goes back, as for a takeover, so calling
         // the tool again once the allowance allows claims it and runs the call.
+        // The same for a body that caught the refusal and raised its own error
+        // with it as the cause, or an AggregateError holding it: the body
+        // failed because of the refusal all the same. The caller still gets
+        // the body's own error.
         ctx.giveBackPosition(seq);
         throw err;
       }
@@ -424,10 +429,10 @@ export function tool<A extends unknown[], R>(
           // answered at once.
           acquiredExpiresAtMs:
             !late && resp.leaseExpiresAtMs !== undefined ? Number(resp.leaseExpiresAtMs) : undefined,
-          onLeaseLost: (detail) => {
+          onLeaseLost: (detail, cause) => {
             if (releasing) return;
             if (committing) lossDuringCommit = detail;
-            else leaseHandle.markLost(detail);
+            else leaseHandle.markLost(detail, cause);
           },
         });
         if (late) await hb.confirmGrant();
@@ -555,6 +560,10 @@ export function tool<A extends unknown[], R>(
         committing = false;
         if (isStaleLease(err) || isCommittedElsewhere(err)) throw takenOver(result, err);
         if (outcome?.takenOver) throw takenOver(result, outcome.error);
+        // The same commit sent again was refused because the org is over its
+        // allowance: that answer, not the first one's silence, is what the
+        // caller hears, and like any refusal it is not recorded.
+        if (outcome && isAllowanceRefusal(outcome.error)) throw outcome.error;
         throw err;
       }
       return result;
@@ -596,7 +605,7 @@ export function tool<A extends unknown[], R>(
       // A commit refused because the org is over its allowance did not land,
       // so a lease that would not be released is no longer this call's, and
       // the same commit sent again would only be refused again.
-      if (known.lost && returned && !(err instanceof LeaseLostError) && !(err instanceof AllowanceExceededError)) {
+      if (known.lost && returned && !(err instanceof LeaseLostError) && !isAllowanceRefusal(err)) {
         // The commit failed and the lease would not be released. Either the
         // commit landed and only its answer was lost, which completed the key
         // under this call's own token, or another worker holds the call. The
@@ -608,11 +617,19 @@ export function tool<A extends unknown[], R>(
         }
         if (outcome.takenOver) throw takenOver(returned.result, outcome.error);
         // Unknown: the call is not treated as taken over, and fails as it
-        // would have.
+        // would have, unless the commit sent again was refused because the
+        // org is over its allowance, which is then what the caller hears.
         known.lost = false;
+        if (isAllowanceRefusal(outcome.error)) err = outcome.error;
       }
       if (known.lost) handle?.markLost("the engine would not release the lease: it is no longer this call's");
       applyHeldLoss();
+      // The lease was lost at its deadline because the engine refused to renew
+      // it, the org being over its allowance, and the body stopped on that
+      // loss: the refusal is what stopped the call, so the caller hears it,
+      // and like any refusal it is not recorded.
+      const refusal = hb?.allowanceRefusal;
+      if (refusal && err instanceof LeaseLostError && err.cause === refusal) throw refusal;
       throw err;
     } finally {
       // Already marked on every path that ran the body; this covers the rest.

@@ -28,8 +28,9 @@ export class AllowanceExceededError extends ConnectError {
   /**
    * What the engine stops while the org is over its allowance, as it names it:
    * `new_sessions_blocked` or `writes_blocked`. Absent when it did not say.
+   * Any other name a later engine sends is kept as it is.
    */
-  declare readonly limit?: string;
+  declare readonly limit?: AllowanceLimit;
 
   /**
    * @param init.message The engine's message, kept at the end of this error's.
@@ -38,7 +39,7 @@ export class AllowanceExceededError extends ConnectError {
   constructor(init: {
     subject: string;
     resetsAt?: Date;
-    limit?: string;
+    limit?: AllowanceLimit;
     message?: string;
     cause?: unknown;
     metadata?: ConstructorParameters<typeof ConnectError>[2];
@@ -74,7 +75,16 @@ export class AllowanceExceededError extends ConnectError {
   }
 }
 
-/** The plain words of an {@link AllowanceExceededError}. */
+/**
+ * What the engine stops while an org is over its allowance. The two it sends
+ * today, or any other name, so a later one still reads.
+ */
+export type AllowanceLimit = "new_sessions_blocked" | "writes_blocked" | (string & {});
+
+/**
+ * The plain words of an {@link AllowanceExceededError}. The reset is shown in
+ * UTC to the second, with milliseconds only when it has them.
+ */
 function allowanceMessage(subject: string, resetsAt: Date | undefined, engineMessage: string): string {
   let text = `The Cellaflow org is over its allowance for ${subject}, so the engine refused this call.`;
   if (resetsAt) text += ` The allowance resets at ${resetsAt.toISOString().replace(".000Z", "Z")}.`;
@@ -127,6 +137,53 @@ export function allowanceRefusal(err: unknown): AllowanceExceededError | undefin
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Whether `err` is a refusal because the org is over its allowance: one this
+ * SDK's client raised, or one that never went through it, such as a raw
+ * `ConnectError` or one raised by another copy of this SDK, read from its
+ * details. Every decision that treats the refusal as final asks this.
+ */
+export function isAllowanceRefusal(err: unknown): boolean {
+  return err instanceof AllowanceExceededError || allowanceRefusal(err) !== undefined;
+}
+
+/** How many `cause` links, or levels of AggregateError, are followed looking for a refusal. */
+const MAX_REFUSAL_DEPTH = 8;
+/** How many errors are looked at, at most, so a wide AggregateError costs a bounded amount. */
+const MAX_REFUSAL_ERRORS = 64;
+
+/**
+ * Whether `err` is an allowance refusal, or carries one: in its `cause` chain,
+ * up to {@link MAX_REFUSAL_DEPTH} links, or among the errors of an
+ * AggregateError, at any level within that depth. Cycles end the search, and
+ * it never throws.
+ *
+ * A tool body that catches a refusal and raises its own error, or that runs
+ * calls together and raises their AggregateError, failed because of the
+ * refusal all the same: it says nothing about the step, so it is not recorded
+ * as the step's failure either.
+ */
+export function carriesAllowanceRefusal(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  const queue: Array<[unknown, number]> = [[err, 0]];
+  while (queue.length > 0 && seen.size < MAX_REFUSAL_ERRORS) {
+    const [value, depth] = queue.shift()!;
+    if (typeof value !== "object" || value === null || seen.has(value)) continue;
+    seen.add(value);
+    if (isAllowanceRefusal(value)) return true;
+    if (depth >= MAX_REFUSAL_DEPTH) continue;
+    try {
+      if ("cause" in value) queue.push([(value as { cause?: unknown }).cause, depth + 1]);
+      if (value instanceof AggregateError && Array.isArray(value.errors)) {
+        for (const member of value.errors.slice(0, MAX_REFUSAL_ERRORS)) queue.push([member, depth + 1]);
+      }
+    } catch {
+      // A getter that throws hides what is behind it.
+    }
+  }
+  return false;
 }
 
 /** An RFC 3339 timestamp: date, `T`, time, optional fraction, and `Z` or an offset. */
@@ -267,7 +324,7 @@ const NETWORK_ERROR_CODES = new Set<unknown>([
  * engine's answer, not a call that went unanswered.
  */
 export function isRetryable(err: unknown): boolean {
-  if (err instanceof AllowanceExceededError) return false;
+  if (isAllowanceRefusal(err)) return false;
   const code = codeOf(err);
   if (hasStatusCode(err)) return RETRYABLE_CODES.has(code);
   return NETWORK_ERROR_CODES.has(code);

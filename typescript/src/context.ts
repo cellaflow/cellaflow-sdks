@@ -12,9 +12,9 @@ import {
   afterInProgress,
 } from "./wait.js";
 import {
-  AllowanceExceededError,
   errorCode,
   hasStatusCode,
+  isAllowanceRefusal,
   isFailedPrecondition,
   isNotFound,
   isPositionCommitted,
@@ -416,7 +416,7 @@ export class WorkflowContext {
       // is still owed, and a caller that catches the refusal and carries on once
       // the allowance is back writes it then. Nothing here asks again or waits
       // for that.
-      if (err instanceof AllowanceExceededError) throw err;
+      if (isAllowanceRefusal(err)) throw err;
       // The record will not be accepted: another writer in this session took the
       // position first, the engine refused the write itself, or it failed before
       // reaching the engine and would fail the same way on every retry. Read where
@@ -564,11 +564,19 @@ export class WorkflowContext {
       );
       pending.unreleased = undefined;
     } catch (err) {
-      // Refused because the org is over its allowance, so the lease is still
-      // there, and so is the record's need to wait for it. Leasing the record
-      // now would be refused for the same reason or for that lease, so the
-      // write fails at once, keeping both, rather than wait.
-      if (err instanceof AllowanceExceededError) throw err;
+      if (isAllowanceRefusal(err)) {
+        // Refused because the org is over its allowance. A lease past its
+        // lapse no longer claims the position, so the record goes on to its
+        // own lease without it. One still live is there, and so is the
+        // record's need to wait for it; leasing the record now would be
+        // refused for the same reason or for that lease, so the write fails
+        // at once, keeping both, rather than wait.
+        if ((unreleased.lapsesAt ?? 0) <= Date.now()) {
+          pending.unreleased = undefined;
+          return;
+        }
+        throw err;
+      }
       // Already released or lapsed: nothing is left to free.
       if (!isRetryable(err)) pending.unreleased = undefined;
     }

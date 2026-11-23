@@ -1,6 +1,6 @@
 import type { CellaflowClient } from "./client.js";
 import { RenewFailureReason } from "./cellaflow/v1/idempotency_pb.js";
-import { AllowanceExceededError } from "./errors.js";
+import { type AllowanceExceededError, allowanceRefusal } from "./errors.js";
 
 /** Why the engine refused to renew, in words a caller can act on. */
 function renewFailureDetail(reason: RenewFailureReason | undefined): string {
@@ -102,8 +102,12 @@ export interface LeaseHeartbeatOptions {
    * Defaults to half a heartbeat interval, capped at half of `extendMs`.
    */
   marginMs?: number;
-  /** Called once when the lease is determined to be lost. */
-  onLeaseLost?: (detail: string) => void;
+  /**
+   * Called once when the lease is determined to be lost. `cause` is the
+   * refusal that stopped the renewals, when the engine refused them because
+   * the org is over its allowance.
+   */
+  onLeaseLost?: (detail: string, cause?: AllowanceExceededError) => void;
   /** Called on every renewal outcome, for tracing. */
   onEvent?: (event: LeaseEvent) => void;
 }
@@ -286,6 +290,7 @@ export class LeaseHeartbeat {
               `allowance for ${this.allowanceRefusal.subject}. The lease may already belong to another worker`
           : `no renewal was confirmed in time: the lease may already belong to another worker`,
         false,
+        this.allowanceRefusal,
       );
       return true;
     }
@@ -354,8 +359,9 @@ export class LeaseHeartbeat {
    * @param final True when the engine refused the lease, so renewing is over.
    *   A passed deadline is not final: the holder must stop acting, but the
    *   engine may still hold the lease, and renewing keeps it until it refuses.
+   * @param cause The refusal that stopped the renewals, if that is why.
    */
-  private notifyLost(detail: string, final: boolean): void {
+  private notifyLost(detail: string, final: boolean, cause?: AllowanceExceededError): void {
     if (final) void this.stop();
     if (this.lost) {
       // Already reported on the deadline; now the engine has answered. Say so,
@@ -371,7 +377,7 @@ export class LeaseHeartbeat {
     // onLeaseLost first: it is what marks the handle lost, so a tracer that
     // looks at the handle from the "lost" event already sees it lost.
     try {
-      this.opts.onLeaseLost?.(detail);
+      this.opts.onLeaseLost?.(detail, cause);
     } catch {
       // A caller's callback must not take down the heartbeat.
     }
@@ -470,12 +476,14 @@ export class LeaseHeartbeat {
       // the deadline it would be judged against is the one known to be stale.
       const msg = err instanceof Error ? err.message : String(err);
       this.emit({ type: "renew_failed", detail: msg });
-      if (err instanceof AllowanceExceededError) {
+      const refusal = allowanceRefusal(err);
+      if (refusal) {
         // Refused because the org is over its allowance: an answer, which the
         // engine gives every renewal until the allowance is back, so renewing
         // stops here rather than be refused every interval. The lease is not
-        // lost yet: it lasts until its deadline, which still reports the loss.
-        this.allowanceRefusal = err;
+        // lost yet: it lasts until its deadline, which reports the loss with
+        // this refusal as its cause.
+        this.allowanceRefusal = refusal;
         if (this.timer) {
           clearInterval(this.timer);
           this.timer = undefined;

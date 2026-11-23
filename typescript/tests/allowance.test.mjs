@@ -18,14 +18,22 @@ import {
   AllowanceExceededError,
   CacheStatus,
   CellaflowClient,
+  LeaseLostError,
   StepStatus,
   WorkflowContext,
+  currentLease,
   durableTools,
   executionLease,
   tool,
 } from "../dist/index.js";
 import { runWithContext } from "../dist/context.js";
-import { allowanceRefusal, hasStatusCode, isRetryable } from "../dist/errors.js";
+import {
+  allowanceRefusal,
+  carriesAllowanceRefusal,
+  hasStatusCode,
+  isAllowanceRefusal,
+  isRetryable,
+} from "../dist/errors.js";
 import { LeaseHeartbeat } from "../dist/lease.js";
 import { serialize } from "../dist/serialization.js";
 import { MAX_UNANSWERED } from "../dist/wait.js";
@@ -66,6 +74,43 @@ const mailboxFull = () => new ConnectError("session mailbox is full", Code.Resou
 
 /** The engine unavailable: no answer either way. */
 const unavailable = () => new ConnectError("engine unavailable", Code.Unavailable);
+
+/**
+ * A refusal as another copy of the SDK, with its own copy of Connect, raises
+ * it: shaped like a ConnectError, carrying the details, but none of this
+ * copy's classes.
+ */
+function foreignRefusal() {
+  const err = new Error("[resource_exhausted] The Cellaflow org is over its allowance for cellaflow.steps");
+  return Object.assign(err, {
+    name: "ConnectError",
+    code: 8,
+    metadata: new Headers(),
+    details: allowanceDetails(),
+    rawMessage: "The Cellaflow org is over its allowance for cellaflow.steps",
+    cause: undefined,
+    findDetails: ConnectError.prototype.findDetails,
+  });
+}
+
+/**
+ * Moves both clocks the heartbeat reads forward by `ms`, as a process stopped
+ * for that long sees them when it resumes. Returns a function that undoes it.
+ */
+function jumpClocks(ms) {
+  const perf = performance.now.bind(performance);
+  const wall = Date.now;
+  // Defined rather than assigned: on some Node versions performance.now is an
+  // inherited read-only property, which an own property can still shadow.
+  const own = Object.getOwnPropertyDescriptor(performance, "now");
+  Object.defineProperty(performance, "now", { value: () => perf() + ms, configurable: true, writable: true });
+  Date.now = () => wall() + ms;
+  return () => {
+    if (own) Object.defineProperty(performance, "now", own);
+    else delete performance.now;
+    Date.now = wall;
+  };
+}
 
 // --- Recognising the refusal ---------------------------------------------
 
@@ -239,6 +284,16 @@ test("resets_at and limit, present, absent and unparsable", () => {
   }
 });
 
+test("the reset is shown in UTC to the second, with milliseconds only when it has them", () => {
+  const read = (resetsAt) =>
+    allowanceRefusal(exhausted([quotaFailure("cellaflow.steps"), errorInfo({ resets_at: resetsAt })])).message;
+  assert.match(read("2026-12-01T00:00:00Z"), /resets at 2026-12-01T00:00:00Z\./);
+  assert.match(read("2026-12-01T00:00:00.000Z"), /resets at 2026-12-01T00:00:00Z\./);
+  assert.match(read("2026-12-01T01:30:00+01:30"), /resets at 2026-12-01T00:00:00Z\./);
+  assert.match(read("2026-12-01T00:00:00.5Z"), /resets at 2026-12-01T00:00:00\.500Z\./);
+  assert.match(read("2026-12-01T00:00:00.123456Z"), /resets at 2026-12-01T00:00:00\.123Z\./);
+});
+
 test("the first cellaflow. violation names the refusal", () => {
   const one = allowanceRefusal(exhausted([quotaFailure("projects/1/quota", "cellaflow.storage", "cellaflow.steps")]));
   assert.equal(one.subject, "cellaflow.storage");
@@ -263,6 +318,56 @@ test("an allowance refusal is final, and a full mailbox still may pass", () => {
   // Both are the engine's answers.
   assert.equal(hasStatusCode(overAllowance()), true);
   assert.equal(hasStatusCode(mailboxFull()), true);
+});
+
+test("a refusal that never went through this copy's client is final too", () => {
+  // Raw, as a client that skips the conversion raises it, and from another
+  // copy of the SDK, whose class this copy does not know.
+  for (const [what, err] of [["raw", exhausted(allowanceDetails())], ["foreign", foreignRefusal()]]) {
+    assert.equal(err instanceof AllowanceExceededError, false, what);
+    assert.equal(isAllowanceRefusal(err), true, what);
+    assert.equal(isRetryable(err), false, what);
+  }
+  assert.equal(isAllowanceRefusal(mailboxFull()), false);
+  assert.equal(isAllowanceRefusal(undefined), false);
+});
+
+test("a refusal is found behind causes and inside AggregateErrors, within bounds", () => {
+  const refusal = overAllowance();
+  const chain = (links, end) => {
+    let err = end;
+    for (let i = 0; i < links; i++) err = new Error(`link ${i}`, { cause: err });
+    return err;
+  };
+  assert.equal(carriesAllowanceRefusal(refusal), true);
+  assert.equal(carriesAllowanceRefusal(chain(1, refusal)), true);
+  assert.equal(carriesAllowanceRefusal(chain(8, refusal)), true);
+  assert.equal(carriesAllowanceRefusal(chain(9, refusal)), false);
+  assert.equal(carriesAllowanceRefusal(chain(2, exhausted(allowanceDetails()))), true);
+  assert.equal(carriesAllowanceRefusal(chain(2, foreignRefusal())), true);
+  assert.equal(carriesAllowanceRefusal(new AggregateError([new Error("timeout"), refusal], "every route failed")), true);
+  assert.equal(
+    carriesAllowanceRefusal(new AggregateError([new AggregateError([chain(1, refusal)], "inner")], "outer")),
+    true,
+  );
+  assert.equal(carriesAllowanceRefusal(new Error("wrapped", { cause: new AggregateError([refusal]) })), true);
+  // Not a refusal, however it is wrapped.
+  assert.equal(carriesAllowanceRefusal(chain(3, mailboxFull())), false);
+  assert.equal(carriesAllowanceRefusal(new AggregateError([mailboxFull(), new Error("x")])), false);
+  for (const value of [undefined, null, "refused", 8]) assert.equal(carriesAllowanceRefusal(value), false);
+  // A cycle ends the search, and a cause that cannot be read hides only itself.
+  const a = new Error("a");
+  const b = new Error("b", { cause: a });
+  a.cause = b;
+  assert.equal(carriesAllowanceRefusal(a), false);
+  const hidden = new Error("hidden");
+  Object.defineProperty(hidden, "cause", {
+    get() {
+      throw new Error("no cause for you");
+    },
+  });
+  assert.equal(carriesAllowanceRefusal(hidden), false);
+  assert.equal(carriesAllowanceRefusal(new AggregateError([hidden, refusal])), true);
 });
 
 // --- Every call site, with a scripted engine -----------------------------
@@ -640,6 +745,251 @@ test("a late grant whose renewal finds the mailbox full still tries again before
   assert.equal(client.count("acquire"), 1);
 });
 
+test("a commit sent again after no answer and refused over the allowance raises the refusal", async () => {
+  const client = scriptedClient({ commit: [unavailable(), overAllowance()] });
+  const charge = tool(async () => "charged", { toolName: "charge" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), isAllowance);
+    assert.equal(await notify(), "notified");
+  });
+  // Nothing recorded at position 1, which notify takes.
+  assert.equal(client.count("recordAcquire"), 0);
+  assert.deepEqual(committed(client), [[1, "charge"], [1, "charge"], [1, "notify"]]);
+});
+
+test("a commit sent again after a refused release and refused over the allowance raises the refusal", async () => {
+  // The first commit and the one sent after it get no answer; the lease is
+  // not released, so the commit is sent once more to tell a landed commit
+  // from a takeover, and that one is refused over the allowance.
+  const client = scriptedClient({
+    commit: [unavailable(), unavailable(), overAllowance()],
+    release: [{ released: false }],
+  });
+  const charge = tool(async () => "charged", { toolName: "charge" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), isAllowance);
+    assert.equal(await notify(), "notified");
+  });
+  assert.equal(client.count("recordAcquire"), 0);
+  assert.deepEqual(committed(client), [[1, "charge"], [1, "charge"], [1, "charge"], [1, "notify"]]);
+});
+
+/** A grant answered at once whose renewals are due every 20 ms. */
+const quickRenewals = () => ({ status: CacheStatus.ACQUIRED, fencingToken: 7n, heartbeatIntervalMs: 20n });
+
+test("a tool body that finishes within its lease after a refused renewal commits normally", async () => {
+  const client = scriptedClient({ acquire: [quickRenewals()], renew: [overAllowance()] });
+  const charge = tool(
+    async () => {
+      await sleep(80);
+      return "charged";
+    },
+    { toolName: "charge", ttlMs: 1000 },
+  );
+  assert.equal(await runWithContext(session(client), () => charge()), "charged");
+  assert.equal(client.count("renew"), 1);
+  assert.deepEqual(committed(client), [[1, "charge"]]);
+  assert.equal(client.count("release"), 0);
+});
+
+test("a tool body stopped at its deadline after a refused renewal raises the refusal, and nothing is recorded", async () => {
+  const client = scriptedClient({ acquire: [quickRenewals()], renew: [overAllowance()] });
+  let seen;
+  const charge = tool(
+    async () => {
+      // The refused renewal is due after 20 ms; the process then stalls past
+      // the lease's deadline, and the body checks before acting.
+      await sleep(80);
+      const restore = jumpClocks(5000);
+      try {
+        currentLease().check();
+      } catch (err) {
+        seen = err;
+        throw err;
+      } finally {
+        restore();
+      }
+      return "charged";
+    },
+    { toolName: "charge", ttlMs: 1000 },
+  );
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), isAllowance);
+    assert.equal(await notify(), "notified");
+  });
+  // The body saw the loss, caused by the refusal.
+  assert.ok(seen instanceof LeaseLostError);
+  assert.match(seen.message, /over its allowance for cellaflow\.steps/);
+  assert.ok(seen.cause instanceof AllowanceExceededError);
+  assert.equal(client.count("renew"), 1);
+  assert.deepEqual(client.of("release").map((c) => c.reason), ["TOOL_ERROR"]);
+  assert.equal(client.count("recordAcquire"), 0);
+  assert.deepEqual(committed(client), [[1, "notify"]]);
+});
+
+test("a failure record whose lease has lapsed goes on when its release is refused over the allowance", async () => {
+  // The failed call's lease could not be released, and by the next call it
+  // has lapsed: it no longer claims position 1, so the record does not wait
+  // for the allowance to release it.
+  const client = scriptedClient({ release: [unavailable(), overAllowance()] });
+  const charge = tool(async () => { throw new Error("boom"); }, { toolName: "charge", ttlMs: 1000 });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), /boom/);
+    const restore = jumpClocks(5000);
+    try {
+      assert.equal(await notify(), "notified");
+    } finally {
+      restore();
+    }
+  });
+  assert.equal(client.count("release"), 2);
+  assert.equal(client.count("recordAcquire"), 1);
+  assert.deepEqual(committed(client), [[1, "charge"], [2, "notify"]]);
+});
+
+test("a body's own error caused by a refusal is not recorded, and the caller gets that error", async () => {
+  const client = scriptedClient({ acquire: [undefined, overAllowance()] });
+  const charge = tool(async () => "charged", { toolName: "charge" });
+  const book = tool(
+    async () => {
+      try {
+        return await charge();
+      } catch (err) {
+        throw new Error("could not book the trip", { cause: err });
+      }
+    },
+    { toolName: "book" },
+  );
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(book(), (err) => {
+      assert.equal(err instanceof AllowanceExceededError, false);
+      assert.match(err.message, /could not book the trip/);
+      return true;
+    });
+    assert.equal(await notify(), "notified");
+  });
+  assert.equal(client.count("recordAcquire"), 0);
+  assert.deepEqual(committed(client), [[1, "notify"]]);
+});
+
+test("an AggregateError holding a refusal is not recorded, and the caller gets it", async () => {
+  const client = scriptedClient();
+  const route = tool(
+    async () => {
+      throw new AggregateError([new Error("route A timed out"), new Error("route B", { cause: overAllowance() })], "every route failed");
+    },
+    { toolName: "route" },
+  );
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(route(), (err) => err instanceof AggregateError && /every route failed/.test(err.message));
+    assert.equal(await notify(), "notified");
+  });
+  assert.equal(client.count("recordAcquire"), 0);
+  assert.deepEqual(committed(client), [[1, "notify"]]);
+});
+
+test("a refusal that never went through this copy's client is final at a call site", async () => {
+  for (const refusal of [exhausted(allowanceDetails()), foreignRefusal()]) {
+    const client = scriptedClient({ acquire: [refusal] });
+    const charge = tool(async () => "charged", { toolName: "charge" });
+    const notify = tool(async () => "notified", { toolName: "notify" });
+    await runWithContext(session(client), async () => {
+      const started = performance.now();
+      await assert.rejects(charge(), (err) => err === refusal);
+      assert.ok(performance.now() - started < 150, "the refusal waited before failing");
+      assert.equal(await notify(), "notified");
+    });
+    assert.deepEqual(client.of("acquire").map((c) => c.sequence), [1, 1]);
+    assert.equal(client.count("recordAcquire"), 0);
+  }
+});
+
+test("a renewal or a record refused by a refusal from outside this copy's client is final too", async () => {
+  for (const refusal of [exhausted(allowanceDetails()), foreignRefusal()]) {
+    const renewals = scriptedClient({ renew: [refusal] });
+    const hb = new LeaseHeartbeat({
+      client: renewals,
+      agentId: "agent",
+      idempotencyKey: "key",
+      fencingToken: 1,
+      heartbeatIntervalMs: 20,
+      extendMs: 400,
+      leaseTtlMs: 400,
+    });
+    try {
+      hb.start();
+      await sleep(120);
+      assert.equal(renewals.count("renew"), 1);
+      assert.equal(hb.allowanceRefusal?.subject, "cellaflow.steps");
+    } finally {
+      await hb.stop();
+    }
+
+    const records = scriptedClient({ acquire: [hit("placed-elsewhere")], recordAcquire: [refusal] });
+    const place = tool(async () => "placed-here", { toolName: "place_order" });
+    const confirm = tool(async () => "confirmed", { toolName: "send_confirmation" });
+    const warned = await warnings(() =>
+      runWithContext(session(records), async () => {
+        await place();
+        await assert.rejects(confirm(), (err) => err === refusal);
+        assert.equal(await confirm(), "confirmed");
+      }),
+    );
+    assert.deepEqual(committed(records), [[1, "place_order"], [2, "send_confirmation"]]);
+    assert.deepEqual(warned, []);
+  }
+});
+
+test("a call refused while a later one runs leaves its position empty and stops recording", async () => {
+  // charge claims 1 and slow claims 2 before either reaches the engine. The
+  // refusal cannot hand back position 1 with 2 claimed above it, so 1 stays
+  // empty and the run stops recording, as for any call that overlaps.
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const client = scriptedClient({ acquire: [overAllowance()] });
+  const charge = tool(async () => "charged", { toolName: "charge" });
+  const slow = tool(async () => { await gate; return "slow"; }, { toolName: "slow" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    const results = await Promise.allSettled([charge().finally(() => release()), slow()]);
+    assert.ok(isAllowance(results[0].reason));
+    assert.equal(results[1].value, "slow");
+    assert.equal(ctx.historyKnown, false);
+    assert.equal(await notify(), "notified");
+  });
+  assert.deepEqual(client.of("acquire").map((c) => c.sequence), [1, 2, 3]);
+  assert.equal(client.count("recordAcquire"), 0);
+  assert.deepEqual(committed(client), [[2, "slow"], [3, "notify"]]);
+});
+
+test("a call refused while an earlier one runs hands back its position", async () => {
+  // slow holds 1; charge claims 2, the top, and is refused, so the next call
+  // takes 2 again.
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const client = scriptedClient({ acquire: [undefined, overAllowance()] });
+  const slow = tool(async () => { await gate; return "slow"; }, { toolName: "slow" });
+  const charge = tool(async () => "charged", { toolName: "charge" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    const results = await Promise.allSettled([slow(), charge().finally(() => release())]);
+    assert.equal(results[0].value, "slow");
+    assert.ok(isAllowance(results[1].reason));
+    assert.equal(ctx.historyKnown, true);
+    assert.equal(await notify(), "notified");
+  });
+  assert.deepEqual(client.of("acquire").map((c) => c.sequence), [1, 2, 2]);
+  assert.deepEqual(committed(client), [[1, "slow"], [2, "notify"]]);
+});
+
 // --- Over the real transport ---------------------------------------------
 
 /** What an engine over the allowance raises, as the engine sends it. */
@@ -800,6 +1150,43 @@ test("an execution lease whose renewal is refused over the allowance does not st
     isEngineRefusal,
   );
   assert.equal(ran, false);
+  assert.deepEqual(served, ["checkIdempotencyCache", "renewLease", "releaseLease"]);
+});
+
+test("an execution lease whose renewal is refused mid-block is lost at its deadline, caused by the refusal", async () => {
+  engineAnswers((name) => {
+    if (name === "checkIdempotencyCache") return { status: CacheStatus.ACQUIRED, fencingToken: 7n, heartbeatIntervalMs: 20n };
+    if (name === "renewLease") throw engineRefusal();
+  });
+  let lostDetail;
+  let reason;
+  await assert.rejects(
+    executionLease(
+      "task:2",
+      { workerId: "worker-1", target, ttlMs: 1000, onLeaseLost: (detail) => (lostDetail = detail) },
+      async (lease) => {
+        // The refused renewal is due after 20 ms; the block then stalls past
+        // the lease's deadline and checks before acting.
+        await sleep(80);
+        const restore = jumpClocks(5000);
+        try {
+          lease.check();
+        } finally {
+          reason = lease.signal.reason;
+          restore();
+        }
+      },
+    ),
+    (err) => {
+      assert.ok(err instanceof LeaseLostError);
+      assert.match(err.message, /over its allowance for cellaflow\.steps/);
+      return isEngineRefusal(err.cause);
+    },
+  );
+  assert.match(lostDetail, /over its allowance for cellaflow\.steps/);
+  assert.ok(reason instanceof LeaseLostError);
+  assert.ok(reason.cause instanceof AllowanceExceededError);
+  // Renewed once, refused, and never asked again; released as the block ends.
   assert.deepEqual(served, ["checkIdempotencyCache", "renewLease", "releaseLease"]);
 });
 

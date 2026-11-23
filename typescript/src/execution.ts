@@ -91,7 +91,11 @@ function holderInfo(holder: LeaseHolder | undefined): LeaseHolderInfo | undefine
   });
 }
 
-/** Raised by `LeaseHandle.check()` once the lease has been lost. */
+/**
+ * Raised by `LeaseHandle.check()` once the lease has been lost. When it was
+ * lost because the engine refused its renewals, the org being over its
+ * allowance, its `cause` is that refusal, an `AllowanceExceededError`.
+ */
 export class LeaseLostError extends Error {
   /**
    * What a `tool()` body returned before the engine refused to record it,
@@ -155,6 +159,8 @@ export class LeaseHandle {
   readonly #key: string;
   private readonly controller = new AbortController();
   private lostDetail?: string;
+  /** What lost the lease, when that is known: the refusal that stopped its renewals. */
+  private lostCause?: unknown;
   private released = false;
   private readonly probe?: () => void;
 
@@ -308,11 +314,21 @@ export class LeaseHandle {
     this.released = true;
   }
 
-  /** @internal */
-  markLost(detail: string): void {
+  /**
+   * @internal
+   * @param cause Why, when it is known: the refusal that stopped the lease's
+   *   renewals because the org is over its allowance. Carried as the `cause`
+   *   of every LeaseLostError the handle raises from here on.
+   */
+  markLost(detail: string, cause?: unknown): void {
     if (this.controller.signal.aborted) return;
     this.lostDetail = detail;
-    this.controller.abort(new LeaseLostError(`Execution lease was lost: ${detail}`));
+    this.lostCause = cause;
+    this.controller.abort(new LeaseLostError(`Execution lease was lost: ${detail}`, this.lostOptions()));
+  }
+
+  private lostOptions(): { cause: unknown } | undefined {
+    return this.lostCause === undefined ? undefined : { cause: this.lostCause };
   }
 
   /**
@@ -329,11 +345,10 @@ export class LeaseHandle {
    */
   check(): void {
     if (!this.isLost) return;
-    throw new LeaseLostError(
-      this.controller.signal.aborted
-        ? `Execution lease was lost: ${this.lostDetail}`
-        : "Execution lease was released when its block exited",
-    );
+    if (this.controller.signal.aborted) {
+      throw new LeaseLostError(`Execution lease was lost: ${this.lostDetail}`, this.lostOptions());
+    }
+    throw new LeaseLostError("Execution lease was released when its block exited");
   }
 }
 
@@ -539,8 +554,8 @@ export async function executionLease<T>(
       acquiredExpiresAtMs:
         waitMs === 0 && resp.leaseExpiresAtMs !== undefined ? Number(resp.leaseExpiresAtMs) : undefined,
       onEvent,
-      onLeaseLost: (detail) => {
-        leaseHandle.markLost(detail);
+      onLeaseLost: (detail, cause) => {
+        leaseHandle.markLost(detail, cause);
         try {
           onLeaseLost?.(detail);
         } catch {
