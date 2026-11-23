@@ -180,8 +180,20 @@ class WorkflowContext:
     # Positions below the top that a call claimed and left unwritten, and could
     # not give back, because a later one was claimed meanwhile. When the top is
     # given back, the counter steps down through any of these just below it.
-    # See `give_back_position`.
+    # See `give_back_refused_position`.
     _vacated: "set[int]" = field(default_factory=set, repr=False, compare=False)
+    # Releases owed at a position: the lease of a call an allowance refusal
+    # stopped, which it could not release, by the position the call gave back
+    # or vacated. Settled before a call claims that position. See
+    # `_settle_owed`.
+    _owed: Dict[int, List[Dict[str, Any]]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    # The settling of an owed release that async steps are waiting on. See
+    # `begin_call_async`.
+    _owing: "Optional[asyncio.Task[None]]" = field(
+        default=None, repr=False, compare=False
+    )
     # The refusal that stopped this run's replay, if one did. Every later step
     # raises it again, and so does the workflow's end. See `refuse`.
     _refusal: Optional[BaseException] = field(default=None, repr=False, compare=False)
@@ -263,7 +275,18 @@ class WorkflowContext:
                 # Shielded: one caller being cancelled does not stop the write
                 # the others are waiting on.
                 await asyncio.shield(settling)
-            position, wait = self._try_claim()
+            if self._owed.get(self.sequence + 1):
+                # A release owed at the next position is an engine call too,
+                # so it is sent on a worker thread, not the loop. Every call
+                # that finds it owed waits on the same settling, and they
+                # resume in the order they arrived, then look again.
+                owing = self._owing
+                if owing is None or owing.done() or owing.get_loop() is not loop:
+                    owing = loop.create_task(self._settle_owed_async())
+                    self._owing = owing
+                await asyncio.shield(owing)
+                continue
+            position, wait = self._try_claim(send=False)
             if position is not None:
                 return position
             await asyncio.sleep(wait)
@@ -320,21 +343,91 @@ class WorkflowContext:
         with self._lock:
             return self._reconcile_or_wait()
 
-    def _try_claim(self) -> Tuple[Optional[int], float]:
+    def _try_claim(self, send: bool = True) -> Tuple[Optional[int], float]:
         """One attempt to claim a position: the position, or how long to wait.
 
         Settling the pending record and claiming are one locked step, so no
-        other call can hold a new record in between.
+        other call can hold a new record in between. So is settling a release
+        owed at the position, which `send` lets this send; without it, the
+        caller sends it first (`_settle_owed_next`) and tries again.
         """
         self._prepare_pending()
         with self._lock:
             wait = self._reconcile_or_wait()
             if wait:
                 return None, wait
+            owed = self._settle_owed(self.sequence + 1, send)
+            if owed is None or owed:
+                return None, owed or 0.0
             self.sequence += 1
             self._in_flight += 1
             self._vacated.discard(self.sequence)
             return self.sequence, 0.0
+
+    async def _settle_owed_async(self) -> None:
+        """Settles the release owed at the next position on a worker thread,
+        waiting out a lease that cannot be released yet."""
+        while True:
+            wait = await asyncio.to_thread(self._settle_owed_next)
+            if not wait:
+                return
+            await asyncio.sleep(wait)
+
+    def _settle_owed_next(self) -> float:
+        """Settles the release owed at the next position, if one is: 0, or how
+        long to wait before trying again."""
+        with self._lock:
+            return self._settle_owed(self.sequence + 1, True) or 0.0
+
+    def _settle_owed(self, position: int, send: bool) -> Optional[float]:
+        """Settles the releases owed at `position` before a call claims it: 0
+        once none is left, how long to wait before asking again, or None when
+        one must be sent and `send` is false. Under the lock; never sleeps.
+
+        A lease that has lapsed is dropped. One whose token is known is released
+        (reason TOOL_ERROR): released, or answered as no longer the call's, it is
+        dropped. Refused because the org is over its allowance, it stays owed and
+        the refusal is raised, so the call fails at once without claiming the
+        position. An error that may pass leaves it to lapse: it is waited out,
+        then dropped. Any other error drops it, as a failed release always was.
+        A lease whose token was never known (a request whose answer was lost)
+        is waited out the same way. When it lapses was counted from the
+        hand-back, with a second's grace already in it, as in the TypeScript
+        SDK. Unclaimed, it stays owed: below a committed call, say, where it
+        lapses on its own. Without this, the lease
+        would claim the position until it lapsed, the engine would refuse the
+        next call's lease there as divergent, and every call after would land
+        past an empty position.
+        """
+        entries = self._owed.get(position)
+        while entries:
+            entry = entries[0]
+            now = time.monotonic()
+            if now >= entry["lapses_at"]:
+                entries.pop(0)
+                continue
+            if entry["token"] and not entry.get("waiting"):
+                if not send:
+                    return None
+                try:
+                    self.client.release_lease(
+                        agent_id=entry["agent_id"],
+                        idempotency_key=entry["key"],
+                        fencing_token=entry["token"],
+                        reason="TOOL_ERROR",
+                        timeout=self._rpc_timeout(),
+                    )
+                except Exception as exc:
+                    if _is_allowance_refusal(exc):
+                        raise
+                    if _may_pass(exc):
+                        entry["waiting"] = True
+                        return float(entry["lapses_at"]) - now
+                entries.pop(0)
+                continue
+            return float(entry["lapses_at"]) - now
+        self._owed.pop(position, None)
+        return 0.0
 
     def _reconcile_or_wait(self) -> float:
         """`reconcile_sequence`, or how long a held record says to wait. Under
@@ -795,13 +888,37 @@ class WorkflowContext:
         step takes this position rather than landing one past an empty one. Only
         while no later position was claimed meanwhile; if the step did commit
         before the interruption reached it, the next step's lease at that position
-        is refused before its body runs.
+        is refused before its body runs. The counter then steps on down through
+        positions vacated just below, as `give_back_refused_position` does: there
+        are none unless an allowance refusal vacated them.
         """
         with self._lock:
             if self._in_flight == 1 and self.sequence == sequence:
-                self.sequence = sequence - 1
+                self._step_down_from(sequence)
 
-    def give_back_refused_position(self, sequence: int) -> None:
+    def _step_down_from(self, sequence: int) -> None:
+        """Hands back the top position `sequence`, and every vacated position
+        directly below it. Under the lock."""
+        self.sequence = sequence - 1
+        while self.sequence in self._vacated:
+            self._vacated.discard(self.sequence)
+            self.sequence -= 1
+
+    def give_back_taken_over_position(self, sequence: int) -> None:
+        """Returns the position of a step another worker took over and an
+        allowance refusal then stopped, as the TypeScript SDK hands back a
+        takeover's: at the top, even with lower calls in flight; below it, the
+        position stays empty and the run stops recording for good. It is not
+        vacated, since the takeover's new holder may yet fill it."""
+        with self._lock:
+            if self.sequence == sequence:
+                self._step_down_from(sequence)
+                return
+            self.history_known = False
+
+    def give_back_refused_position(
+        self, sequence: int, unreleased: Optional[Dict[str, Any]] = None
+    ) -> None:
         """Returns the position of a step an allowance refusal stopped, which
         records nothing there, so the next step takes it rather than landing
         one past an empty one. Only for refusals: a process exit gives its
@@ -819,15 +936,20 @@ class WorkflowContext:
         every vacated position is claimed again or stepped through, recording
         resumes, unless something else stopped it meanwhile (a failure that
         could not be held, say, which stops it for good).
+
+        `unreleased` is the step's lease, if it could not be released: it still
+        claims this position, so the release is owed there, given back or
+        vacated alike, and settled before a call claims it (`_settle_owed`).
         """
         with self._lock:
+            if unreleased is not None:
+                owed = dict(unreleased)
+                owed["lapses_at"] = time.monotonic() + owed["lapses_in_s"]
+                self._owed.setdefault(sequence, []).append(owed)
             if self.sequence != sequence:
                 self._vacated.add(sequence)
                 return
-            self.sequence = sequence - 1
-            while self.sequence in self._vacated:
-                self._vacated.discard(self.sequence)
-                self.sequence -= 1
+            self._step_down_from(sequence)
 
     def _adopt_position(self, position: int) -> None:
         """Moves the counter to the position the engine reported. Positions

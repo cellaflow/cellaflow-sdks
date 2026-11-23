@@ -467,6 +467,7 @@ def _note_failure(
     is_async: bool = True,
     lease_ttl_ms: Optional[int] = None,
     may_have_landed: bool = False,
+    taken_over: bool = False,
 ) -> None:
     """Holds a live step's failure or cancellation to be recorded at its position.
 
@@ -482,7 +483,8 @@ def _note_failure(
     other. A process exit (`KeyboardInterrupt`, `SystemExit`) is not something a
     workflow carries on past, so the step gives its position back instead.
     `may_have_landed` is whether the step's commit, sent again, was refused
-    for the allowance when the first may have landed.
+    for the allowance when the first may have landed, and `taken_over` whether
+    the engine showed another worker holds the call.
     """
     try:
         if may_have_landed:
@@ -494,7 +496,7 @@ def _note_failure(
             # its lease before its body runs (or, with the same key, answered
             # from the commit), where a call placed past it would be refused
             # only at its commit, after its side effect.
-            ctx.give_back_refused_position(seq)
+            ctx.give_back_refused_position(seq, unreleased)
             ctx.mark_history_unknown()
             return
         if isinstance(exc, DivergentStepError):
@@ -514,12 +516,21 @@ def _note_failure(
             # the allowance no longer forces. The caller still sees the error
             # as it was raised.
             #
-            # A lease that an earlier, unanswered request may have been granted
-            # (`unreleased`) goes with it: nothing waits it out. If the
-            # allowance is back within about a TTL, the next call at this
-            # position can be refused with `DivergentStepError` until that
-            # lease lapses, as after a process exit.
-            ctx.give_back_refused_position(seq)
+            # The step's own lease, if it could not be released (`unreleased`,
+            # or one an unanswered request may have been granted), still claims
+            # this position. Its release is owed there, and settled before a
+            # call claims the position again: otherwise the engine would refuse
+            # that call's lease as divergent, which records nothing and hands
+            # nothing back, and every call after would land past an empty
+            # position, to be refused only at its commit.
+            #
+            # A call another worker took over is handed back as the TypeScript
+            # SDK hands back a takeover: its new holder may yet fill the
+            # position, so it is not vacated.
+            if taken_over:
+                ctx.give_back_taken_over_position(seq)
+            else:
+                ctx.give_back_refused_position(seq, unreleased)
             return
         if isinstance(exc, asyncio.CancelledError) and is_async:
             ctx.defer_cancellation_record(
@@ -583,6 +594,8 @@ class _CallLease:
         # Set when the engine showed the lease is no longer this call's.
         self.lost = False
         self.returned = False
+        # Set when a commit got no answer, so it may have landed.
+        self.commit_unanswered = False
         # Set when the same commit sent again was refused because the org is
         # over its allowance: the first may still have landed. Cleared when the
         # release shows the lease was still this call's, so it did not. See
@@ -1025,6 +1038,7 @@ def _commit(
         if not _unanswered(exc):
             call.committing = False
             raise
+        call.commit_unanswered = True
         try:
             _send_commit(
                 ctx, call, seq, name, ikey, fencing_token, call_coordination
@@ -1089,13 +1103,15 @@ def _resend_commit(
     key recorded at another position), so another worker holds the call; False
     for anything else (no answer, or the position already filled, which can
     also mean the commit landed), so the call fails as it would have. A resend
-    refused because the org is over its allowance is raised: it is the answer
-    the call fails with, rather than the first attempt's error.
+    refused because the org is over its allowance is raised, when the first
+    attempt got no answer: it is the answer the call fails with. When the first
+    attempt failed with a definite error, that error is the step's failure, and
+    the call fails with it as before.
     """
     try:
         _send_commit(ctx, call, seq, name, ikey, fencing_token, call_coordination)
     except Exception as again:
-        if _is_allowance_refusal(again):
+        if _is_allowance_refusal(again) and call.commit_unanswered:
             # What the caller hears. The lease would not be released, which
             # can mean the first commit landed and completed the key; see
             # `_note_failure`.
@@ -1578,6 +1594,7 @@ def step(
                     unreleased,
                     lease_ttl_ms=_ttl_for(ctx),
                     may_have_landed=call.may_have_landed,
+                    taken_over=call.lost,
                 )
             raise
         finally:
@@ -1888,6 +1905,7 @@ def step(
                     is_async=False,
                     lease_ttl_ms=_ttl_for(ctx),
                     may_have_landed=call.may_have_landed,
+                    taken_over=call.lost,
                 )
             raise
         finally:
