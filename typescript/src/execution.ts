@@ -18,9 +18,9 @@ const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
  */
 export interface LeaseHolderInfo {
   /**
-   * The `workerId` the holder acquired the lease with. It is what that worker
-   * said it was, not an authenticated identity. Absent when the engine did not
-   * record one, or the holder sent an empty one.
+   * The worker that acquired the lease, by the `workerId` it acquired it with.
+   * That is what the worker said it was, not an authenticated identity. Absent
+   * when the engine did not record one, or the worker sent an empty one.
    */
   readonly workerId?: string;
   /**
@@ -29,12 +29,12 @@ export interface LeaseHolderInfo {
    * worker (that is `workerId`).
    */
   readonly holderId: string;
-  /** When the holder acquired the lease, epoch ms on the engine's clock. Absent when not recorded. */
+  /** When the lease was acquired, epoch ms on the engine's clock. Absent when not recorded. */
   readonly acquiredAtMs?: number;
   /**
-   * When the lease lapses unless the holder renews it, epoch ms on the engine's
-   * clock. After waiting (`waitMs`), as of the engine's last look at the lease,
-   * so a later renewal may have moved it.
+   * When the lease lapses unless renewed, epoch ms on the engine's clock.
+   * After waiting (`waitMs`), as of the engine's last look at the lease, so a
+   * later renewal may have moved it.
    */
   readonly expiresAtMs: number;
   /** The lease's ceiling, independent of renewals, epoch ms on the engine's clock. Absent when it has none. */

@@ -190,9 +190,9 @@ export const CheckCacheResponseSchema: GenMessage<CheckCacheResponse> = /*@__PUR
  */
 export type LeaseHolder = Message<"cellaflow.v1.LeaseHolder"> & {
   /**
-   * The agent_id the holder sent when it acquired the lease. Not authenticated:
-   * it is what that caller said it was, and every caller refused the lease sees
-   * it. Empty for a lease recorded by an engine that did not store it.
+   * The agent that acquired the lease, as it named itself in
+   * CheckCacheRequest.agent_id. Not authenticated, and every caller refused the
+   * lease sees it. Empty for a lease recorded by an engine that did not store it.
    *
    * @generated from field: string agent_id = 1;
    */

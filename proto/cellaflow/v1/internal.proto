@@ -39,9 +39,9 @@ message LeaseRecord {
   // Computed once at acquisition. A value of 0 means no ceiling.
   uint64 hard_expires_at_ms = 7;
 
-  // The agent_id the holder sent when it acquired the lease, reported to a
-  // caller refused while it holds it. Empty on a record written before this
-  // field existed.
+  // The agent that acquired the lease, as it named itself in
+  // CheckCacheRequest.agent_id, reported to callers refused the lease. Empty on
+  // a record written before this field existed.
   string agent_id = 8;
 }
 

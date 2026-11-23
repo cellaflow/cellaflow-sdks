@@ -112,9 +112,9 @@ export type LeaseRecord = Message<"cellaflow.v1.internal.LeaseRecord"> & {
   hardExpiresAtMs: bigint;
 
   /**
-   * The agent_id the holder sent when it acquired the lease, reported to a
-   * caller refused while it holds it. Empty on a record written before this
-   * field existed.
+   * The agent that acquired the lease, as it named itself in
+   * CheckCacheRequest.agent_id, reported to callers refused the lease. Empty on
+   * a record written before this field existed.
    *
    * @generated from field: string agent_id = 8;
    */

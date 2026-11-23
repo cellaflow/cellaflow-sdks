@@ -104,19 +104,19 @@ class LeaseHolderInfo:
     Attributes
     ----------
     worker_id:
-        The ``worker_id`` the holder acquired the lease with. It is what that
-        worker said it was, not an authenticated identity. ``None`` when the
-        engine did not record one, or the holder sent an empty one.
+        The worker that acquired the lease, by the ``worker_id`` it acquired
+        it with. That is what the worker said it was, not an authenticated
+        identity. ``None`` when the engine did not record one, or the worker
+        sent an empty one.
     holder_id:
         The engine's id for this grant of the lease, kept through its renewals;
         a reclaim is a new grant with a new id. It identifies the grant, not
         the worker (that is ``worker_id``).
     acquired_at_ms:
-        When the holder acquired the lease, epoch ms on the engine's clock.
-        ``None`` when not recorded.
+        When the lease was acquired, epoch ms on the engine's clock. ``None``
+        when not recorded.
     expires_at_ms:
-        When the lease lapses unless the holder renews it, epoch ms on the
-        engine's clock.
+        When the lease lapses unless renewed, epoch ms on the engine's clock.
     hard_expires_at_ms:
         The lease's ceiling, independent of renewals, epoch ms on the engine's
         clock. ``None`` when it has none.

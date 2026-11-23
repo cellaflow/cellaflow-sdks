@@ -137,9 +137,9 @@ message CheckCacheResponse {
 // release and commit check it to order grants, not to authenticate the caller.
 // Nothing may rely on a refused caller not knowing it.
 message LeaseHolder {
-  // The agent_id the holder sent when it acquired the lease. Not authenticated:
-  // it is what that caller said it was, and every caller refused the lease sees
-  // it. Empty for a lease recorded by an engine that did not store it.
+  // The agent that acquired the lease, as it named itself in
+  // CheckCacheRequest.agent_id. Not authenticated, and every caller refused the
+  // lease sees it. Empty for a lease recorded by an engine that did not store it.
   string agent_id = 1;
   // The engine's id for this grant of the lease, kept through its renewals; a
   // reclaim is a new grant with a new id. It identifies the grant, not the
