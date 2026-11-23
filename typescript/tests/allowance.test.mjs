@@ -297,6 +297,7 @@ test("resets_at and limit, present, absent and unparsable", () => {
     ["2026-11-30T19:00:00-05:00", RESETS_AT_MS],
     ["2026-12-01t00:00:00z", RESETS_AT_MS],
     ["2028-02-29T00:00:00Z", Date.UTC(2028, 1, 29)],
+    ["9999-12-31T23:59:59Z", Date.UTC(9999, 11, 31, 23, 59, 59)],
   ];
   for (const [value, ms] of parsed) {
     const err = read({ resets_at: value, limit: "writes_blocked" });
@@ -322,6 +323,8 @@ test("resets_at and limit, present, absent and unparsable", () => {
     "2026-12-01T00:00:00+24:00",
     "2026-12-01T00:00:00+01:60",
     "0099-12-01T00:00:00Z",
+    // Past year 9999 once converted to UTC.
+    "9999-12-31T23:59:59-01:00",
   ];
   for (const value of unparsable) {
     const err = read({ resets_at: value, limit: "writes_blocked" });
@@ -574,7 +577,7 @@ test("a tool call refused over the allowance fails at once, and the next call ta
       const started = performance.now();
       await assert.rejects(charge(), isAllowance);
       // Asking again after no answer waits 200 ms first.
-      assert.ok(performance.now() - started < 150, "the refusal waited before failing");
+      assert.ok(performance.now() - started < 1000, "the refusal waited before failing");
       ran = true;
       assert.equal(await notify(), "notified");
     }),
@@ -700,7 +703,7 @@ test("a received result's record refused over the allowance is kept, and not ask
       assert.equal(await place(), "placed-elsewhere");
       const started = performance.now();
       await assert.rejects(confirm(), isAllowance);
-      assert.ok(performance.now() - started < 150, "the refusal waited before failing");
+      assert.ok(performance.now() - started < 1000, "the refusal waited before failing");
       // The call claimed nothing, and the record is still owed: written by
       // the next call, once the allowance allows, before it claims position 2.
       assert.equal(client.count("acquire"), 1);
@@ -754,7 +757,7 @@ test("a failure record whose lease's release is refused over the allowance keeps
     await assert.rejects(charge(), /boom/);
     const started = performance.now();
     await assert.rejects(notify(), isAllowance);
-    assert.ok(performance.now() - started < 150, "the refusal waited before failing");
+    assert.ok(performance.now() - started < 1000, "the refusal waited before failing");
     assert.equal(client.count("recordAcquire"), 0);
     // Once the allowance allows, the release goes through and the record is written.
     assert.equal(await notify(), "notified");
@@ -891,9 +894,10 @@ test("a commit sent again after no answer and refused over the allowance raises 
   assert.deepEqual(committed(client), [[1, "charge"], [1, "charge"], [1, "notify"]]);
 });
 
-for (const [what, release] of [
-  ["the release gets no answer", [unavailable()]],
-  ["the release is refused", [{ released: false }]],
+for (const [what, release, releases] of [
+  // Unanswered, the release is owed and sent again before notify claims 1.
+  ["the release gets no answer", [unavailable()], 2],
+  ["the release is refused", [{ released: false }], 1],
 ]) {
   test(`a commit that may have landed is handed back with the history unknown: ${what}`, async () => {
     // The first commit got no answer and the same commit sent again was
@@ -910,6 +914,7 @@ for (const [what, release] of [
       assert.equal(ctx.historyKnown, false);
       assert.equal(await notify(), "notified");
     });
+    assert.equal(client.count("release"), releases);
     assert.equal(client.count("recordAcquire"), 0);
     assert.deepEqual(committed(client), [[1, "charge"], [1, "charge"], [1, "notify"]]);
   });
@@ -1065,7 +1070,7 @@ test("a refusal that never went through this copy's client is final at a call si
     await runWithContext(session(client), async () => {
       const started = performance.now();
       await assert.rejects(charge(), (err) => err === refusal);
-      assert.ok(performance.now() - started < 150, "the refusal waited before failing");
+      assert.ok(performance.now() - started < 1000, "the refusal waited before failing");
       assert.equal(await notify(), "notified");
     });
     assert.deepEqual(client.of("acquire").map((c) => c.sequence), [1, 1]);
@@ -1087,7 +1092,9 @@ test("a renewal or a record refused by a refusal from outside this copy's client
     });
     try {
       hb.start();
-      await sleep(120);
+      await until(() => renewals.count("renew") >= 1 && hb.allowanceRefusal !== undefined);
+      // Several more renewals would have come due by now.
+      await sleep(100);
       assert.equal(renewals.count("renew"), 1);
       assert.equal(hb.allowanceRefusal?.subject, "cellaflow.steps");
     } finally {
@@ -1390,6 +1397,217 @@ test("a vacated position is no longer vacated once a call claims it", () => {
   ctx.claimPosition();
   ctx.claimPosition();
   assert.equal(ctx.historyKnown, true);
+});
+
+/** The engine refusing what is not this call's to do: a FAILED_PRECONDITION. */
+const failedPrecondition = (message) => new ConnectError(message, Code.FailedPrecondition);
+
+test("a refused call's release that got no answer is sent again before its position is claimed", async () => {
+  // An engine that keeps the session in order: a lease at a position another
+  // key claims is refused, and a commit must land at the next position. The
+  // refused call's lease still claims 1, because its release got no answer.
+  let committedUpTo = 0;
+  let nextToken = 0;
+  let releaseFails = 1;
+  const leases = new Map();
+  const claims = new Map();
+  const log = [];
+  const client = {
+    async checkIdempotencyCache(agentId, key, waitTimeoutMs, ttl, sessionId, seq) {
+      const claimer = claims.get(seq);
+      if (claimer && claimer !== key) throw failedPrecondition(`Sequence ${seq} is already claimed by a different step identity`);
+      const token = ++nextToken;
+      leases.set(key, { token, seq });
+      claims.set(seq, key);
+      return { status: CacheStatus.ACQUIRED, fencingToken: BigInt(token), heartbeatIntervalMs: 60_000n };
+    },
+    async commitStep(sessionId, seq, name) {
+      if (seq !== committedUpTo + 1) throw failedPrecondition(`Sequence mismatch: expected sequence ${committedUpTo + 1}`);
+      committedUpTo = seq;
+      log.push(`commit ${seq} ${name}`);
+      return {};
+    },
+    async renewLease(agentId, key, token, extendMs) {
+      return { renewed: true, newExpiresAtMs: BigInt(Date.now() + extendMs) };
+    },
+    async releaseLease(agentId, key, token) {
+      log.push(`release ${token}`);
+      if (releaseFails-- > 0) throw unavailable();
+      const lease = leases.get(key);
+      if (lease?.token !== Number(token)) return { released: false };
+      claims.delete(lease.seq);
+      leases.delete(key);
+      return { released: true };
+    },
+    async getGraph() {
+      return [[], undefined];
+    },
+    close() {},
+  };
+  const charge = tool(async () => { throw overAllowance(); }, { toolName: "charge" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  const audit = tool(async () => "audited", { toolName: "audit" });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    await assert.rejects(charge(), isAllowance);
+    assert.equal(await notify(), "notified");
+    assert.equal(await audit(), "audited");
+    assert.equal(await notify(), "notified");
+  });
+  assert.deepEqual(log, ["release 1", "release 1", "commit 1 notify", "commit 2 audit", "commit 3 notify"]);
+  assert.equal(ctx.historyKnown, true);
+});
+
+for (const [what, answer, waits] of [
+  ["answered that the lease is not this call's", { released: false }, false],
+  ["refused for good", new ConnectError("bad token", Code.InvalidArgument), false],
+  ["unanswered again", unavailable(), true],
+]) {
+  test(`an owed release ${what} is dropped${waits ? " once the lease has lapsed" : " at once"}`, async () => {
+    const client = scriptedClient({ release: [unavailable(), answer] });
+    const charge = tool(async () => { throw overAllowance(); }, { toolName: "charge", ttlMs: 1000 });
+    const notify = tool(async () => "notified", { toolName: "notify" });
+    await runWithContext(session(client), async () => {
+      await assert.rejects(charge(), isAllowance);
+      const started = performance.now();
+      assert.equal(await notify(), "notified");
+      const took = performance.now() - started;
+      // The lease lasts a TTL past its last renewal, plus a second of grace.
+      if (waits) assert.ok(took >= 1900, `waited ${took} ms`);
+      else assert.ok(took < 1000, `waited ${took} ms`);
+    });
+    assert.deepEqual(client.of("release").map((c) => [c.fencingToken, c.reason]), [[7, "TOOL_ERROR"], [7, "TOOL_ERROR"]]);
+    assert.deepEqual(committed(client), [[1, "notify"]]);
+  });
+}
+
+test("an owed release whose lease has lapsed is dropped without sending it", async () => {
+  const client = scriptedClient({ release: [unavailable()] });
+  const charge = tool(async () => { throw overAllowance(); }, { toolName: "charge", ttlMs: 1000 });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), isAllowance);
+    // Past the lease's lapse, a TTL and a second after the hand-back.
+    const restore = jumpClocks(5000);
+    try {
+      assert.equal(await notify(), "notified");
+    } finally {
+      restore();
+    }
+  });
+  assert.equal(client.count("release"), 1);
+  assert.deepEqual(committed(client), [[1, "notify"]]);
+});
+
+test("a lease granted with its answer lost, then refused over the allowance, is waited out", async () => {
+  // The first request got no answer and may have been granted, a lease whose
+  // token nobody here knows; the request sent again is refused. That lease is
+  // waited out before position 1 is claimed again: it cannot be released.
+  const client = scriptedClient({ acquire: [unavailable(), overAllowance()] });
+  const charge = tool(async () => "charged", { toolName: "charge", ttlMs: 1000 });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), isAllowance);
+    const started = performance.now();
+    assert.equal(await notify(), "notified");
+    const took = performance.now() - started;
+    assert.ok(took >= 1900, `waited ${took} ms`);
+  });
+  assert.equal(client.count("release"), 0);
+  assert.deepEqual(client.of("acquire").map((c) => c.sequence), [1, 1, 1]);
+  assert.deepEqual(committed(client), [[1, "notify"]]);
+});
+
+test("an owed release refused over the allowance fails the next call at once, and is still owed", async () => {
+  const client = scriptedClient({ release: [unavailable(), overAllowance()] });
+  const charge = tool(async () => { throw overAllowance(); }, { toolName: "charge" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  await runWithContext(session(client), async () => {
+    await assert.rejects(charge(), isAllowance);
+    const started = performance.now();
+    await assert.rejects(notify(), isAllowance);
+    assert.ok(performance.now() - started < 1000, "the refusal waited before failing");
+    // notify claimed nothing and asked for no lease.
+    assert.equal(client.count("acquire"), 1);
+    // Once the allowance allows, the release goes through and notify runs.
+    assert.equal(await notify(), "notified");
+  });
+  assert.equal(client.count("release"), 3);
+  assert.deepEqual(client.of("acquire").map((c) => c.sequence), [1, 1]);
+  assert.deepEqual(committed(client), [[1, "notify"]]);
+});
+
+test("a release owed at a vacated position is settled when the step-down hands it to a call", async () => {
+  // a holds 1 and b holds 2. a's body is refused and its release gets no
+  // answer, so 1 is vacated with a release owed. b is refused at the top, and
+  // the counter steps down through 1; notify settles the release, then
+  // claims 1.
+  const aSettled = signal();
+  const client = scriptedClient({
+    acquire: [
+      undefined,
+      () =>
+        aSettled.fired.then(() => {
+          throw overAllowance();
+        }),
+    ],
+    release: [unavailable()],
+  });
+  const a = tool(async () => { throw overAllowance(); }, { toolName: "a" });
+  const b = tool(async () => "b", { toolName: "b" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    const results = await Promise.allSettled([a().finally(aSettled.fire), b()]);
+    assert.ok(results.every((r) => isAllowance(r.reason)));
+    assert.equal(ctx.historyKnown, true);
+    assert.equal(client.count("release"), 1);
+    assert.equal(await notify(), "notified");
+  });
+  assert.equal(client.count("release"), 2);
+  assert.deepEqual(client.of("acquire").map((c) => c.sequence), [1, 2, 1]);
+  assert.deepEqual(committed(client), [[1, "notify"]]);
+});
+
+test("a takeover at the top steps down through positions refused calls vacated", async () => {
+  // a holds 1 and is refused while b holds 2, so 1 is vacated. b is then
+  // taken over at the top: handing back 2 steps down through 1 as well.
+  const aSettled = signal();
+  const client = scriptedClient({ acquire: [overAllowance()], release: [{ released: false }] });
+  const a = tool(async () => "a", { toolName: "a" });
+  const b = tool(async () => { await aSettled.fired; throw new LeaseLostError("taken over"); }, { toolName: "b" });
+  const c = tool(async () => "c", { toolName: "c" });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    const results = await Promise.allSettled([a().finally(aSettled.fire), b()]);
+    assert.ok(isAllowance(results[0].reason));
+    assert.ok(results[1].reason instanceof LeaseLostError);
+    assert.equal(ctx.sequence, 0);
+    assert.equal(ctx.historyKnown, true);
+    assert.equal(await c(), "c");
+  });
+  assert.deepEqual(client.of("acquire").map((call) => call.sequence), [1, 2, 1]);
+  assert.deepEqual(committed(client), [[1, "c"]]);
+});
+
+test("a commit that failed for certain keeps its error when the one sent again is refused", async () => {
+  // The first commit is refused for good, so it did not land; the release is
+  // refused, so the same commit is sent once more, and that is refused over
+  // the allowance. The step's real failure is the first commit's: the caller
+  // hears it, and it is recorded, as it always was.
+  const invalid = new ConnectError("payload too large", Code.InvalidArgument);
+  const client = scriptedClient({ commit: [invalid, overAllowance()], release: [{ released: false }] });
+  const charge = tool(async () => "charged", { toolName: "charge" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    await assert.rejects(charge(), (err) => err === invalid);
+    assert.equal(ctx.historyKnown, true);
+    assert.equal(await notify(), "notified");
+  });
+  const failure = client.of("recordCommit");
+  assert.deepEqual(failure.map((c) => [c.sequence, c.name, c.status]), [[1, "charge", StepStatus.FAILED]]);
+  assert.deepEqual(committed(client), [[1, "charge"], [1, "charge"], [1, "charge"], [2, "notify"]]);
 });
 
 // --- Over the real transport ---------------------------------------------

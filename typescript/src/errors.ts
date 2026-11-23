@@ -227,7 +227,10 @@ function parseTimestamp(value: string | undefined): Date | undefined {
   }
   const millis = m[7] ? Number(m[7].slice(0, 3).padEnd(3, "0")) : 0;
   const offsetMs = (m[8] === "-" ? -1 : 1) * (offsetHours * 60 + offsetMinutes) * 60_000;
-  return new Date(at.getTime() + millis - offsetMs);
+  const utc = new Date(at.getTime() + millis - offsetMs);
+  // Past year 9999 in UTC, as Python's datetime cannot hold, it is unknown in
+  // both SDKs.
+  return utc.getUTCFullYear() > 9999 ? undefined : utc;
 }
 
 /**

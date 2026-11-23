@@ -56,6 +56,23 @@ export interface UnreleasedLease {
   lapsesAt?: number;
 }
 
+/**
+ * A release a refused call still owes for its own lease, which claims the
+ * position the call handed back. See {@link WorkflowContext.giveBackRefusedPosition}.
+ */
+interface OwedRelease {
+  agentId: string;
+  key: string;
+  /** 0 when the lease's token is unknown: a grant whose answer was lost. */
+  token: number;
+  /**
+   * When the lease lapses on the engine's clock at the latest: its
+   * `lapsesInMs`, which already counts a second of grace for the engine's
+   * clock, from when the position was handed back.
+   */
+  lapsesAt: number;
+}
+
 /** How many steps to ask the engine for per page of a session's history. */
 const GRAPH_PAGE = 1000;
 
@@ -142,9 +159,10 @@ export class WorkflowContext {
    * this session without risking a second record of a step the session already
    * holds. See {@link deferHitRecord}.
    *
-   * Also false while a position a call handed back below the top is empty, and
-   * true again once every such position is claimed, unless something else made
-   * it false. See {@link giveBackPosition}. Set to false, it stays false.
+   * Also false while a position is vacated (left empty below the top by a
+   * refused call), and true again once no position is vacated, unless
+   * something else made it false. See {@link giveBackRefusedPosition}. Set to
+   * false, it stays false.
    */
   get historyKnown(): boolean {
     return this.accounted && this.vacated.size === 0;
@@ -158,10 +176,19 @@ export class WorkflowContext {
   private accounted: boolean;
 
   /**
-   * Positions below the top that calls handed back empty, not yet claimed
-   * again. See {@link giveBackPosition}.
+   * Positions below the top that refused calls left empty, not yet claimed
+   * again. See {@link giveBackRefusedPosition}.
    */
   private readonly vacated = new Set<number>();
+
+  /**
+   * Releases refused calls still owe, by the position their lease claims.
+   * See {@link giveBackRefusedPosition} and {@link settleOwedRelease}.
+   */
+  private readonly owed = new Map<number, OwedRelease>();
+
+  /** The settling of the release owed at the next position, while in flight. */
+  private settlingOwed?: Promise<void>;
 
   private pendingHit?: PendingHit;
 
@@ -335,10 +362,18 @@ export class WorkflowContext {
    * top position, so handing it back defers no write, even with lower calls
    * still in flight. Otherwise the position stays empty and the run stops
    * recording, for the reason a failure record does.
+   *
+   * Handing back the top also steps the counter down through positions that
+   * refused calls vacated directly below it, as
+   * {@link giveBackRefusedPosition} does. Without refusals none are vacated,
+   * and this is what it always was.
+   *
+   * @internal
    */
   giveBackPosition(sequence: number): void {
     if (this.sequence === sequence) {
       this.sequence = sequence - 1;
+      while (this.vacated.delete(this.sequence)) this.sequence -= 1;
       return;
     }
     this.historyKnown = false;
@@ -368,8 +403,26 @@ export class WorkflowContext {
    *   recording for good.
    * - Recording resumes as soon as no position is vacated, unless something
    *   else stopped it, such as a failure left unrecorded meanwhile.
+   * - A call that could not release its own lease (`unreleased`, its token 0
+   *   when the grant's answer was lost) still claims the position through it,
+   *   so the release is owed there, at the top or vacated alike, and settled
+   *   before a call claims that position. See {@link settleOwedRelease}.
+   *   Adopting the engine's position leaves owed releases alone: they are
+   *   about leases, not positions.
+   *
+   * @internal
    */
-  giveBackRefusedPosition(sequence: number): void {
+  giveBackRefusedPosition(sequence: number, unreleased?: UnreleasedLease): void {
+    if (unreleased) {
+      // Counted from now, as for a failure record: the call's heartbeat has
+      // stopped, so no renewal can extend the lease past this.
+      this.owed.set(sequence, {
+        agentId: unreleased.agentId,
+        key: unreleased.key,
+        token: unreleased.token,
+        lapsesAt: Date.now() + unreleased.lapsesInMs,
+      });
+    }
     if (this.sequence !== sequence) {
       this.vacated.add(sequence);
       return;
@@ -466,6 +519,69 @@ export class WorkflowContext {
       this.adoptPosition(this.reportedSequence);
       this.reportedSequence = undefined;
     }
+  }
+
+  /**
+   * Whether a release is owed at the position the next call claims, or being
+   * settled. See {@link settleOwedRelease}.
+   */
+  get releaseOwed(): boolean {
+    return this.settlingOwed !== undefined || this.owed.has(this.sequence + 1);
+  }
+
+  /**
+   * Settles the release owed at the position the next call claims, by this
+   * call or a concurrent one, before anything claims it. Called, like
+   * {@link settleRecording}, before claiming a position, so nothing waits
+   * while holding a position or a lease other calls need; calls behind it
+   * wait in the order they arrived, and settle again.
+   *
+   * - Lapsed: it no longer claims the position, so it is dropped.
+   * - Token known: the release is sent again. Released, or answered that the
+   *   lease is not this call's any more, it is dropped. Refused because the
+   *   org is over its allowance, it is kept and the refusal rejects this at
+   *   once, so the call fails having claimed nothing. With no answer, the
+   *   lease is waited out and then dropped. Any other error drops it, as a
+   *   failed release always has been.
+   * - Token unknown (0, a grant whose answer was lost): it cannot be released,
+   *   only waited out, then dropped.
+   */
+  async settleOwedRelease(): Promise<void> {
+    if (!this.settlingOwed) {
+      const settling = this.settleOwed(this.sequence + 1);
+      const done = () => {
+        if (this.settlingOwed === settling) this.settlingOwed = undefined;
+      };
+      this.settlingOwed = settling;
+      // Registered before any caller awaits, so the next look finds it done.
+      settling.then(done, done);
+    }
+    await this.settlingOwed;
+  }
+
+  private async settleOwed(position: number): Promise<void> {
+    const owed = this.owed.get(position);
+    if (!owed) return;
+    if (Date.now() >= owed.lapsesAt) {
+      this.owed.delete(position);
+      return;
+    }
+    if (owed.token !== 0) {
+      try {
+        await this.client.releaseLease(owed.agentId, owed.key, owed.token, "TOOL_ERROR", RELEASE_DEADLINE_SECS);
+        this.owed.delete(position);
+        return;
+      } catch (err) {
+        if (isAllowanceRefusal(err)) throw err;
+        if (!isRetryable(err)) {
+          this.owed.delete(position);
+          return;
+        }
+      }
+    }
+    // Its lapse already counts the grace for the engine's clock.
+    await sleep(Math.max(0, owed.lapsesAt - Date.now()));
+    this.owed.delete(position);
   }
 
   /** Whether a deferred record is being written. */

@@ -188,21 +188,30 @@ export function tool<A extends unknown[], R>(
     // order they arrived, so positions are still claimed in call order, and each
     // settles again in case anything changed while it waited. With nothing being
     // written there is no await, and the claim stays synchronous as before.
+    //
+    // The same for a release a refused call still owes at the position this
+    // call would claim: its lease claims that position until it is released
+    // or lapses, so it is settled first, the same way.
     if (!ctx.positionKnown) await ctx.ensurePosition();
     for (;;) {
       ctx.reconcileSequence();
-      if (!ctx.recordingInFlight) break;
-      await ctx.settleRecording();
+      if (ctx.recordingInFlight) {
+        await ctx.settleRecording();
+        continue;
+      }
+      if (!ctx.releaseOwed) break;
+      await ctx.settleOwedRelease();
     }
     const seq = ctx.claimPosition();
     const known: Known = {};
     try {
       return await runAt(ctx, seq, args, callCoordination, coordinationId, leaseTtlMs, known);
     } catch (err) {
-      // What happens to the position, decided by one principle: a position is
-      // handed back only with the history marked unknown unless nothing can
-      // have landed there. So the doubt about a commit is settled first,
-      // whatever else is true of the call, then a takeover, then a refusal.
+      // What happens to the position. A refused call's position is handed back
+      // with the history known only when nothing can have landed there, so the
+      // doubt about a commit is settled first, whatever else is true of the
+      // call. Then a takeover, which hands its position back with the history
+      // known, as it always has. Then a refusal.
       if (known.mayHaveLanded) {
         // The commit got no answer, the same commit sent again was refused
         // because the org is over its allowance, and the release did not show
@@ -212,8 +221,9 @@ export function tool<A extends unknown[], R>(
         // refuses the next call's lease at this position before its body
         // runs, or answers a hit for the same key; keeping the position would
         // instead put the next call past a possible gap, refused only at its
-        // commit, after its side effect.
-        ctx.giveBackRefusedPosition(seq);
+        // commit, after its side effect. A lease it could not release is owed,
+        // as for any refusal below.
+        ctx.giveBackRefusedPosition(seq, known.unreleased);
         ctx.historyKnown = false;
         throw err;
       }
@@ -236,13 +246,13 @@ export function tool<A extends unknown[], R>(
         // failed because of the refusal all the same. The caller still gets
         // the body's own error.
         //
-        // The trade-off: with no failure record, nothing holds on to the
-        // call's own lease if it could not be released (`known.unreleased`),
-        // and no record waits for it to lapse. If the allowance is back
-        // within about a TTL, the next call at this position can be refused
-        // with DivergentStepError while that lease still claims it, as after
-        // a process that exited holding a lease.
-        ctx.giveBackRefusedPosition(seq);
+        // With no failure record to hold on to the call's own lease when it
+        // could not be released (`known.unreleased`), the context keeps it as
+        // a release owed at this position, settled before the next call
+        // claims it: sent again, or waited out. Otherwise the next call here
+        // would be refused with DivergentStepError while that lease still
+        // claims the position, and the one after it would land past the gap.
+        ctx.giveBackRefusedPosition(seq, known.unreleased);
         throw err;
       }
       // A failed call leaves its position empty; record the failure there so the
@@ -650,11 +660,13 @@ export function tool<A extends unknown[], R>(
         }
         if (outcome.takenOver) throw takenOver(returned.result, outcome.error);
         // Unknown: the call is not treated as taken over, and fails as it
-        // would have, unless the commit sent again was refused because the
-        // org is over its allowance, which is then what the caller hears. The
-        // first may still have landed: the lease was not released.
+        // would have. Unless the first commit got no answer and the one sent
+        // again was refused because the org is over its allowance: that is
+        // then what the caller hears, and the first may still have landed,
+        // since the lease was not released. A first commit that failed for
+        // certain keeps its own error, the step's real failure.
         known.lost = false;
-        if (isAllowanceRefusal(outcome.error)) {
+        if (isAllowanceRefusal(outcome.error) && isUnanswered(err)) {
           known.mayHaveLanded = true;
           err = outcome.error;
         }
