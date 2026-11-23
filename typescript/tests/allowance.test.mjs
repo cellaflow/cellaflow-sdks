@@ -78,6 +78,40 @@ const mailboxFull = () => new ConnectError("session mailbox is full", Code.Resou
 /** The engine unavailable: no answer either way. */
 const unavailable = () => new ConnectError("engine unavailable", Code.Unavailable);
 
+/** A promise to wait for, and the function that settles it. */
+function signal() {
+  let fire;
+  const fired = new Promise((resolve) => (fire = resolve));
+  return { fire, fired };
+}
+
+/**
+ * A renewal refused over the allowance, for a scripted list, and a wait for it:
+ * `handled()` resolves once the heartbeat has taken the refusal in, however
+ * long the renewal took to come due.
+ */
+function refusedRenewal() {
+  const { fire, fired } = signal();
+  return {
+    answer: () => {
+      fire();
+      throw overAllowance();
+    },
+    // The heartbeat takes the refusal in a few microtasks after it is thrown,
+    // all of which run before the next macrotask.
+    handled: () => fired.then(() => new Promise((resolve) => setImmediate(resolve))),
+  };
+}
+
+/** Waits until `condition()` holds, checking every 10 ms, for at most `ms`. */
+async function until(condition, ms = 10_000) {
+  const deadline = Date.now() + ms;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("timed out waiting");
+    await sleep(10);
+  }
+}
+
 /** A refusal over the allowance that arrives `ms` later, for a scripted list. */
 const refusedAfter = (ms) => () => sleep(ms).then(() => {
   throw overAllowance();
@@ -745,6 +779,7 @@ test("a renewal refused over the allowance is not sent again, and the lease last
   // A renewal the engine would grant, if it were asked again.
   const client = scriptedClient({ renew: [overAllowance()] });
   const events = [];
+  const refused = signal();
   let lostDetail;
   const hb = new LeaseHeartbeat({
     client,
@@ -752,20 +787,31 @@ test("a renewal refused over the allowance is not sent again, and the lease last
     idempotencyKey: "key",
     fencingToken: 1,
     heartbeatIntervalMs: 20,
-    extendMs: 400,
-    leaseTtlMs: 400,
-    onEvent: (event) => events.push(event),
+    extendMs: 2000,
+    leaseTtlMs: 2000,
+    onEvent: (event) => {
+      events.push(event);
+      if (event.type === "renew_failed") refused.fire();
+    },
     onLeaseLost: (detail) => {
       lostDetail = detail;
     },
   });
   try {
     hb.start();
-    await sleep(150);
+    await refused.fired;
+    // Five more renewals would have come due by now.
+    await sleep(100);
     assert.equal(client.count("renew"), 1);
     assert.equal(hb.lost, false);
     assert.match(events.find((e) => e.type === "renew_failed").detail, /over its allowance for cellaflow\.steps/);
-    await sleep(400);
+    // The deadline passes; nothing renewed the lease meanwhile.
+    const restore = jumpClocks(5000);
+    try {
+      assert.equal(hb.pastDeadline(), true);
+    } finally {
+      restore();
+    }
     assert.equal(hb.lost, true);
     assert.match(lostDetail, /over its allowance for cellaflow\.steps/);
     assert.equal(client.count("renew"), 1);
@@ -787,8 +833,7 @@ test("a renewal that finds the mailbox full is still sent again", async () => {
   });
   try {
     hb.start();
-    await sleep(150);
-    assert.ok(client.count("renew") >= 3, `${client.count("renew")} renewals`);
+    await until(() => client.count("renew") >= 3);
   } finally {
     await hb.stop();
   }
@@ -830,20 +875,45 @@ test("a late grant whose renewal finds the mailbox full still tries again before
 });
 
 test("a commit sent again after no answer and refused over the allowance raises the refusal", async () => {
+  // The lease is then released, so it was still this call's: neither commit
+  // landed, and the position is handed back as for any refusal.
   const client = scriptedClient({ commit: [unavailable(), overAllowance()] });
   const charge = tool(async () => "charged", { toolName: "charge" });
   const notify = tool(async () => "notified", { toolName: "notify" });
   const ctx = session(client);
   await runWithContext(ctx, async () => {
     await assert.rejects(charge(), isAllowance);
-    // The first commit may have landed: position 1 is not handed back, and
-    // the run stops recording.
-    assert.equal(ctx.historyKnown, false);
+    assert.equal(ctx.historyKnown, true);
     assert.equal(await notify(), "notified");
   });
+  assert.deepEqual(client.of("release").map((c) => c.reason), ["TOOL_ERROR"]);
   assert.equal(client.count("recordAcquire"), 0);
-  assert.deepEqual(committed(client), [[1, "charge"], [1, "charge"], [2, "notify"]]);
+  assert.deepEqual(committed(client), [[1, "charge"], [1, "charge"], [1, "notify"]]);
 });
+
+for (const [what, release] of [
+  ["the release gets no answer", [unavailable()]],
+  ["the release is refused", [{ released: false }]],
+]) {
+  test(`a commit that may have landed is handed back with the history unknown: ${what}`, async () => {
+    // The first commit got no answer and the same commit sent again was
+    // refused over the allowance, and nothing shows the lease was still this
+    // call's: the first may have landed. Refused, the release also marks the
+    // call as taken over, so both apply. The position goes back, where the
+    // engine refuses a lease if the commit is there, and recording stops.
+    const client = scriptedClient({ commit: [unavailable(), overAllowance()], release });
+    const charge = tool(async () => "charged", { toolName: "charge" });
+    const notify = tool(async () => "notified", { toolName: "notify" });
+    const ctx = session(client);
+    await runWithContext(ctx, async () => {
+      await assert.rejects(charge(), isAllowance);
+      assert.equal(ctx.historyKnown, false);
+      assert.equal(await notify(), "notified");
+    });
+    assert.equal(client.count("recordAcquire"), 0);
+    assert.deepEqual(committed(client), [[1, "charge"], [1, "charge"], [1, "notify"]]);
+  });
+}
 
 test("a commit sent again after a refused release and refused over the allowance raises the refusal", async () => {
   // The first commit and the one sent after it get no answer; the lease is
@@ -858,21 +928,24 @@ test("a commit sent again after a refused release and refused over the allowance
   const ctx = session(client);
   await runWithContext(ctx, async () => {
     await assert.rejects(charge(), isAllowance);
+    // The first commit may have landed: the position goes back with the run
+    // no longer recording.
     assert.equal(ctx.historyKnown, false);
     assert.equal(await notify(), "notified");
   });
   assert.equal(client.count("recordAcquire"), 0);
-  assert.deepEqual(committed(client), [[1, "charge"], [1, "charge"], [1, "charge"], [2, "notify"]]);
+  assert.deepEqual(committed(client), [[1, "charge"], [1, "charge"], [1, "charge"], [1, "notify"]]);
 });
 
 /** A grant answered at once whose renewals are due every 20 ms. */
 const quickRenewals = () => ({ status: CacheStatus.ACQUIRED, fencingToken: 7n, heartbeatIntervalMs: 20n });
 
 test("a tool body that finishes within its lease after a refused renewal commits normally", async () => {
-  const client = scriptedClient({ acquire: [quickRenewals()], renew: [overAllowance()] });
+  const renewal = refusedRenewal();
+  const client = scriptedClient({ acquire: [quickRenewals()], renew: [renewal.answer] });
   const charge = tool(
     async () => {
-      await sleep(80);
+      await renewal.handled();
       return "charged";
     },
     { toolName: "charge", ttlMs: 1000 },
@@ -884,13 +957,14 @@ test("a tool body that finishes within its lease after a refused renewal commits
 });
 
 test("a tool body stopped at its deadline after a refused renewal raises the refusal, and nothing is recorded", async () => {
-  const client = scriptedClient({ acquire: [quickRenewals()], renew: [overAllowance()] });
+  const renewal = refusedRenewal();
+  const client = scriptedClient({ acquire: [quickRenewals()], renew: [renewal.answer] });
   let seen;
   const charge = tool(
     async () => {
-      // The refused renewal is due after 20 ms; the process then stalls past
-      // the lease's deadline, and the body checks before acting.
-      await sleep(80);
+      // The renewal is refused; the process then stalls past the lease's
+      // deadline, and the body checks before acting.
+      await renewal.handled();
       const restore = jumpClocks(5000);
       try {
         currentLease().check();
@@ -1129,9 +1203,10 @@ test("refused calls nested in a refused call hand back every position", async ()
 
 test("a lease lost at its deadline while the commit is on its way keeps the refusal as its cause", async () => {
   const invalid = new ConnectError("payload too large", Code.InvalidArgument);
+  const renewal = refusedRenewal();
   const client = scriptedClient({
     acquire: [quickRenewals()],
-    renew: [overAllowance()],
+    renew: [renewal.answer],
     commit: [
       async () => {
         // The process stalls past the lease's deadline while the commit is
@@ -1150,7 +1225,7 @@ test("a lease lost at its deadline while the commit is on its way keeps the refu
   const charge = tool(
     async () => {
       lease = currentLease();
-      await sleep(60);
+      await renewal.handled();
       return "charged";
     },
     { toolName: "charge", ttlMs: 1000 },
@@ -1166,6 +1241,7 @@ test("a lease lost at its deadline while the commit is on its way keeps the refu
 
 test("without a subject, both messages leave out what the org is over its allowance of", async () => {
   const refusal = new AllowanceExceededError({ subject: "" });
+  const refused = signal();
   assert.equal(refusal.message, "[resource_exhausted] The Cellaflow org is over its allowance, so the engine refused this call.");
   const client = scriptedClient({ renew: [refusal] });
   let lost;
@@ -1180,10 +1256,13 @@ test("without a subject, both messages leave out what the org is over its allowa
     onLeaseLost: (detail, cause) => {
       lost = { detail, cause };
     },
+    onEvent: (event) => {
+      if (event.type === "renew_failed") refused.fire();
+    },
   });
   try {
     hb.start();
-    await sleep(60);
+    await refused.fired;
     const restore = jumpClocks(5000);
     try {
       assert.equal(hb.pastDeadline(), true);
@@ -1208,6 +1287,109 @@ test("without a subject, both messages leave out what the org is over its allowa
       return true;
     },
   );
+});
+
+test("a failure left unrecorded while a position is vacated keeps the history unknown", async () => {
+  // a, b and c claim 1, 2 and 3. b is refused, so 2 is vacated; a then fails
+  // with its own error, which is not recorded while history is unknown, so 1
+  // stays empty; c is refused at the top, and the counter steps down through
+  // 2 to 1. Recording must not resume with 1 empty.
+  const bSettled = signal();
+  const aSettled = signal();
+  const client = scriptedClient({
+    acquire: [
+      undefined,
+      overAllowance(),
+      () =>
+        aSettled.fired.then(() => {
+          throw overAllowance();
+        }),
+    ],
+  });
+  const a = tool(async () => { await bSettled.fired; throw new Error("card declined"); }, { toolName: "a" });
+  const b = tool(async () => "b", { toolName: "b" });
+  const c = tool(async () => "c", { toolName: "c" });
+  const declined = tool(async () => { throw new Error("declined again"); }, { toolName: "declined" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    const results = await Promise.allSettled([a().finally(aSettled.fire), b().finally(bSettled.fire), c()]);
+    assert.match(results[0].reason.message, /card declined/);
+    assert.ok(isAllowance(results[1].reason));
+    assert.ok(isAllowance(results[2].reason));
+    assert.equal(ctx.historyKnown, false);
+    // Nothing is recorded from here on: not a's failure, nor a later one.
+    await assert.rejects(declined(), /declined again/);
+    assert.equal(await notify(), "notified");
+  });
+  assert.deepEqual(client.of("acquire").map((c) => c.sequence), [1, 2, 3, 2, 3]);
+  assert.equal(client.count("recordAcquire"), 0);
+  assert.deepEqual(committed(client), [[3, "notify"]]);
+});
+
+test("a takeover below the top leaves its position empty for good, as before", async () => {
+  // lost holds 1 and is taken over (the engine will not release its lease);
+  // refused holds 2, the top, and is refused after that. The takeover's
+  // position is not vacated, so the counter does not step down through it.
+  const lostSettled = signal();
+  const client = scriptedClient({
+    acquire: [
+      undefined,
+      () =>
+        lostSettled.fired.then(() => {
+          throw overAllowance();
+        }),
+    ],
+    release: [{ released: false }],
+  });
+  const lost = tool(async () => { throw new LeaseLostError("taken over"); }, { toolName: "lost" });
+  const refused = tool(async () => "refused", { toolName: "refused" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    const results = await Promise.allSettled([lost().finally(lostSettled.fire), refused()]);
+    assert.ok(results[0].reason instanceof LeaseLostError);
+    assert.ok(isAllowance(results[1].reason));
+    assert.equal(ctx.historyKnown, false);
+    assert.equal(await notify(), "notified");
+  });
+  assert.deepEqual(client.of("acquire").map((c) => c.sequence), [1, 2, 2]);
+  assert.deepEqual(committed(client), [[2, "notify"]]);
+});
+
+test("adopting a position the engine reported drops vacated positions and stops recording", async () => {
+  // A refused call below the top vacates 1; the call above it commits 2.
+  // Adopting the engine's position forgets 1 unclaimed, so recording stays
+  // stopped, even through recordEngineSequence, which does not stop it.
+  const slowSettled = signal();
+  let release;
+  const gate = new Promise((r) => (release = r));
+  const client = scriptedClient({ acquire: [overAllowance()] });
+  const charge = tool(async () => "charged", { toolName: "charge" });
+  const slow = tool(async () => { await gate; return "slow"; }, { toolName: "slow" });
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    await Promise.allSettled([charge().finally(() => release()), slow().finally(slowSettled.fire)]);
+    ctx.recordEngineSequence(2);
+    assert.equal(await notify(), "notified");
+    assert.equal(ctx.historyKnown, false);
+  });
+  assert.deepEqual(client.of("acquire").map((c) => c.sequence), [1, 2, 3]);
+});
+
+test("a vacated position is no longer vacated once a call claims it", () => {
+  // Only reachable once the counter was moved below a call still in flight,
+  // which a refused call then vacates above the counter.
+  const ctx = session(scriptedClient());
+  ctx.claimPosition();
+  ctx.claimPosition();
+  ctx.sequence = 0;
+  ctx.giveBackRefusedPosition(2);
+  assert.equal(ctx.historyKnown, false);
+  ctx.claimPosition();
+  ctx.claimPosition();
+  assert.equal(ctx.historyKnown, true);
 });
 
 // --- Over the real transport ---------------------------------------------
@@ -1380,14 +1562,23 @@ test("an execution lease whose renewal is refused mid-block is lost at its deadl
   });
   let lostDetail;
   let reason;
+  const refused = signal();
   await assert.rejects(
     executionLease(
       "task:2",
-      { workerId: "worker-1", target, ttlMs: 1000, onLeaseLost: (detail) => (lostDetail = detail) },
+      {
+        workerId: "worker-1",
+        target,
+        ttlMs: 1000,
+        onLeaseLost: (detail) => (lostDetail = detail),
+        onEvent: (event) => {
+          if (event.type === "renew_failed") refused.fire();
+        },
+      },
       async (lease) => {
-        // The refused renewal is due after 20 ms; the block then stalls past
-        // the lease's deadline and checks before acting.
-        await sleep(80);
+        // The renewal is refused, however long it takes over the wire; the
+        // block then stalls past the lease's deadline and checks before acting.
+        await refused.fired;
         const restore = jumpClocks(5000);
         try {
           lease.check();

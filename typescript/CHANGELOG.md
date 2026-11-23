@@ -23,13 +23,18 @@ All notable changes to the Cellaflow TypeScript SDK.
   a refusal, and checking it never throws.
 - **A refused call hands its position back when it is the top one**, so the next call takes it.
   One below a later call leaves its position empty and stops the session's recording, as before,
-  but the position is remembered: when the calls above it hand theirs back too, the counter steps
-  down through every such position, the next calls take them, and recording resumes. The same
-  applies to a call another worker took over. Adopting the engine's position instead, after a
-  cache hit or a refused record, drops them, and recording stays stopped.
+  but the position is remembered: when the calls above it are refused too and hand theirs back,
+  the counter steps down through every such position, so the next calls take them, and recording
+  resumes at once, unless a failure was left unrecorded meanwhile, which stops it for good.
+  Adopting the engine's position instead, after a cache hit or a refused record, drops them, and
+  recording stays stopped. A call another worker took over is handled as before: below a later
+  call, its position stays empty for good.
 - **A commit that got no answer and was refused over the allowance when sent again** raises the
-  refusal, not the first commit's error. That first commit may have landed, so its position is
-  not handed back: the next call takes the one after it, and the session's recording stops.
+  refusal, not the first commit's error. If the lease is then released, it was still this call's
+  and neither commit landed, so the position is handed back as for any refusal. Otherwise the
+  first may have landed: the position is handed back all the same, since the engine refuses the
+  next call's lease there before its body runs if the commit is there, and the session's recording
+  stops.
 - **A renewal refused over the allowance stops the renewals**, so the lease lasts until its
   deadline. A body that finishes before then is recorded as usual. Past it, `LeaseHandle.check()`
   throws, and `signal` aborts with, a `LeaseLostError` with the refusal as its `cause`, also when
@@ -61,8 +66,9 @@ All notable changes to the Cellaflow TypeScript SDK.
   `"new_sessions_blocked" | "writes_blocked"`, or any other name a later engine sends. Both are
   absent when the ErrorInfo is missing or they do not parse. The message says the org is over its
   allowance, of what (left out when the subject is empty), and when it resets (in UTC, to the
-  second, with milliseconds only when it has them), followed by the engine's message; `rawMessage` holds the same, and the engine's own text is
-  `cause.rawMessage`, `cause` being the engine's error. It is a `ConnectError` with code
+  second, with milliseconds only when it has them), followed by the engine's message;
+  `rawMessage` holds the same, and the engine's own text is `cause.rawMessage`, `cause` being the
+  engine's error. It is a `ConnectError` with code
   `Code.ResourceExhausted`, so code that checks either still matches it, and so its `name` is
   `ConnectError`. See "When the org is over its allowance" in the README.
 - **`LeaseLostError` has a `cause`** when the lease was lost because its renewals were refused over

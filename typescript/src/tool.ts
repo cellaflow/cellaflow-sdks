@@ -199,12 +199,21 @@ export function tool<A extends unknown[], R>(
     try {
       return await runAt(ctx, seq, args, callCoordination, coordinationId, leaseTtlMs, known);
     } catch (err) {
+      // What happens to the position, decided by one principle: a position is
+      // handed back only with the history marked unknown unless nothing can
+      // have landed there. So the doubt about a commit is settled first,
+      // whatever else is true of the call, then a takeover, then a refusal.
       if (known.mayHaveLanded) {
-        // The commit got no answer, and sent again was refused because the org
-        // is over its allowance, so it may have landed. Its position is not
-        // handed back, where the next call could land on the commit, and
-        // nothing is recorded in its name; the run can no longer tell what the
-        // session holds, so it stops recording.
+        // The commit got no answer, the same commit sent again was refused
+        // because the org is over its allowance, and the release did not show
+        // the lease was still this call's: the first may have landed. Nothing
+        // is recorded in its name, and the position goes back all the same,
+        // with the run no longer recording. If the commit did land, the engine
+        // refuses the next call's lease at this position before its body
+        // runs, or answers a hit for the same key; keeping the position would
+        // instead put the next call past a possible gap, refused only at its
+        // commit, after its side effect.
+        ctx.giveBackRefusedPosition(seq);
         ctx.historyKnown = false;
         throw err;
       }
@@ -233,7 +242,7 @@ export function tool<A extends unknown[], R>(
         // within about a TTL, the next call at this position can be refused
         // with DivergentStepError while that lease still claims it, as after
         // a process that exited holding a lease.
-        ctx.giveBackPosition(seq);
+        ctx.giveBackRefusedPosition(seq);
         throw err;
       }
       // A failed call leaves its position empty; record the failure there so the
@@ -578,8 +587,8 @@ export function tool<A extends unknown[], R>(
         if (outcome?.takenOver) throw takenOver(result, outcome.error);
         // The same commit sent again was refused because the org is over its
         // allowance: that answer, not the first one's silence, is what the
-        // caller hears. The first may still have landed, so its position is
-        // not handed back.
+        // caller hears. The first may still have landed, unless the release
+        // below shows the lease was still this call's.
         if (outcome && isAllowanceRefusal(outcome.error)) {
           known.mayHaveLanded = true;
           throw outcome.error;
@@ -606,6 +615,9 @@ export function tool<A extends unknown[], R>(
           .then((released) => {
             // Not released: the lease was no longer this call's to release.
             if (!released.released) known.lost = true;
+            // Released: it was still this call's, so no commit under it
+            // landed, whatever the commits' answers were.
+            else known.mayHaveLanded = false;
           })
           .catch(() => {
             // The lease expires on its own. Losing the release is not worth
@@ -640,7 +652,7 @@ export function tool<A extends unknown[], R>(
         // Unknown: the call is not treated as taken over, and fails as it
         // would have, unless the commit sent again was refused because the
         // org is over its allowance, which is then what the caller hears. The
-        // first may still have landed, so its position is not handed back.
+        // first may still have landed: the lease was not released.
         known.lost = false;
         if (isAllowanceRefusal(outcome.error)) {
           known.mayHaveLanded = true;
@@ -681,8 +693,9 @@ interface Known {
   lost?: boolean;
   /**
    * Set when the call's commit got no answer and the same commit sent again
-   * was refused over the allowance: the first may have landed, so the
-   * position is neither handed back nor recorded.
+   * was refused over the allowance, and cleared if the lease is then
+   * released: while set, the first may have landed, so the position is
+   * handed back only with the history marked unknown, and nothing recorded.
    */
   mayHaveLanded?: boolean;
 }

@@ -271,7 +271,13 @@ export class WorkflowContext {
   ): void {
     // As for a hit: a run that does not know everything the session holds (a
     // resumed `durableTools` session) would record at a position already filled.
-    if (!this.historyKnown) return;
+    if (!this.historyKnown) {
+      // Not recorded, so this position stays empty for good. While positions
+      // are vacated, history is unknown only until they are reclaimed; this
+      // gap is not one of them, so recording must not resume past it.
+      this.historyKnown = false;
+      return;
+    }
     if (!(this.inFlight === 1 && this.sequence === sequence)) {
       // It overlapped another call, so its position stays empty, and the run
       // stops recording, as for a hit: a later failure held above that empty
@@ -305,6 +311,11 @@ export class WorkflowContext {
    */
   claimPosition(): number {
     this.sequence += 1;
+    // A vacated position is below the counter, so no claim lands on one, unless
+    // the counter was moved below a call still in flight (by adopting the
+    // engine's position) and that call was then refused. Recording has stopped
+    // for good by then; this only keeps a later step-down from passing through
+    // a position a call has claimed since.
     this.vacated.delete(this.sequence);
     this.inFlight += 1;
     return this.sequence;
@@ -316,11 +327,29 @@ export class WorkflowContext {
   }
 
   /**
-   * Hands back the position a call claimed and left unwritten, so a later call
+   * Hands back the position a call claimed and left unwritten, so the next call
    * claims it instead of landing one past an empty one. For a call another
-   * worker took over, whose outcome belongs to that worker, and for one refused
-   * because the org is over its allowance: nothing is recorded there in its
-   * name.
+   * worker took over: its outcome belongs to that worker, so nothing is recorded
+   * there in its name, and calling the tool again finds that worker's result.
+   * Only while no later position was claimed meanwhile: the call then holds the
+   * top position, so handing it back defers no write, even with lower calls
+   * still in flight. Otherwise the position stays empty and the run stops
+   * recording, for the reason a failure record does.
+   */
+  giveBackPosition(sequence: number): void {
+    if (this.sequence === sequence) {
+      this.sequence = sequence - 1;
+      return;
+    }
+    this.historyKnown = false;
+  }
+
+  /**
+   * Hands back the position of a call refused because the org is over its
+   * allowance, which says nothing about the call, so nothing is recorded there
+   * in its name. Refused calls often come together, all at once, so unlike
+   * {@link giveBackPosition} this keeps track of the positions it cannot hand
+   * back yet.
    *
    * The rule, the same in the Python SDK:
    *
@@ -333,14 +362,14 @@ export class WorkflowContext {
    *   claimed above it. The position is vacated instead: it stays empty, and
    *   the run stops recording while any position is vacated, for the reason a
    *   failure record does.
-   * - A vacated position is no longer vacated once the counter steps down
-   *   through it or a call claims it. If the run adopts the engine's position
-   *   instead of its own count, every vacated position is dropped and the run
-   *   stops recording for good.
-   * - Recording resumes once no position is vacated, unless something else
-   *   stopped it.
+   * - A position is no longer vacated once the counter steps down through it
+   *   or a call claims it. If the run adopts the engine's position instead of
+   *   its own count, every vacated position is dropped and the run stops
+   *   recording for good.
+   * - Recording resumes as soon as no position is vacated, unless something
+   *   else stopped it, such as a failure left unrecorded meanwhile.
    */
-  giveBackPosition(sequence: number): void {
+  giveBackRefusedPosition(sequence: number): void {
     if (this.sequence !== sequence) {
       this.vacated.add(sequence);
       return;
@@ -352,6 +381,8 @@ export class WorkflowContext {
   /**
    * Moves the counter to the position the engine reported. Positions vacated
    * below the old count are dropped unclaimed, so the run stops recording.
+   * Both callers have stopped it already, except a caller of the public
+   * {@link recordEngineSequence}, whose position is adopted here too.
    */
   private adoptPosition(position: number): void {
     this.sequence = position;
@@ -745,7 +776,7 @@ export function getContext(): WorkflowContext {
 
   if (openSessions.size === 0) {
     throw new Error(
-      "No CellaFlow session is active. A leased tool must be called inside " +
+      "No Cellaflow session is active. A leased tool must be called inside " +
         "durableTools(...), which is what binds it to a session. Without one " +
         "there is no idempotency key to derive and nothing to lease.",
     );
