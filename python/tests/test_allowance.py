@@ -27,6 +27,7 @@ import cellaflow.lease
 from cellaflow import (
     AllowanceExceeded,
     CellaflowClient,
+    LeaseHandle,
     LeaseLostError,
     async_execution_lease,
     current_lease,
@@ -1761,20 +1762,26 @@ def test_a_resent_commit_refused_for_the_allowance_raises_the_refusal(
     def notify_sync() -> str:
         return "notified"
 
+    known: List[bool] = []
+
     @workflow(version="1.0.0")
     def checkout() -> str:
         try:
             return charge_sync()  # type: ignore[no-any-return]
         except grpc.RpcError as e:
             caught.append(e)
+            known.append(get_context().history_known)
             return notify_sync()  # type: ignore[no-any-return]
 
     assert checkout() == "notified"
     assert isinstance(caught[0], AllowanceExceeded)
+    # The first commit may have landed, so its position is kept, and the run
+    # stops recording into the session.
+    assert known == [False]
     assert _commits(mock_stub) == [
         (1, "charge_sync", SUCCESS),
         (1, "charge_sync", SUCCESS),
-        (1, "notify_sync", SUCCESS),
+        (2, "notify_sync", SUCCESS),
     ]
 
 
@@ -2077,5 +2084,625 @@ def test_the_future_wrapper_can_be_copied_and_made_without_a_call() -> None:
     copied = copy.copy(_RequestFuture(call))
     assert copied.code() == grpc.StatusCode.OK
     bare = _RequestFuture.__new__(_RequestFuture)
-    assert getattr(bare, "code", None) is None
+    # Without a call, asking fails plainly instead of recursing.
+    with pytest.raises(AttributeError):
+        bare.code()
+    assert getattr(bare, "debug_error_string", None) is None
     assert not hasattr(bare, "__setstate_custom__")
+
+
+# --- Positions given back, as the TypeScript SDK gives them back ----------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_a_refused_step_inside_another_gives_both_positions_back(
+    mock_stub: MagicMock, asynchronous: bool
+) -> None:
+    """`book` (position 1) calls `charge` (position 2), which is refused. The
+    refusal passes up through `book`, and each gives its position back as it
+    goes, the top one first, so the step the workflow calls next lands at 1
+    with the history still known."""
+    _refuse_step(mock_stub, "charge" if asynchronous else "charge_sync", over_allowance)
+    known: List[bool] = []
+
+    @step
+    async def charge() -> str:
+        return "charged"  # pragma: no cover
+
+    @step
+    async def book() -> str:
+        return await charge()  # type: ignore[no-any-return]
+
+    @step
+    async def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    async def checkout_async() -> str:
+        try:
+            return await book()  # type: ignore[no-any-return]
+        except AllowanceExceeded:
+            known.append(get_context().history_known)
+            return await notify()  # type: ignore[no-any-return]
+
+    @step
+    def charge_sync() -> str:
+        return "charged"  # pragma: no cover
+
+    @step
+    def book_sync() -> str:
+        return charge_sync()  # type: ignore[no-any-return]
+
+    @step
+    def notify_sync() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    def checkout() -> str:
+        try:
+            return book_sync()  # type: ignore[no-any-return]
+        except AllowanceExceeded:
+            known.append(get_context().history_known)
+            return notify_sync()  # type: ignore[no-any-return]
+
+    assert await _run(checkout_async if asynchronous else checkout) == "notified"
+    assert known == [True]
+    next_step = "notify" if asynchronous else "notify_sync"
+    assert _commits(mock_stub) == [(1, next_step, SUCCESS)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", ["call order", "reverse order"])
+async def test_concurrent_refused_calls_give_their_positions_back_in_either_order(
+    mock_stub: MagicMock, order: str
+) -> None:
+    """`first` claims 1 and `second` claims 2, and both are refused. Refused in
+    call order, `first` cannot give 1 back past `second`, so it is vacated, and
+    the run records nothing meanwhile; when `second` gives 2 back, the counter
+    steps down past 1 as well, and recording resumes. In reverse order each
+    gives its own back in turn. Either way the next call takes 1."""
+    gates = {"first": threading.Event(), "second": threading.Event()}
+    granted = mock_stub.CheckIdempotencyCache.return_value
+
+    def check(req: Any, **kwargs: Any) -> Any:
+        for name, gate in gates.items():
+            if f":{name}:" in req.idempotency_key:
+                assert gate.wait(5.0)
+                raise over_allowance()
+        return granted
+
+    mock_stub.CheckIdempotencyCache.side_effect = check
+
+    @step
+    async def first() -> str:
+        return "first"  # pragma: no cover
+
+    @step
+    async def second() -> str:
+        return "second"  # pragma: no cover
+
+    @step
+    async def notify() -> str:
+        return "notified"
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(),
+        session_id="s-concurrent",
+        workflow_version="1.0.0",
+        history_known=True,
+    )
+    with ctx.bind():
+        a = asyncio.ensure_future(first())
+        await _until(lambda: ctx.sequence == 1)
+        b = asyncio.ensure_future(second())
+        await _until(lambda: ctx.sequence == 2)
+        settle = [("first", a), ("second", b)]
+        if order == "reverse order":
+            settle.reverse()
+        recording: List[bool] = []
+        for name, task in settle:
+            gates[name].set()
+            with pytest.raises(AllowanceExceeded):
+                await task
+            recording.append(ctx.history_known)
+        assert recording == ([False, True] if order == "call order" else [True, True])
+        assert ctx.sequence == 0
+        assert not ctx._vacated
+        assert ctx.history_known
+        assert await notify() == "notified"
+    assert _commits(mock_stub) == [(1, "notify", SUCCESS)]
+
+
+@pytest.mark.asyncio
+async def test_a_call_refused_below_one_that_commits_leaves_its_position_empty(
+    mock_stub: MagicMock,
+) -> None:
+    """`first` (1) is refused while `second` (2) is still running, and then
+    `second` commits. Position 1 can never be given back, so it stays vacated,
+    and the run records nothing into the session from then on."""
+    gates = {"first": threading.Event(), "second": threading.Event()}
+    granted = mock_stub.CheckIdempotencyCache.return_value
+
+    def check(req: Any, **kwargs: Any) -> Any:
+        if ":first:" in req.idempotency_key:
+            assert gates["first"].wait(5.0)
+            raise over_allowance()
+        if ":second:" in req.idempotency_key:
+            assert gates["second"].wait(5.0)
+        return granted
+
+    mock_stub.CheckIdempotencyCache.side_effect = check
+
+    @step
+    async def first() -> str:
+        return "first"  # pragma: no cover
+
+    @step
+    async def second() -> str:
+        return "second"
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(),
+        session_id="s-below",
+        workflow_version="1.0.0",
+        history_known=True,
+    )
+    with ctx.bind():
+        a = asyncio.ensure_future(first())
+        await _until(lambda: ctx.sequence == 1)
+        b = asyncio.ensure_future(second())
+        await _until(lambda: ctx.sequence == 2)
+        gates["first"].set()
+        with pytest.raises(AllowanceExceeded):
+            await a
+        assert ctx._vacated == {1} and ctx.sequence == 2
+        assert not ctx.history_known
+        gates["second"].set()
+        assert await b == "second"
+    assert _commits(mock_stub) == [(2, "second", SUCCESS)]
+    assert ctx._vacated == {1}
+    assert not ctx.history_known
+
+
+def test_a_vacated_position_is_cleared_when_a_call_claims_it() -> None:
+    ctx = WorkflowContext(
+        client=MagicMock(), session_id="s", workflow_version="1", history_known=True
+    )
+    ctx.sequence, ctx._in_flight = 3, 3
+    ctx.give_back_position(2)
+    assert ctx._vacated == {2} and ctx.sequence == 3
+    assert not ctx.history_known
+    # A call claiming 2 again, after the counter moved back to 1 (as a cache
+    # hit's report can move it), fills it.
+    ctx.sequence = 1
+    assert ctx._try_claim() == (2, 0.0)
+    assert ctx._vacated == set()
+    assert ctx.history_known
+
+
+def test_adopting_the_engines_position_drops_vacated_ones_for_good() -> None:
+    ctx = WorkflowContext(
+        client=MagicMock(), session_id="s", workflow_version="1", history_known=True
+    )
+    ctx.sequence, ctx._in_flight = 3, 3
+    ctx.give_back_position(1)
+    ctx.record_engine_sequence(5)
+    ctx.reconcile_sequence()
+    assert ctx.sequence == 5 and not ctx._vacated
+    assert not ctx.history_known
+    # Without a vacated position, adopting keeps the history known.
+    ctx2 = WorkflowContext(
+        client=MagicMock(), session_id="s", workflow_version="1", history_known=True
+    )
+    ctx2.record_engine_sequence(5)
+    ctx2.reconcile_sequence()
+    assert ctx2.sequence == 5 and ctx2.history_known
+
+
+# --- A refused resend after a commit with no answer -----------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_a_resend_refused_after_the_lease_was_said_to_be_gone_raises_it(
+    mock_stub: MagicMock, asynchronous: bool
+) -> None:
+    """Commit unanswered, resent and unanswered again, the release answered as
+    no longer the call's, and the resend that decides it refused for the
+    allowance: the caller gets the refusal. The first commit may have landed,
+    so nothing is recorded, the position is kept, and the run stops recording
+    into the session."""
+    name = "charge" if asynchronous else "charge_sync"
+    answer = mock_stub.CommitStep.side_effect
+    failures: List[BaseException] = [
+        over_allowance(),
+        EngineError(grpc.StatusCode.UNAVAILABLE, "unavailable"),
+        EngineError(grpc.StatusCode.UNAVAILABLE, "unavailable"),
+    ]
+
+    def commit(req: Any, **kwargs: Any) -> Any:
+        if req.step_result.name == name and failures:
+            raise failures.pop()
+        return answer(req, **kwargs)
+
+    mock_stub.CommitStep.side_effect = commit
+    mock_stub.ReleaseLease.return_value = idempotency_pb2.ReleaseLeaseResponse(
+        released=False
+    )
+    caught: List[BaseException] = []
+    known: List[bool] = []
+
+    @step
+    async def charge() -> str:
+        return "charged"
+
+    @step
+    async def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    async def checkout_async() -> str:
+        try:
+            return await charge()  # type: ignore[no-any-return]
+        except grpc.RpcError as e:
+            caught.append(e)
+            known.append(get_context().history_known)
+            return await notify()  # type: ignore[no-any-return]
+
+    @step
+    def charge_sync() -> str:
+        return "charged"
+
+    @step
+    def notify_sync() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    def checkout() -> str:
+        try:
+            return charge_sync()  # type: ignore[no-any-return]
+        except grpc.RpcError as e:
+            caught.append(e)
+            known.append(get_context().history_known)
+            return notify_sync()  # type: ignore[no-any-return]
+
+    assert await _run(checkout_async if asynchronous else checkout) == "notified"
+    assert isinstance(caught[0], AllowanceExceeded)
+    assert known == [False]
+    commits = _commits(mock_stub)
+    assert commits[:3] == [(1, name, SUCCESS)] * 3
+    assert all(status != FAILED for _, _, status in commits)
+    assert commits[-1][0] == 2
+    assert mock_stub.ReleaseLease.call_count == 1
+
+
+def test_a_resend_refused_after_the_release_is_refused_keeps_the_position(
+    mock_stub: MagicMock,
+) -> None:
+    """The first commit was answered (refused for another reason), but the
+    engine would not release the lease: the commit may have landed and
+    completed the key all the same, which is what the resend is sent to find
+    out. It is refused for the allowance, so the position is kept, as in the
+    TypeScript SDK, and the run stops recording."""
+    answer = mock_stub.CommitStep.side_effect
+    failures: List[BaseException] = [
+        over_allowance(),
+        EngineError(grpc.StatusCode.INVALID_ARGUMENT, "not that"),
+    ]
+
+    def commit(req: Any, **kwargs: Any) -> Any:
+        if req.step_result.name == "charge_sync" and failures:
+            raise failures.pop()
+        return answer(req, **kwargs)
+
+    mock_stub.CommitStep.side_effect = commit
+    mock_stub.ReleaseLease.return_value = idempotency_pb2.ReleaseLeaseResponse(
+        released=False
+    )
+    caught: List[BaseException] = []
+    known: List[bool] = []
+
+    @step
+    def charge_sync() -> str:
+        return "charged"
+
+    @step
+    def notify_sync() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    def checkout() -> str:
+        try:
+            return charge_sync()  # type: ignore[no-any-return]
+        except grpc.RpcError as e:
+            caught.append(e)
+            known.append(get_context().history_known)
+            return notify_sync()  # type: ignore[no-any-return]
+
+    assert checkout() == "notified"
+    assert isinstance(caught[0], AllowanceExceeded)
+    assert known == [False]
+    assert _commits(mock_stub)[-1] == (2, "notify_sync", SUCCESS)
+
+
+# --- The refusal is the loss's cause only when it is the reason -----------------
+
+
+def test_a_refusal_after_a_loss_for_another_reason_is_not_its_cause() -> None:
+    """The holder stalled past its deadline, so the lease was lost on the
+    clock; a renewal refused for the allowance only after that does not make
+    the refusal the cause."""
+    client = MagicMock()
+    client.renew_lease.side_effect = refusal()
+    long_ago = (time.monotonic() - 5.0, time.time() - 5.0)
+    hb = LeaseHeartbeat(
+        client=client,
+        agent_id="a",
+        idempotency_key="k",
+        fencing_token=7,
+        heartbeat_interval_ms=200,
+        acquired_sent_at=long_ago,
+    )
+    handle = LeaseHandle(
+        7, probe=hb.past_deadline, key="k", refusal=lambda: hb.loss_refusal
+    )
+    with pytest.raises(LeaseLostError) as stalled:
+        handle.check()
+    hb.start_sync()
+    _wait_for(lambda: client.renew_lease.call_count == 1)
+    hb.stop_sync()
+    assert hb.allowance_refusal is not None
+    assert hb.loss_refusal is None
+    with pytest.raises(LeaseLostError) as later:
+        handle.check()
+    for lost in (stalled.value, later.value):
+        assert lost.__cause__ is None
+        assert "allowance" not in str(lost)
+
+
+def _stalled_then_refused(mock_stub: MagicMock, interval_ms: int) -> List[str]:
+    """The first renewal hangs past the lease's deadline, then is refused for
+    the allowance. Returns a list that holds "refused" once it was."""
+    mock_stub.CheckIdempotencyCache.return_value = acquired(456, interval_ms)
+    refused: List[str] = []
+
+    def renew(req: Any, **kwargs: Any) -> Any:
+        time.sleep(1.0)
+        refused.append("refused")
+        raise over_allowance()
+
+    mock_stub.RenewLease.side_effect = renew
+    return refused
+
+
+def test_an_execution_lease_lost_before_its_renewal_was_refused_is_a_plain_loss(
+    mock_stub: MagicMock,
+) -> None:
+    """Deadline 0.9 s in; the renewal sent at 0.1 s answers at 1.1 s."""
+    refused = _stalled_then_refused(mock_stub, 200)
+    with execution_lease(
+        "task:1", worker_id="w-1", ttl_ms=1000, heartbeat_interval_ms=200
+    ) as lease:
+        time.sleep(0.95)
+        with pytest.raises(LeaseLostError) as first:
+            lease.check()
+        _wait_for(lambda: bool(refused))
+        time.sleep(0.05)
+        with pytest.raises(LeaseLostError) as later:
+            lease.check()
+    for lost in (first.value, later.value):
+        assert lost.__cause__ is None
+        assert "allowance" not in str(lost)
+
+
+def test_a_step_lost_before_its_renewal_was_refused_fails_with_the_loss(
+    mock_stub: MagicMock,
+) -> None:
+    """The step's own loss came first, so the call fails with `LeaseLostError`,
+    recorded as any failure is, not with the refusal that came after."""
+    refused = _stalled_then_refused(mock_stub, 250)
+
+    @step(lease_ttl_ms=1000)  # type: ignore[untyped-decorator]
+    def charge() -> str:
+        time.sleep(0.95)
+        lease = current_lease()
+        assert lease.is_lost
+        _wait_for(lambda: bool(refused))
+        time.sleep(0.05)
+        lease.check()
+        return "charged"  # pragma: no cover
+
+    @step
+    def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    def checkout() -> str:
+        try:
+            return charge()  # type: ignore[no-any-return]
+        except LeaseLostError as e:
+            assert e.__cause__ is None
+            return notify()  # type: ignore[no-any-return]
+
+    assert checkout() == "notified"
+    assert _commits(mock_stub) == [(1, "charge", FAILED), (2, "notify", SUCCESS)]
+
+
+def test_a_loss_caused_by_the_refusal_says_so_in_the_shared_words() -> None:
+    for subject, what in (("cellaflow.steps", " for cellaflow.steps"), ("", "")):
+        refused = AllowanceExceeded(subject=subject)
+        handle = LeaseHandle(7, probe=lambda: True, key="k", refusal=lambda: refused)
+        with pytest.raises(LeaseLostError) as lost:
+            handle.check()
+        assert str(lost.value) == (
+            "Execution lease was lost: the engine refused to renew it because the "
+            f"Cellaflow org is over its allowance{what}, and its deadline passed. "
+            "The lease may already belong to another worker."
+        )
+        assert lost.value.__cause__ is refused
+    assert str(AllowanceExceeded()) == (
+        "The Cellaflow org is over its allowance, so the engine refused this call."
+    )
+
+
+# --- The heartbeat wakes at the deadline ----------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_after_a_refusal_the_heartbeat_wakes_at_the_deadline_not_the_interval(
+    asynchronous: bool, caplog: Any
+) -> None:
+    """Renewals every 0.9 s for a 2 s lease: the first, at 0.9 s, is refused,
+    and the deadline is 1.5 s in. Waking only at the next interval would report
+    the loss at 1.8 s."""
+    client = MagicMock()
+    client.renew_lease.side_effect = refusal()
+    lost_at: List[float] = []
+    started = time.monotonic()
+    hb = LeaseHeartbeat(
+        client=client,
+        agent_id="a",
+        idempotency_key="k",
+        fencing_token=7,
+        heartbeat_interval_ms=1000,
+        lease_ttl_ms=2000,
+        on_lease_lost=lambda: lost_at.append(time.monotonic() - started),
+    )
+    with caplog.at_level("WARNING", logger="cellaflow.lease"):
+        if asynchronous:
+            hb.start_async()
+            await _until(lambda: bool(lost_at), within_s=4.0)
+            await hb.stop_async()
+        else:
+            hb.start_sync()
+            _wait_for(lambda: bool(lost_at), within_s=4.0)
+            hb.stop_sync()
+    assert client.renew_lease.call_count == 1
+    assert 1.4 <= lost_at[0] < 1.65
+    assert "is not renewed any more and lasts until its deadline: " in caplog.text
+
+
+# --- grpc.Call, as the errors and futures it replaces are -----------------------
+
+
+class FinishedCall(grpc.RpcError, grpc.Call):  # type: ignore[misc]
+    """A finished call that answers everything, unlike gRPC's own error."""
+
+    def initial_metadata(self) -> Any:
+        return (("x-initial", "1"),)
+
+    def trailing_metadata(self) -> Any:
+        return ()
+
+    def code(self) -> Any:
+        return grpc.StatusCode.RESOURCE_EXHAUSTED
+
+    def details(self) -> str:
+        return MESSAGE
+
+    def is_active(self) -> bool:
+        return True
+
+    def time_remaining(self) -> Optional[float]:
+        return 1.5
+
+    def cancel(self) -> bool:
+        return True
+
+    def add_callback(self, callback: Any) -> bool:
+        callback()
+        return True
+
+
+def test_the_refusal_is_a_grpc_call_answering_as_its_call_does() -> None:
+    refused = AllowanceExceeded(MESSAGE, subject="cellaflow.steps")
+    refused.__cause__ = FinishedCall()
+    called: List[str] = []
+    assert isinstance(refused, grpc.Call) and isinstance(refused, grpc.RpcError)
+    assert refused.initial_metadata() == (("x-initial", "1"),)
+    assert refused.is_active() is True
+    assert refused.time_remaining() == 1.5
+    assert refused.cancel() is True
+    assert refused.add_callback(lambda: called.append("cb")) is True
+    assert called == ["cb"]
+    # Pickled, there is no call: it answers as a finished one.
+    copy_ = pickle.loads(pickle.dumps(refused))
+    assert isinstance(copy_, grpc.Call)
+    assert copy_.initial_metadata() == ()
+    assert copy_.is_active() is False
+    assert copy_.time_remaining() is None
+    assert copy_.cancel() is False
+    assert copy_.add_callback(lambda: called.append("again")) is False
+    assert called == ["cb"]
+    # From a client whose error is not a `grpc.Call`, likewise.
+    plain = refusal()
+    assert (plain.initial_metadata(), plain.is_active(), plain.cancel()) == (
+        (),
+        False,
+        False,
+    )
+
+
+def test_a_refusal_through_the_real_transport_answers_as_grpcs_error_does(
+    engine: Tuple[str, Engine],
+) -> None:
+    """gRPC's own failed call leaves `is_active`, `time_remaining` and
+    `add_callback` unimplemented; the refusal answers them as a finished call."""
+    target, _ = engine
+    client = CellaflowClient(target=target)
+    with pytest.raises(AllowanceExceeded) as caught:
+        client.start_session("wf", "1.0.0")
+    refused = caught.value
+    assert isinstance(refused, grpc.Call)
+    assert refused.initial_metadata() == refused.__cause__.initial_metadata()
+    assert refused.is_active() is False
+    assert refused.time_remaining() is None
+    assert refused.cancel() is False
+    assert refused.add_callback(lambda: None) is False
+    client.close()
+
+
+def test_the_future_wrapper_is_a_grpc_call_passing_everything_through() -> None:
+    call = MagicMock()
+    call.initial_metadata.return_value = (("i", "1"),)
+    call.trailing_metadata.return_value = (("t", "2"),)
+    call.code.return_value = grpc.StatusCode.OK
+    call.details.return_value = "fine"
+    call.is_active.return_value = True
+    call.time_remaining.return_value = 2.5
+    call.add_callback.return_value = True
+    call.cancel.return_value = True
+    wrapped = _RequestFuture(call)
+    assert isinstance(wrapped, grpc.Call) and isinstance(wrapped, grpc.Future)
+    assert wrapped.initial_metadata() == (("i", "1"),)
+    assert wrapped.trailing_metadata() == (("t", "2"),)
+    assert wrapped.code() == grpc.StatusCode.OK
+    assert wrapped.details() == "fine"
+    assert wrapped.is_active() is True
+    assert wrapped.time_remaining() == 2.5
+    callback = lambda: None  # noqa: E731
+    assert wrapped.add_callback(callback) is True
+    call.add_callback.assert_called_once_with(callback)
+    assert wrapped.cancel() is True
+
+
+def test_the_real_future_is_a_grpc_call(engine: Tuple[str, Engine]) -> None:
+    target, _ = engine
+    client = CellaflowClient(target=target)
+    request = client.check_idempotency_cache_future("a", "k", timeout=5.0)
+    assert isinstance(request, grpc.Call) and isinstance(request, grpc.Future)
+    with pytest.raises(AllowanceExceeded):
+        request.result()
+    assert request.is_active() is False
+    assert request.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+    assert request.details() == MESSAGE
+    assert request.initial_metadata() is not None
+    assert (STATUS_DETAILS_KEY, allowance_details()) in [
+        tuple(m) for m in request.trailing_metadata()
+    ]
+    remaining = request.time_remaining()
+    assert remaining is None or remaining >= 0
+    assert request.add_callback(lambda: None) is False
+    client.close()

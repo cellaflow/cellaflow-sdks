@@ -426,18 +426,19 @@ class LeaseHandle:
             raise self._lost_error("Execution lease was lost")
 
     def _lost_error(self, message: str) -> LeaseLostError:
-        """The `LeaseLostError` for a loss. When the engine refused the lease's
-        renewals because the org is over its allowance, it says so, and the
-        refusal is its cause, so a handler can tell the two apart and see when
-        the allowance resets."""
+        """The `LeaseLostError` for a loss. A loss that came about because the
+        engine refused the lease's renewals for the allowance says so, in the
+        words the TypeScript SDK uses, and has the refusal as its cause, so a
+        handler can tell the two apart and see when the allowance resets."""
         refusal = self._refusal() if self._refusal is not None else None
         if refusal is None:
             return LeaseLostError(message)
         subject = getattr(refusal, "subject", "")
         what = f" for {subject}" if subject else ""
         error = LeaseLostError(
-            f"{message}: the engine refused to renew it, because the org is over "
-            f"its allowance{what}"
+            f"Execution lease was lost: the engine refused to renew it because "
+            f"the Cellaflow org is over its allowance{what}, and its deadline "
+            f"passed. The lease may already belong to another worker."
         )
         error.__cause__ = refusal
         return error
@@ -708,7 +709,7 @@ def execution_lease(
             token,
             probe=lambda: hb.past_deadline(),
             key=key,
-            refusal=lambda: hb.allowance_refusal,
+            refusal=lambda: hb.loss_refusal,
         )
 
         def _on_lost() -> None:
@@ -833,7 +834,7 @@ async def async_execution_lease(
         token,
         probe=lambda: hb.past_deadline(),
         key=key,
-        refusal=lambda: hb.allowance_refusal,
+        refusal=lambda: hb.loss_refusal,
     )
     caller_task = asyncio.current_task()
     caller_loop = asyncio.get_running_loop()

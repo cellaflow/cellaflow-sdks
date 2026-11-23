@@ -110,6 +110,22 @@ def _may_pass(exc: BaseException) -> bool:
     return isinstance(exc, grpc.RpcError) and exc.code() in _RETRYABLE_CODES
 
 
+class _HistoryKnown:
+    """`WorkflowContext.history_known`: what it was last set to, while no
+    position is vacated. Setting it to false keeps it false; a vacated position
+    only holds it false until it is claimed again or stepped through, as the
+    TypeScript SDK's `historyKnown` does."""
+
+    def __get__(self, ctx: Any, owner: Any = None) -> bool:
+        if ctx is None:
+            return False  # the field's default
+        accounted = bool(ctx.__dict__.get("_accounted", False))
+        return accounted and not ctx.__dict__.get("_vacated")
+
+    def __set__(self, ctx: Any, known: bool) -> None:
+        ctx.__dict__["_accounted"] = bool(known)
+
+
 @dataclass
 class WorkflowContext:
     client: CellaflowClient
@@ -138,7 +154,11 @@ class WorkflowContext:
     #
     # False unless the caller says otherwise: a context built for a session whose
     # history it never read must not record into it.
-    history_known: bool = False
+    #
+    # Also false while a position is vacated, and true again once every such
+    # position is claimed or stepped through, unless something else set it
+    # false: set to false, it stays false. See `give_back_position`.
+    history_known: _HistoryKnown = _HistoryKnown()
     # Whether `sequence` is where the session is. False for a resumed
     # `durable_tools` session, which does not replay from the start: its first
     # call reads the session's position, unless a cache hit has reported it by
@@ -155,6 +175,11 @@ class WorkflowContext:
     # Calls in one session can overlap: asyncio tasks, or a framework running
     # tools on a thread pool. See `take_hit`.
     _in_flight: int = 0
+    # Positions below the top that a call claimed and left unwritten, and could
+    # not give back, because a later one was claimed meanwhile. When the top is
+    # given back, the counter steps down through any of these just below it.
+    # See `give_back_position`.
+    _vacated: "set[int]" = field(default_factory=set, repr=False, compare=False)
     # The refusal that stopped this run's replay, if one did. Every later step
     # raises it again, and so does the workflow's end. See `refuse`.
     _refusal: Optional[BaseException] = field(default=None, repr=False, compare=False)
@@ -306,6 +331,7 @@ class WorkflowContext:
                 return None, wait
             self.sequence += 1
             self._in_flight += 1
+            self._vacated.discard(self.sequence)
             return self.sequence, 0.0
 
     def _reconcile_or_wait(self) -> float:
@@ -754,18 +780,50 @@ class WorkflowContext:
                 return
 
     def give_back_position(self, sequence: int) -> None:
-        """Returns the position of a step a process exit interrupted.
+        """Returns the position of a step that claimed it and recorded nothing
+        there: one a process exit interrupted, or one an allowance refusal
+        stopped. If the code carries on, its next step takes this position
+        rather than landing one past an empty one.
 
-        A `KeyboardInterrupt` or `SystemExit` is not something a workflow carries
-        on past, so it is not recorded. If the code does carry on anyway, its next
-        step takes this position rather than landing one past an empty one. Only
-        while no later position was claimed meanwhile; if the step did commit
-        before the interruption reached it, the next step's lease at that position
-        is refused before its body runs.
+        Only the top position can be given back, but that one can be even with
+        lower calls still in flight (a step that called this one): no later
+        position was claimed, so handing it back defers no write. The counter
+        then steps on down through positions just below that were vacated
+        earlier, so calls refused together give their positions back in either
+        order. A position below the top is remembered as vacated instead, and
+        while any position is vacated the run records nothing, as for a failure
+        it cannot hold: a later step would land beyond an empty position. Once
+        every vacated position is claimed again or stepped through, recording
+        resumes, unless something else stopped it. As the TypeScript SDK's
+        `giveBackPosition` does.
+
+        If the step did commit before the interruption reached it, the next
+        step's lease at that position is refused before its body runs.
         """
         with self._lock:
-            if self._in_flight == 1 and self.sequence == sequence:
-                self.sequence = sequence - 1
+            if self.sequence != sequence:
+                self._vacated.add(sequence)
+                return
+            self.sequence = sequence - 1
+            while self.sequence in self._vacated:
+                self._vacated.discard(self.sequence)
+                self.sequence -= 1
+
+    def _adopt_position(self, position: int) -> None:
+        """Moves the counter to the position the engine reported. Positions
+        vacated below the old count are dropped unclaimed, so the run stops
+        recording for good. Under the lock."""
+        self.sequence = position
+        if self._vacated:
+            self._vacated.clear()
+            self.history_known = False
+
+    def mark_history_unknown(self) -> None:
+        """Stops recording into this session, without giving a position back:
+        a step whose commit got no answer may have landed there, so the run no
+        longer knows what the session holds."""
+        with self._lock:
+            self.history_known = False
 
     def has_pending_failure(self) -> bool:
         """Whether a failure is held, waiting to be recorded."""
@@ -930,7 +988,7 @@ class WorkflowContext:
                 # recording hits and continues from the session's real position.
                 self._pending_hit = None
                 self.history_known = False
-                self.sequence = position
+                self._adopt_position(position)
                 if code == grpc.StatusCode.FAILED_PRECONDITION:
                     reason = "another writer committed or claimed it first"
                 elif code is not None:
@@ -957,7 +1015,7 @@ class WorkflowContext:
             self._pending_hit = None
             return
         if self._reported_sequence is not None:
-            self.sequence = self._reported_sequence
+            self._adopt_position(self._reported_sequence)
             self._reported_sequence = None
 
     def _write_record(self, pending: Dict[str, Any]) -> None:

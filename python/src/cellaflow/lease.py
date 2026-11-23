@@ -164,6 +164,11 @@ class LeaseHeartbeat:
         # allowance, if it refused one. Renewing stops there, and the loss is
         # reported at the deadline. See `_refused_for_allowance`.
         self.allowance_refusal: Optional[AllowanceExceeded] = None
+        # That refusal, if it is why the lease was lost: decided when the loss
+        # is reported, so a refusal that came only after a loss for another
+        # reason (a holder stalled past its deadline) is not taken for its
+        # cause.
+        self.loss_refusal: Optional[AllowanceExceeded] = None
         self._lost_lock = threading.Lock()
         # Set once the heartbeat is told to stop: the lease is then being let
         # go, not lost, and the clock no longer judges it.
@@ -241,7 +246,8 @@ class LeaseHeartbeat:
             self._notify_lost(
                 f"no renewal was confirmed in time, because the engine refused "
                 f"them: the org is over its allowance for {refusal.subject}. The "
-                f"lease may already belong to another worker"
+                f"lease may already belong to another worker",
+                refusal,
             )
         else:
             self._notify_lost(
@@ -250,8 +256,11 @@ class LeaseHeartbeat:
             )
         return True
 
-    def _notify_lost(self, detail: str) -> None:
-        """Marks the lease lost and runs the caller's callback, once."""
+    def _notify_lost(
+        self, detail: str, refusal: Optional[AllowanceExceeded] = None
+    ) -> None:
+        """Marks the lease lost and runs the caller's callback, once.
+        `refusal` is the allowance refusal the loss is due to, if it is."""
         with self._lost_lock:
             if self.lost:
                 # Already judged lost on the clock; the engine's own reason is
@@ -260,6 +269,7 @@ class LeaseHeartbeat:
                 return
             self.lost = True
             self.lost_detail = detail
+            self.loss_refusal = refusal
         logger.warning("Lease %s lost: %s", self.idempotency_key, detail)
         if self.on_lease_lost is None:
             return
@@ -280,7 +290,7 @@ class LeaseHeartbeat:
         `LeaseLostError` with this refusal as its cause."""
         self.allowance_refusal = refusal
         logger.warning(
-            "Lease %s is not renewed any more: %s It lasts until its deadline.",
+            "Lease %s is not renewed any more and lasts until its deadline: %s",
             self.idempotency_key,
             refusal,
         )

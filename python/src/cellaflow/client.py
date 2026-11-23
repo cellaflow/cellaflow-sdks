@@ -605,10 +605,12 @@ def _send(request: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         raise refusal from exc
 
 
-class _RequestFuture(grpc.Future):  # type: ignore[misc]
+class _RequestFuture(grpc.Call, grpc.Future):  # type: ignore[misc]
     """A request's `grpc.Future` that fails with `AllowanceExceeded` where the
-    call failed with an allowance refusal, as `_send` raises it. The call's own
-    attributes (`code()`, `details()`, `is_active()`) are passed through."""
+    call failed with an allowance refusal, as `_send` raises it. It is a
+    `grpc.Call` too, as the call it wraps is, and everything else is passed
+    through to that call: `code()`, `details()`, metadata, `is_active()`,
+    `time_remaining()`, `add_callback()` and the rest."""
 
     def __init__(self, call: Any) -> None:
         self._call = call
@@ -656,6 +658,28 @@ class _RequestFuture(grpc.Future):  # type: ignore[misc]
         # Called with this future, not the call, so the callback reads the
         # error as this future reports it.
         self._call.add_done_callback(lambda _: fn(self))
+
+    def initial_metadata(self) -> Any:
+        return self._call.initial_metadata()
+
+    def trailing_metadata(self) -> Any:
+        return self._call.trailing_metadata()
+
+    def code(self) -> Any:
+        return self._call.code()
+
+    def details(self) -> Any:
+        return self._call.details()
+
+    def is_active(self) -> bool:
+        return bool(self._call.is_active())
+
+    def time_remaining(self) -> Optional[float]:
+        remaining: Optional[float] = self._call.time_remaining()
+        return remaining
+
+    def add_callback(self, callback: Callable[[], None]) -> bool:
+        return bool(self._call.add_callback(callback))
 
     def __getattr__(self, name: str) -> Any:
         # Only for what this class does not define. A copy or an unpickled one

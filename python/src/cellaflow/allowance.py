@@ -12,8 +12,9 @@ may also carry a `google.rpc.ErrorInfo` from domain `cellaflow.com` with reason
 then. The TypeScript SDK reads the same details the same way.
 
 `CellaflowClient` raises such a refusal as `AllowanceExceeded`, and nothing in
-the SDK sends the request again: until the allowance resets, the engine gives
-the same answer.
+the SDK loops or waits on it: until the allowance resets, the engine gives the
+same answer. Only a refused release, and the lease on a record the SDK keeps
+pending, are sent again, once, by the next call.
 
 The details are decoded with message classes built here, from the few fields
 this needs, in a descriptor pool of this module's own. Nothing is added to
@@ -42,19 +43,23 @@ _DOMAIN = "cellaflow.com"
 _REASON = "ALLOWANCE_EXCEEDED"
 
 
-class AllowanceExceeded(grpc.RpcError):  # type: ignore[misc]
+class AllowanceExceeded(grpc.RpcError, grpc.Call):  # type: ignore[misc]
     """The engine refused a request because the organization is over its
     allowance.
 
-    Final: nothing in the SDK sends the request again, because the engine gives
-    the same answer until the allowance resets. A step that raises it is not
-    recorded as failed, so calling the step again once the allowance resets, or
-    running the workflow again, runs it.
+    Final: nothing in the SDK loops or waits on it, because the engine gives
+    the same answer until the allowance resets. Only a refused release, and the
+    lease on a record the SDK keeps pending, are sent again, once, by the next
+    call. A step that raises it is not recorded as failed, so calling the step
+    again once the allowance resets, or running the workflow again, runs it.
 
     Still a `grpc.RpcError`, so code that catches those catches it too: `code()`
     is RESOURCE_EXHAUSTED, `details()` the engine's message, and
     `trailing_metadata()` what the engine sent. The error the call failed with
-    is its `__cause__`.
+    is its `__cause__`. Like gRPC's own error for a failed call, it is a
+    `grpc.Call` too: `initial_metadata()`, `is_active()`, `time_remaining()`,
+    `cancel()` and `add_callback()` answer as that call does, or as a finished
+    call would once there is none (after pickling, say).
 
     Attributes
     ----------
@@ -92,6 +97,36 @@ class AllowanceExceeded(grpc.RpcError):  # type: ignore[misc]
 
     def trailing_metadata(self) -> Tuple[Any, ...]:
         return self._trailing_metadata
+
+    def initial_metadata(self) -> Any:
+        return self._from_call("initial_metadata", ())
+
+    def is_active(self) -> bool:
+        return bool(self._from_call("is_active", False))
+
+    def time_remaining(self) -> Optional[float]:
+        remaining: Optional[float] = self._from_call("time_remaining", None)
+        return remaining
+
+    def cancel(self) -> bool:
+        return bool(self._from_call("cancel", False))
+
+    def add_callback(self, callback: Any) -> bool:
+        return bool(self._from_call("add_callback", False, callback))
+
+    def _from_call(self, name: str, default: Any, *args: Any) -> Any:
+        """What the call this refusal came from answers to `name`, or `default`
+        as a finished call would: when there is no call (unpickled, or raised
+        by a client whose error is not a `grpc.Call`), or the call leaves it
+        unimplemented, as gRPC's own failed call does `is_active`,
+        `time_remaining` and `add_callback`."""
+        call = self.__cause__
+        if not isinstance(call, grpc.Call):
+            return default
+        try:
+            return getattr(call, name)(*args)
+        except NotImplementedError:
+            return default
 
     def debug_error_string(self) -> str:
         return f"RESOURCE_EXHAUSTED: {self._details}"

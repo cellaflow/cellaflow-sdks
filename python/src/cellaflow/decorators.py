@@ -466,6 +466,7 @@ def _note_failure(
     unreleased: Optional[Dict[str, Any]] = None,
     is_async: bool = True,
     lease_ttl_ms: Optional[int] = None,
+    may_have_landed: bool = False,
 ) -> None:
     """Holds a live step's failure or cancellation to be recorded at its position.
 
@@ -480,8 +481,17 @@ def _note_failure(
     exception (an `asyncio.run` inside it, say), recorded and replayed like any
     other. A process exit (`KeyboardInterrupt`, `SystemExit`) is not something a
     workflow carries on past, so the step gives its position back instead.
+    `may_have_landed` is whether the step's commit, sent again, was refused
+    for the allowance when the first may have landed.
     """
     try:
+        if may_have_landed:
+            # Refused, but the step's commit may have landed at this position.
+            # Giving the position back could put the next step on top of it,
+            # and nothing is recorded in its name, so the run can no longer
+            # tell what the session holds, and stops recording into it.
+            ctx.mark_history_unknown()
+            return
         if isinstance(exc, DivergentStepError):
             return
         if _carries_refusal(exc):
@@ -489,8 +499,9 @@ def _note_failure(
             # once it resets the step can run. Recorded, it would be raised
             # again at this position by every resume, even after that. So it
             # is not recorded, as a process exit is not, and the position is
-            # given back: calling the step again after the reset takes it, and
-            # a re-run runs the step.
+            # given back if it is the top one (see `give_back_position`):
+            # calling the step again after the reset takes it, and a re-run
+            # runs the step.
             #
             # The same goes for an error the body made from a refusal (`raise
             # OrderFailed(...) from refusal`) or a group holding one: its own
@@ -568,6 +579,10 @@ class _CallLease:
         # Set when the engine showed the lease is no longer this call's.
         self.lost = False
         self.returned = False
+        # Set when the same commit sent again was refused because the org is
+        # over its allowance: the first may still have landed, so the call's
+        # position is not given back. See `_note_failure`.
+        self.may_have_landed = False
         self.result: Any = None
         # The payload committed, taken once from the result.
         self.payload: Dict[str, Any] = {}
@@ -908,7 +923,7 @@ def _lease_for_body(
         return hb is not None and hb.past_deadline()
 
     def refusal() -> Optional[BaseException]:
-        return hb.allowance_refusal if hb is not None else None
+        return hb.loss_refusal if hb is not None else None
 
     handle = LeaseHandle(fencing_token, probe=probe, key=ikey, refusal=refusal)
     call.handle = handle
@@ -1016,9 +1031,10 @@ def _commit(
                 call.mark_taken_over()
                 raise _taken_over(name, result) from again
             if _is_allowance_refusal(again):
-                # An answer, unlike the first attempt's error: the commit did
-                # not land, and the call fails with the refusal, which is not
-                # recorded.
+                # That answer, not the first attempt's silence, is what the
+                # caller hears. The first attempt may still have landed, so its
+                # position is not given back.
+                call.may_have_landed = True
                 raise
             raise exc from None
     except BaseException:
@@ -1067,11 +1083,20 @@ def _resend_commit(
     `LeaseLostError` when the refusal is about the key (a stale token, or the
     key recorded at another position), so another worker holds the call; False
     for anything else (no answer, or the position already filled, which can
-    also mean the commit landed), so the call fails as it would have.
+    also mean the commit landed), so the call fails as it would have. A resend
+    refused because the org is over its allowance is raised: it is the answer
+    the call fails with, rather than the first attempt's error.
     """
     try:
         _send_commit(ctx, call, seq, name, ikey, fencing_token, call_coordination)
     except Exception as again:
+        if _is_allowance_refusal(again):
+            # What the caller hears. The lease would not be released, which
+            # can mean the first commit landed and completed the key, so its
+            # position is not given back, as in the TypeScript SDK.
+            call.may_have_landed = True
+            call.apply_held_loss()
+            raise
         if not _is_stale_lease(again) and not _is_committed_elsewhere(again):
             return False
         call.apply_held_loss()
@@ -1505,7 +1530,7 @@ def step(
                         return call.result
                 call.apply_held_loss()
                 refused: Optional[BaseException] = (
-                    hb.allowance_refusal if hb is not None else None
+                    hb.loss_refusal if hb is not None else None
                 )
                 if (
                     refused is not None
@@ -1544,6 +1569,7 @@ def step(
                     failed_at or time.monotonic(),
                     unreleased,
                     lease_ttl_ms=_ttl_for(ctx),
+                    may_have_landed=call.may_have_landed,
                 )
             raise
         finally:
@@ -1812,7 +1838,7 @@ def step(
                         return call.result
                 call.apply_held_loss()
                 refused: Optional[BaseException] = (
-                    hb.allowance_refusal if hb is not None else None
+                    hb.loss_refusal if hb is not None else None
                 )
                 if (
                     refused is not None
@@ -1850,6 +1876,7 @@ def step(
                     unreleased,
                     is_async=False,
                     lease_ttl_ms=_ttl_for(ctx),
+                    may_have_landed=call.may_have_landed,
                 )
             raise
         finally:
