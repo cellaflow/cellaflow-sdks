@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { checkApiKeyOption } from "./apikey.js";
 import { CellaflowClient } from "./client.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
+import type { LeaseHolder } from "./cellaflow/v1/idempotency_pb.js";
 import { LeaseHeartbeat } from "./lease.js";
 import type { LeaseEvent } from "./lease.js";
 import { RELEASE_DEADLINE_SECS } from "./wait.js";
@@ -11,15 +12,83 @@ const DEFAULT_TTL_MS = 30_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
 
 /**
+ * Who holds a lease, as the engine last read it: recorded when the lease was
+ * granted, with the expiry renewals have since moved it to. Carried on
+ * {@link LeaseNotAcquired} when another worker holds the lease.
+ */
+export interface LeaseHolderInfo {
+  /**
+   * The worker that acquired the lease, by the `workerId` it acquired it with.
+   * That is what the worker said it was, not an authenticated identity. Absent
+   * when the engine did not record one, or the worker sent an empty one.
+   */
+  readonly workerId?: string;
+  /**
+   * The engine's id for this grant of the lease, kept through its renewals; a
+   * reclaim is a new grant with a new id. It identifies the grant, not the
+   * worker (that is `workerId`).
+   */
+  readonly engineHolderId: string;
+  /** When the lease was acquired, epoch ms on the engine's clock. Absent when not recorded. */
+  readonly acquiredAtMs?: number;
+  /**
+   * When the lease lapses unless renewed, epoch ms on the engine's clock.
+   * After waiting (`waitMs`), as of the engine's last look at the lease, so a
+   * later renewal may have moved it.
+   */
+  readonly expiresAtMs: number;
+  /** The lease's ceiling, independent of renewals, epoch ms on the engine's clock. Absent when it has none. */
+  readonly hardExpiresAtMs?: number;
+}
+
+/**
  * Raised when a lease cannot be acquired: by `executionLease` when another
  * worker holds it, and by `tool()` when none of the leases the engine granted
  * could be confirmed.
  */
 export class LeaseNotAcquired extends Error {
-  constructor(message: string) {
+  /**
+   * Who holds the lease. Present only when it was refused because another
+   * worker holds it and the engine said who; absent otherwise, including for a
+   * key that is already committed and for an engine too old to report it.
+   */
+  declare readonly holder?: LeaseHolderInfo;
+
+  constructor(message: string, options?: { holder?: LeaseHolderInfo }) {
     super(message);
     this.name = "LeaseNotAcquired";
+    if (options?.holder) this.holder = options.holder;
   }
+}
+
+/**
+ * A holder's `workerId` as a refusal message shows it. The holder chose that
+ * string and it is not authenticated, and a message often reaches a model, so
+ * it is quoted, cut to 64 characters, and every character that could hide text
+ * or break the line is escaped: control and format characters, line and
+ * paragraph separators, and variation selectors. The full id stays on
+ * `holder.workerId`.
+ */
+function shownWorkerId(id: string): string {
+  const chars = Array.from(id);
+  const cut = chars.length > 64 ? `${chars.slice(0, 64).join("")}...` : id;
+  // After JSON.stringify, \p{Cc} matches only DEL and C1: C0 is already escaped.
+  return JSON.stringify(cut).replace(
+    /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u{FE00}-\u{FE0F}\u{E0100}-\u{E01EF}]/gu,
+    (c) => `\\u{${(c.codePointAt(0) ?? 0).toString(16)}}`,
+  );
+}
+
+/** The SDK's view of the engine's `LeaseHolder`: numbers, and absent rather than empty or 0. */
+function holderInfo(holder: LeaseHolder | undefined): LeaseHolderInfo | undefined {
+  if (!holder) return undefined;
+  return Object.freeze({
+    ...(holder.agentId ? { workerId: holder.agentId } : {}),
+    engineHolderId: holder.engineHolderId,
+    ...(holder.acquiredAtMs ? { acquiredAtMs: Number(holder.acquiredAtMs) } : {}),
+    expiresAtMs: Number(holder.expiresAtMs),
+    ...(holder.hardExpiresAtMs ? { hardExpiresAtMs: Number(holder.hardExpiresAtMs) } : {}),
+  });
 }
 
 /** Raised by `LeaseHandle.check()` once the lease has been lost. */
@@ -320,7 +389,10 @@ export function runWithoutLease<T>(fn: () => T): T {
 }
 
 export interface ExecutionLeaseOptions {
-  /** Identifies this worker. Sent as `agentId`. */
+  /**
+   * Identifies this worker. Sent as `agentId`. Shown to any worker refused this
+   * lease (`LeaseNotAcquired.holder`), so keep it free of anything private.
+   */
   workerId: string;
   target?: string;
   secure?: boolean;
@@ -422,11 +494,13 @@ export async function executionLease<T>(
       );
     }
     if (resp.status !== CacheStatus.ACQUIRED) {
-      const holder = resp.currentHolderId ? ` (held by ${resp.currentHolderId})` : "";
+      const holder = holderInfo(resp.currentHolder);
+      const by = holder?.workerId ? ` (held by ${shownWorkerId(holder.workerId)})` : "";
       throw new LeaseNotAcquired(
-        `Could not acquire execution lease '${key}'${holder}. Another worker is ` +
+        `Could not acquire execution lease '${key}'${by}. Another worker is ` +
           "running it. Raise waitMs to wait for them, or treat this as the " +
           "signal that the work is already in hand.",
+        { holder },
       );
     }
 

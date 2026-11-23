@@ -2,6 +2,40 @@
 
 All notable changes to the Cellaflow TypeScript SDK.
 
+## Unreleased
+
+### Behaviour changes
+
+- **`CheckCacheResponse.currentHolderId` is removed.** It was the engine's opaque id for the
+  holder's grant of the lease, which `CellaflowClient.checkIdempotencyCache` returned on
+  `IN_PROGRESS`. The same value is now `currentHolder.engineHolderId`, and `currentHolder.agentId` is
+  the worker that acquired the lease. Code that read `currentHolderId` no longer compiles; in
+  JavaScript it reads `undefined`.
+- **A refusal's message names the holder's `workerId`, not the engine's opaque id.** It reads
+  `(held by "worker-a")`: quoted, cut to 64 characters, and with control and format characters,
+  line and paragraph separators, and variation selectors escaped, since the holder chose the id and
+  the message may reach a model. The full id is on `holder.workerId`. When the engine does not report the holder, or reports no `workerId`, the
+  message names nobody; 0.12.0 printed the engine's opaque id there.
+
+### Compatibility
+
+- Tested with engine 0.5.0: CI's integration tests run against `ghcr.io/cellaflow/cellaflow:0.5.0`.
+- `holder` on `LeaseNotAcquired` needs engine 0.5.0 or later; with an older engine it is always
+  absent, and everything else works as before. Engine 0.5.0 also refuses a `workerId` (or a tool's
+  agent id) longer than 1024 bytes or containing control characters.
+
+### Added
+
+- **A refused lease says who holds it.** When `executionLease` (or `taskLease`) is refused because
+  another worker holds the lease, `LeaseNotAcquired` carries `holder`, a `LeaseHolderInfo`
+  (exported): `workerId`, the id that worker acquired the lease with; `engineHolderId`, the engine's id
+  for that grant of the lease; `acquiredAtMs`; `expiresAtMs`, when the lease lapses unless renewed;
+  and `hardExpiresAtMs`, its ceiling. Times are epoch milliseconds on the engine's clock. The
+  `workerId` is what that worker said it was, not an authenticated identity. `workerId`,
+  `acquiredAtMs` and `hardExpiresAtMs` are absent rather than empty or 0 when the engine did not
+  record them, and `holder` itself is absent for a key that is already committed, for a `tool()`
+  call whose granted leases could not be confirmed, and when the engine is too old to report it.
+
 ## 0.12.0
 
 ### Compatibility

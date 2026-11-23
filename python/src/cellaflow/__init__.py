@@ -26,6 +26,7 @@ from cellaflow.execution import (
     task_lease,
     current_lease,
     LeaseHandle,
+    LeaseHolderInfo,
     LeaseNotAcquired,
     LeaseLostError,
 )
@@ -58,6 +59,7 @@ __all__ = [
     "task_lease",
     "current_lease",
     "LeaseHandle",
+    "LeaseHolderInfo",
     "LeaseNotAcquired",
     "LeaseLostError",
     "MIN_LEASE_TTL_MS",

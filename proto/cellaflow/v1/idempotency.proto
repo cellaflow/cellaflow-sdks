@@ -52,14 +52,26 @@ enum IdempotencyCommitStatus {
 // ============================================================================
 
 message CheckCacheRequest {
-  // Opaque caller-supplied label, carried for logging and diagnostics.
+  // Caller-supplied label. A granted lease records it, and every caller refused
+  // that lease is shown it (current_holder.agent_id), so it should not carry
+  // anything private. Over 1024 bytes, or containing a control character
+  // (Unicode Cc), is refused with INVALID_ARGUMENT.
   //
   // Not parsed into the idempotency key: key derivation is an SDK concern and the
   // engine treats the key as opaque.
   string agent_id = 1;
   string idempotency_key = 2;       // Fully formed, opaque composite key
+  // How long to wait for a lease another caller holds. Unset or 0, answer at
+  // once. When the wait runs out the engine tries once more before answering, so
+  // the answer can come a few storage round trips after it, and is whatever that
+  // attempt gets: ACQUIRED, HIT or IN_PROGRESS, or the errors any attempt can
+  // return (FAILED_PRECONDITION when the position is claimed or committed,
+  // UNAVAILABLE while the node halts). Set the call's deadline above the wait.
   optional uint64 wait_timeout_ms = 3;
-  optional uint64 lease_ttl_ms = 4; // Crash-detection window; defaults to engine config
+  // Crash-detection window. Unset, the engine's configured default. Under 4 ms
+  // is refused with INVALID_ARGUMENT; above the maximum lease lifetime the lease
+  // is granted the maximum, which lease_expires_at_ms in the answer shows.
+  optional uint64 lease_ttl_ms = 4;
 
   // The session this check is being made on behalf of.
   //
@@ -95,10 +107,11 @@ message CheckCacheResponse {
   CacheStatus status = 1;
   optional StepResult cached_result = 2;
   optional uint64 fencing_token = 3;         // Present iff ACQUIRED
-  optional uint64 lease_expires_at_ms = 4;   // Present iff ACQUIRED or IN_PROGRESS
+  optional uint64 lease_expires_at_ms = 4;   // Present iff ACQUIRED or IN_PROGRESS (then current_holder.expires_at_ms)
   optional uint64 heartbeat_interval_ms = 5; // Present iff ACQUIRED — caller MUST renew
   optional uint64 retry_after_ms = 6;        // Present iff IN_PROGRESS and wait exhausted
-  optional string current_holder_id = 7;     // Present iff IN_PROGRESS (for distributed tracing)
+  reserved 7;                                // was current_holder_id, now current_holder.engine_holder_id
+  reserved "current_holder_id";
 
   // The requested session's highest committed sequence, or 0 if it has
   // none. Present whenever `session_id` was supplied — on every status, not only
@@ -112,12 +125,41 @@ message CheckCacheResponse {
   // that already performs a storage transaction, and it lets a caller about to
   // execute confirm it is where it thinks it is.
   optional uint64 current_sequence = 8;
+
+  // Who holds the lease. Present iff IN_PROGRESS.
+  optional LeaseHolder current_holder = 9;
+}
+
+// Who holds a lease, as the engine last read it: recorded when the lease was
+// granted, with the expiry renewals have since moved it to.
+//
+// The fencing token is not sent, but it is not a credential either: renew,
+// release and commit check it to order grants, not to authenticate the caller.
+// Nothing may rely on a refused caller not knowing it.
+message LeaseHolder {
+  // The agent that acquired the lease, as it named itself in
+  // CheckCacheRequest.agent_id. Not authenticated, and every caller refused the
+  // lease sees it. Empty if the agent sent none, or the lease was recorded by an
+  // engine that did not store it.
+  string agent_id = 1;
+  // The engine's id for this grant of the lease (LeaseRecord.engine_holder_id),
+  // kept through its renewals; a reclaim is a new grant with a new id. It
+  // identifies the grant, not the agent (that is agent_id), and tells apart two
+  // grants to the same agent_id.
+  string engine_holder_id = 2;
+  uint64 acquired_at_ms = 3;     // Epoch ms, engine clock. 0 if not recorded
+  uint64 expires_at_ms = 4;      // When the lease lapses unless renewed (epoch ms)
+  uint64 hard_expires_at_ms = 5; // Ceiling independent of renewals; 0 means none
 }
 
 message RenewLeaseRequest {
   string agent_id = 1;
   string idempotency_key = 2;
   uint64 fencing_token = 3;
+  // How long the lease lasts from this renewal. Under 4 ms (including 0, the
+  // value when unset) is refused with INVALID_ARGUMENT. Above the maximum lease
+  // lifetime it is granted the maximum, and never past the lease's ceiling;
+  // new_expires_at_ms in the answer shows what was granted.
   uint64 extend_ms = 4;
 }
 

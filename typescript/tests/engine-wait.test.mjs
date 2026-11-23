@@ -598,7 +598,7 @@ test("a claim refusal that quotes the committed wording is not read as a committ
   const claimed = Object.assign(
     new Error(
       "Sequence 4 in session 's-1' is already claimed by a different step identity " +
-        "(key 'x is already committed', holder 'h')",
+        "(key 'x is already committed', engine_holder_id 'h')",
     ),
     { code: 9 },
   );

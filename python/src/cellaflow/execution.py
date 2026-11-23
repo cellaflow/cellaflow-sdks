@@ -58,6 +58,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import dataclasses
 import functools
 import hashlib
 import inspect
@@ -91,8 +92,93 @@ _current_lease: contextvars.ContextVar[Optional["LeaseHandle"]] = (
 KeySource = Union[str, Callable[..., str]]
 
 
+@dataclasses.dataclass(frozen=True)
+class LeaseHolderInfo:
+    """Who holds a lease, as the engine last read it: recorded when the lease
+    was granted, with the expiry renewals have since moved it to.
+
+    Carried on :class:`LeaseNotAcquired` when another worker holds the lease.
+    Its fields are stored in recorded step failures, so a field added later
+    needs a default, or a resumed run cannot read records already written.
+
+    Attributes
+    ----------
+    worker_id:
+        The worker that acquired the lease, by the ``worker_id`` it acquired
+        it with. That is what the worker said it was, not an authenticated
+        identity. ``None`` when the engine did not record one, or the worker
+        sent an empty one.
+    engine_holder_id:
+        The engine's id for this grant of the lease, kept through its renewals;
+        a reclaim is a new grant with a new id. It identifies the grant, not
+        the worker (that is ``worker_id``).
+    acquired_at_ms:
+        When the lease was acquired, epoch ms on the engine's clock. ``None``
+        when not recorded.
+    expires_at_ms:
+        When the lease lapses unless renewed, epoch ms on the engine's clock.
+    hard_expires_at_ms:
+        The lease's ceiling, independent of renewals, epoch ms on the engine's
+        clock. ``None`` when it has none.
+    """
+
+    worker_id: Optional[str]
+    engine_holder_id: str
+    acquired_at_ms: Optional[int]
+    expires_at_ms: int
+    hard_expires_at_ms: Optional[int]
+
+    @classmethod
+    def _from_proto(cls, holder: idempotency_pb2.LeaseHolder) -> "LeaseHolderInfo":
+        # Absent rather than empty or 0, so a caller never mistakes "not
+        # recorded" for a worker named "" or a lease granted at the epoch.
+        return cls(
+            worker_id=holder.agent_id or None,
+            engine_holder_id=holder.engine_holder_id,
+            acquired_at_ms=holder.acquired_at_ms or None,
+            expires_at_ms=holder.expires_at_ms,
+            hard_expires_at_ms=holder.hard_expires_at_ms or None,
+        )
+
+
 class LeaseNotAcquired(RuntimeError):
-    """Raised when the requested execution lease cannot be acquired."""
+    """Raised when the requested execution lease cannot be acquired.
+
+    Attributes
+    ----------
+    holder:
+        Who holds the lease. Set only when it was refused because another
+        worker holds it and the engine said who; ``None`` otherwise, including
+        for a key that is already completed and for an engine too old to
+        report it.
+    """
+
+    # The holder as plain fields rather than the dataclass. When a step raises
+    # this refusal and the workflow catches it, the step's failure record keeps
+    # only plain data, so this is what a resumed run reads the holder back
+    # from. Records store it under this name: renaming it, or giving
+    # LeaseHolderInfo a field without a default, breaks reading records
+    # already written. The class default covers a record that has none.
+    _holder: Optional[Dict[str, Any]] = None
+
+    def __init__(self, *args: Any, holder: Optional[LeaseHolderInfo] = None) -> None:
+        super().__init__(*args)
+        self.holder = holder
+
+    @property
+    def holder(self) -> Optional[LeaseHolderInfo]:
+        """Who holds the lease, or ``None``; see the class docstring."""
+        stored = self._holder
+        if stored is None:
+            return None
+        # Fields a later SDK version recorded and this one does not know are
+        # dropped rather than refused.
+        known = {f.name for f in dataclasses.fields(LeaseHolderInfo)}
+        return LeaseHolderInfo(**{k: v for k, v in stored.items() if k in known})
+
+    @holder.setter
+    def holder(self, value: Optional[LeaseHolderInfo]) -> None:
+        self._holder = dataclasses.asdict(value) if value is not None else None
 
 
 _NO_RESULT: Any = object()
@@ -463,6 +549,25 @@ def current_lease() -> LeaseHandle:
     return handle
 
 
+def _holder_of(resp: Any) -> Optional[LeaseHolderInfo]:
+    """The holder an IN_PROGRESS answer names, if the engine sent one.
+
+    A stand-in response names none unless it carries a real ``LeaseHolder``
+    message: a plain object, a ``MagicMock`` or an autospec of
+    ``CheckCacheResponse`` must still give ``LeaseNotAcquired``, as it did
+    before the holder existed, never an error from reading a field it lacks.
+    """
+    try:
+        if not resp.HasField("current_holder"):
+            return None
+        holder = resp.current_holder
+    except Exception:
+        return None
+    if not isinstance(holder, idempotency_pb2.LeaseHolder):
+        return None
+    return LeaseHolderInfo._from_proto(holder)
+
+
 def _acquire(
     client: CellaflowClient,
     key: str,
@@ -478,7 +583,8 @@ def _acquire(
     if resp.status == idempotency_pb2.CACHE_STATUS_IN_PROGRESS:
         raise LeaseNotAcquired(
             f"Lease {key!r} is held by a live worker. Another worker is "
-            f"actively heartbeating this task."
+            f"actively heartbeating this task.",
+            holder=_holder_of(resp),
         )
     if resp.status == idempotency_pb2.CACHE_STATUS_HIT:
         raise LeaseNotAcquired(f"Lease {key!r} was already completed.")
@@ -537,7 +643,9 @@ def execution_lease(
         Idempotency key that identifies the resource being locked.  Must be a
         stable, human-readable business identifier, e.g. ``"task:abc-123"``.
     worker_id:
-        Identifies this worker. Used as ``agent_id`` in the engine API.
+        Identifies this worker. Used as ``agent_id`` in the engine API. Shown
+        to any worker refused this lease (``LeaseNotAcquired.holder``), so
+        keep it free of anything private.
     target:
         CellaFlow engine address. Defaults to ``localhost:50051``.
     secure:

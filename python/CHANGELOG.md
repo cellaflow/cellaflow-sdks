@@ -2,6 +2,41 @@
 
 All notable changes to the Cellaflow Python SDK.
 
+## Unreleased
+
+### Behaviour changes
+
+- **`CheckCacheResponse.current_holder_id` is removed.** It was the engine's opaque id for the
+  holder's grant of the lease, which `CellaflowClient.check_idempotency_cache` returned on
+  `IN_PROGRESS`. The same value is now `current_holder.engine_holder_id`, and
+  `current_holder.agent_id` is the worker that acquired the lease. Code that reads or assigns
+  `current_holder_id` raises `AttributeError`, and `HasField("current_holder_id")` or
+  `CheckCacheResponse(current_holder_id=...)`, in a test double for instance, raises `ValueError`.
+
+### Compatibility
+
+- Tested with engine 0.5.0: CI's integration tests run against `ghcr.io/cellaflow/cellaflow:0.5.0`.
+- `holder` on `LeaseNotAcquired` needs engine 0.5.0 or later; with an older engine it is always
+  `None`, and everything else works as before. Engine 0.5.0 also refuses a `worker_id` (or a step's
+  agent id) longer than 1024 bytes or containing control characters.
+
+### Added
+
+- **A refused lease says who holds it.** When `execution_lease`, `async_execution_lease` or
+  `@task_lease` is refused because another worker holds the lease, `LeaseNotAcquired` carries
+  `holder`, a `LeaseHolderInfo` (exported, a frozen dataclass): `worker_id`, the id that worker
+  acquired the lease with; `engine_holder_id`, the engine's id for that grant of the lease;
+  `acquired_at_ms`; `expires_at_ms`, when the lease lapses unless renewed; and `hard_expires_at_ms`,
+  its ceiling. Times are epoch milliseconds on the engine's clock. The `worker_id` is what that
+  worker said it was, not an authenticated identity. `worker_id`, `acquired_at_ms` and
+  `hard_expires_at_ms` are `None` rather than empty or 0 when the engine did not record them, and
+  `holder` itself is `None` for a key that is already completed, for a `@tool` or `@step` call whose
+  granted leases could not be confirmed, and when the engine is too old to report it.
+  `LeaseNotAcquired` is still a `RuntimeError`, takes the same positional arguments, and its message
+  is unchanged. A test double standing in for the engine's answer (a `MagicMock`, specced or not)
+  still gives a refusal, with `holder` as `None`. When a step raises the refusal and the workflow catches it, the recorded failure
+  keeps the holder, so a resumed run reads the same one.
+
 ## 0.12.0
 
 ### Compatibility
