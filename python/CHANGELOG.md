@@ -15,9 +15,10 @@ All notable changes to the Cellaflow Python SDK.
 
 ### Compatibility
 
-- `holder` on `LeaseNotAcquired` needs an engine that reports it. Engines up to and including 0.4.0
-  do not, and with them it is always `None`. An engine that reports it also refuses a `worker_id`
-  (or a step's agent id) longer than 1024 bytes or containing control characters.
+- Tested with engine 0.5.0: CI's integration tests run against `ghcr.io/cellaflow/cellaflow:0.5.0`.
+- `holder` on `LeaseNotAcquired` needs engine 0.5.0 or later; with an older engine it is always
+  `None`, and everything else works as before. Engine 0.5.0 also refuses a `worker_id` (or a step's
+  agent id) longer than 1024 bytes or containing control characters.
 
 ### Added
 

@@ -825,7 +825,7 @@ The tests in `tests/integration/` run against a real engine, and are skipped unl
 
 ```bash
 docker run -d -p 50051:50051 -e CELLAFLOW_ALLOW_UNAUTHENTICATED=true \
-  ghcr.io/cellaflow/cellaflow:0.3.0
+  ghcr.io/cellaflow/cellaflow:0.5.0
 CELLAFLOW_TARGET=localhost:50051 pytest --no-cov tests/integration
 
 # The TypeScript SDK's, from typescript/
