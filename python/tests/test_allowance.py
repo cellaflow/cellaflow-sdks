@@ -6,8 +6,11 @@ failure. A plain RESOURCE_EXHAUSTED, such as a session's full mailbox, is
 retried as before."""
 
 import asyncio
+import builtins
 import collections
+import copy
 import pickle
+import sys
 import threading
 import time
 from concurrent import futures
@@ -24,7 +27,9 @@ import cellaflow.lease
 from cellaflow import (
     AllowanceExceeded,
     CellaflowClient,
+    LeaseLostError,
     async_execution_lease,
+    current_lease,
     durable_tools,
     execution_lease,
     step,
@@ -32,9 +37,16 @@ from cellaflow import (
     tool,
     workflow,
 )
-from cellaflow.allowance import STATUS_DETAILS_KEY, _refusal_from
-from cellaflow.context import WorkflowContext
-from cellaflow.decorators import _hand_back
+from cellaflow.allowance import (
+    STATUS_DETAILS_KEY,
+    _carries_refusal,
+    _is_allowance_refusal,
+    _refusal_from,
+    _rfc3339,
+)
+from cellaflow.client import _RequestFuture
+from cellaflow.context import WorkflowContext, _may_pass, get_context
+from cellaflow.decorators import _hand_back, _hand_back_later, _unanswered
 from cellaflow.lease import LeaseHeartbeat
 from cellaflow.serialization import serialize
 from cellaflow.v1 import common_pb2, idempotency_pb2, service_pb2
@@ -1181,74 +1193,38 @@ def test_the_last_record_is_still_retried_after_a_full_mailbox(
     assert _commits(mock_stub) == [(1, "charge", FAILED)]
 
 
-def _claimed_once(mock_stub: MagicMock) -> None:
-    """Refuses the first lease on a failure record because the failed step's
-    lease still claims its position, as an engine does until that lapses."""
-    granted = mock_stub.CheckIdempotencyCache.return_value
-    claimed = [EngineError(grpc.StatusCode.FAILED_PRECONDITION, "position claimed")]
-
-    def check(req: Any, **kwargs: Any) -> Any:
-        if ":failure:" in req.idempotency_key and claimed:
-            raise claimed.pop()
-        return granted
-
-    mock_stub.CheckIdempotencyCache.side_effect = check
-
-
-def test_a_release_refused_for_the_allowance_is_not_sent_again_by_the_record(
-    mock_stub: MagicMock,
-) -> None:
-    """The lease still claims the step's position, so the record waits for it
-    to lapse rather than being dropped, without sending the release again."""
-    mock_stub.ReleaseLease.side_effect = over_allowance()
-    _claimed_once(mock_stub)
-
-    @step
-    def charge() -> str:
-        raise PaymentDeclined("no funds")
-
-    @step
-    def notify() -> str:
-        return "notified"
-
-    @workflow(version="1.0.0")
-    def wf() -> str:
-        try:
-            charge()
-        except PaymentDeclined:
-            return notify()  # type: ignore[no-any-return]
-        return "charged"  # pragma: no cover
-
-    assert wf() == "notified"
-    assert mock_stub.ReleaseLease.call_count == 1
-    assert _commits(mock_stub) == [(1, "charge", FAILED), (2, "notify", SUCCESS)]
-
-
-def test_a_release_the_record_retries_is_not_sent_a_third_time_once_refused(
-    mock_stub: MagicMock,
-) -> None:
-    """The step's release goes unanswered and the record sends it again, which
-    the engine refuses for the allowance. The record then waits for the lease to
-    lapse and is held up once more (a full mailbox on its commit), without
-    sending the release again."""
-    releases: List[BaseException] = [over_allowance(), mailbox_full()]
+def _refuse_releases(mock_stub: MagicMock, name: str) -> List[bool]:
+    """Refuses every release of the step `name`'s lease for the allowance while
+    the returned flag is set. Clearing it brings the allowance back."""
+    refusing = [True]
 
     def release(req: Any, **kwargs: Any) -> Any:
-        if ":charge:" in req.idempotency_key and releases:
-            raise releases.pop()
+        if f":{name}:" in req.idempotency_key and refusing[0]:
+            raise over_allowance()
         return idempotency_pb2.ReleaseLeaseResponse(released=True)
 
     mock_stub.ReleaseLease.side_effect = release
-    answer = mock_stub.CommitStep.side_effect
-    commit_failures = [mailbox_full()]
+    return refusing
 
-    def commit(req: Any, **kwargs: Any) -> Any:
-        if req.step_result.status == FAILED and commit_failures:
-            raise commit_failures.pop()
-        return answer(req, **kwargs)
 
-    mock_stub.CommitStep.side_effect = commit
-    _claimed_once(mock_stub)
+def _releases_of(mock_stub: MagicMock, name: str) -> List[Any]:
+    return [
+        c[0][0]
+        for c in mock_stub.ReleaseLease.call_args_list
+        if f":{name}:" in c[0][0].idempotency_key
+    ]
+
+
+def test_a_refused_release_is_kept_and_sent_again_once_the_allowance_is_back(
+    mock_stub: MagicMock,
+) -> None:
+    """The failed step's lease still claims its position, so its failure record
+    sends the release again before it is written. Refused again, the next call
+    fails with the refusal at once rather than waiting out the lease (about 40
+    s here). Once the allowance is back the release goes through, token and
+    all, and the record is written."""
+    refusing = _refuse_releases(mock_stub, "charge")
+    took: List[float] = []
 
     @step
     def charge() -> str:
@@ -1264,18 +1240,79 @@ def test_a_release_the_record_retries_is_not_sent_a_third_time_once_refused(
             charge()
         except PaymentDeclined:
             pass
+        started = time.monotonic()
         try:
             notify()
-        except grpc.RpcError:
-            pass
+        except AllowanceExceeded:
+            took.append(time.monotonic() - started)
+        refusing[0] = False
         return notify()  # type: ignore[no-any-return]
 
     assert wf() == "notified"
-    assert sum(":charge:" in k for k in _keys(mock_stub.ReleaseLease)) == 2
-    assert _commits(mock_stub)[-2:] == [(1, "charge", FAILED), (2, "notify", SUCCESS)]
+    assert len(took) == 1 and took[0] < 1.0
+    assert [r.fencing_token for r in _releases_of(mock_stub, "charge")] == [456] * 3
+    # The record's lease is asked for only once the release went through.
+    assert sum(":failure:" in k for k in _keys(mock_stub.CheckIdempotencyCache)) == 1
+    assert _commits(mock_stub) == [(1, "charge", FAILED), (2, "notify", SUCCESS)]
 
 
-def test_a_hand_back_refused_for_the_allowance_is_kept_to_wait_out_not_resend() -> None:
+def test_a_refused_release_of_a_lease_that_has_lapsed_no_longer_blocks(
+    mock_stub: MagicMock,
+) -> None:
+    _refuse_releases(mock_stub, "charge")
+
+    @step
+    def charge() -> str:
+        raise PaymentDeclined("no funds")
+
+    @step
+    def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            charge()
+        except PaymentDeclined:
+            # As if the lease's lifetime had passed since.
+            pending = get_context()._pending_hit
+            assert pending is not None
+            assert pending["unreleased"]["token"] == 456
+            pending["unreleased"]["lapses_at"] = time.monotonic() - 1.0
+        return notify()  # type: ignore[no-any-return]
+
+    assert wf() == "notified"
+    assert len(_releases_of(mock_stub, "charge")) == 2
+    assert _commits(mock_stub) == [(1, "charge", FAILED), (2, "notify", SUCCESS)]
+
+
+def test_the_last_record_behind_a_refused_release_is_dropped_without_waiting(
+    mock_stub: MagicMock, caplog: Any
+) -> None:
+    _refuse_releases(mock_stub, "charge")
+
+    @step
+    def charge() -> str:
+        raise PaymentDeclined("no funds")
+
+    @workflow(version="1.0.0")
+    def wf() -> str:
+        try:
+            charge()
+        except PaymentDeclined:
+            pass
+        return "done"
+
+    started = time.monotonic()
+    with caplog.at_level("WARNING", logger="cellaflow.context"):
+        assert wf() == "done"
+    assert time.monotonic() - started < 2.0
+    assert len(_releases_of(mock_stub, "charge")) == 2
+    assert "over its allowance for cellaflow.steps" in caplog.text
+    assert _commits(mock_stub) == []
+
+
+def test_a_lease_handed_back_and_refused_for_the_allowance_keeps_its_token() -> None:
     hb = LeaseHeartbeat(
         client=MagicMock(),
         agent_id="a",
@@ -1283,13 +1320,14 @@ def test_a_hand_back_refused_for_the_allowance_is_kept_to_wait_out_not_resend() 
         fencing_token=7,
         heartbeat_interval_ms=5000,
     )
-    for error, token in ((refusal(), 0), (mailbox_full(), 7)):
+    for error in (refusal(), over_allowance(), mailbox_full()):
         client = MagicMock()
         client.release_lease.side_effect = error
         ctx = WorkflowContext(client=client, session_id="s", workflow_version="1")
         held = _hand_back(ctx, "a", "k", 7, "LEASE_UNCONFIRMED", hb)
         assert held is not None
-        assert held["token"] == token
+        assert held["token"] == 7
+        assert _hand_back_later(ctx, "a", "k", 7, hb)["token"] == 7
 
 
 # --- The heartbeat --------------------------------------------------------------
@@ -1314,32 +1352,57 @@ def _wait_for(condition: Callable[[], bool], within_s: float = 3.0) -> None:
         time.sleep(0.01)
 
 
+async def _until(condition: Callable[[], bool], within_s: float = 3.0) -> None:
+    deadline = time.monotonic() + within_s
+    while not condition():
+        assert time.monotonic() < deadline, "the condition never held"
+        await asyncio.sleep(0.01)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("asynchronous", [False, True])
-async def test_a_renewal_refused_for_the_allowance_ends_the_lease_at_once(
+async def test_a_renewal_refused_for_the_allowance_leaves_the_lease_to_its_deadline(
     asynchronous: bool,
 ) -> None:
+    """Renewing stops at the refusal. The lease is not lost then: the engine
+    holds it until its deadline, which the heartbeat goes on watching, so the
+    loss is reported on time, once."""
     client = MagicMock()
     refused = refusal()
     client.renew_lease.side_effect = refused
-    lost: List[str] = []
-    hb = _heartbeat(client, lost)
+    lost_at: List[float] = []
+    started = time.monotonic()
+    hb = LeaseHeartbeat(
+        client=client,
+        agent_id="a",
+        idempotency_key="k",
+        fencing_token=7,
+        # Renews every 0.1 s; the lease lasts 0.8 s, so its deadline is 0.7 s
+        # from now, half an interval early.
+        heartbeat_interval_ms=200,
+        on_lease_lost=lambda: lost_at.append(time.monotonic() - started),
+    )
     if asynchronous:
         hb.start_async()
-        deadline = time.monotonic() + 3.0
-        while not hb.lost:
-            assert time.monotonic() < deadline
-            await asyncio.sleep(0.01)
-        await asyncio.sleep(0.35)
+        await _until(lambda: client.renew_lease.call_count == 1)
+        await asyncio.sleep(max(0.0, 0.4 - (time.monotonic() - started)))
+        assert not hb.lost and lost_at == []
+        await _until(lambda: bool(lost_at))
+        await asyncio.sleep(0.3)
+        assert hb._async_task is not None and hb._async_task.done()
         await hb.stop_async()
     else:
         hb.start_sync()
-        _wait_for(lambda: hb.lost)
-        time.sleep(0.35)
+        _wait_for(lambda: client.renew_lease.call_count == 1)
+        time.sleep(max(0.0, 0.4 - (time.monotonic() - started)))
+        assert not hb.lost and lost_at == []
+        _wait_for(lambda: bool(lost_at))
+        time.sleep(0.3)
+        assert hb._sync_thread is not None and not hb._sync_thread.is_alive()
         hb.stop_sync()
-    assert client.renew_lease.call_count == 1
-    assert lost == ["lost"]
     assert hb.allowance_refusal is refused
+    assert client.renew_lease.call_count == 1
+    assert len(lost_at) == 1 and 0.65 <= lost_at[0] < 1.0
     assert hb.lost_detail is not None
     assert "over its allowance for cellaflow.steps" in hb.lost_detail
 
@@ -1396,20 +1459,24 @@ def test_confirming_a_grant_stops_at_an_allowance_refusal() -> None:
     )
     hb.confirm_grant()
     assert client.order == ["renew:7"]
-    assert hb.lost
+    # Not lost: the call hands the lease back and fails with the refusal.
+    assert not hb.lost
     assert isinstance(hb.allowance_refusal, AllowanceExceeded)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("waited_s", [1.0, 10.0])
 async def test_a_late_grant_whose_renewal_is_refused_fails_the_call_with_it(
-    clocks: Clocks, asynchronous: bool
+    clocks: Clocks, asynchronous: bool, waited_s: float
 ) -> None:
     """The lease is handed back, and the call fails with the refusal rather
-    than asking for another lease the engine would refuse the same way."""
+    than asking for another lease the engine would refuse the same way. After
+    a 1 s wait the 3 s lease is not yet past its deadline, so only the refusal
+    stops the body; after 10 s the deadline has passed as well."""
     client = RefusesRenewals(
         [
-            Answer(acquired(7, 750), waited_s=10.0, expires_in_ms=2900),
+            Answer(acquired(7, 750), waited_s=waited_s, expires_in_ms=2900),
             Answer(acquired(8)),
         ],
         clocks,
@@ -1486,3 +1553,529 @@ def test_the_saver_raises_a_refused_position_read_after_a_conflict(
     with pytest.raises(AllowanceExceeded):
         _saver()._commit_with_retry("thread-1", "checkpoint:1", {})
     assert mock_stub.CommitStep.call_count == 1
+
+
+# --- A renewal refused while the lease is held ----------------------------------
+
+
+def _renewals_refused(mock_stub: MagicMock, interval_ms: int = 250) -> None:
+    """Grants every lease and refuses every renewal for the allowance."""
+    mock_stub.CheckIdempotencyCache.return_value = acquired(456, interval_ms)
+    mock_stub.RenewLease.side_effect = over_allowance()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_a_body_that_finishes_before_the_deadline_still_commits(
+    mock_stub: MagicMock, asynchronous: bool
+) -> None:
+    """A 1 s lease renewed every 0.15 s, its deadline 0.875 s in: the body
+    outlasts a renewal, which is refused, and still commits."""
+    _renewals_refused(mock_stub)
+
+    @step(lease_ttl_ms=1000)  # type: ignore[untyped-decorator]
+    async def charge() -> str:
+        await asyncio.sleep(0.4)
+        current_lease().check()
+        return "charged"
+
+    @workflow(version="1.0.0")
+    async def checkout_async() -> str:
+        return await charge()  # type: ignore[no-any-return]
+
+    @step(lease_ttl_ms=1000)  # type: ignore[untyped-decorator]
+    def charge_sync() -> str:
+        time.sleep(0.4)
+        current_lease().check()
+        return "charged"
+
+    @workflow(version="1.0.0")
+    def checkout() -> str:
+        return charge_sync()  # type: ignore[no-any-return]
+
+    assert await _run(checkout_async if asynchronous else checkout) == "charged"
+    name = "charge" if asynchronous else "charge_sync"
+    assert mock_stub.RenewLease.call_count == 1
+    assert _commits(mock_stub) == [(1, name, SUCCESS)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_a_body_that_outlives_the_deadline_fails_with_the_refusal(
+    mock_stub: MagicMock, asynchronous: bool
+) -> None:
+    """The lease holds until its deadline, and the body's check passes before
+    it. After it, the lease's loss is raised as the refusal behind it, which is
+    not recorded: the position goes back to the next call."""
+    _renewals_refused(mock_stub)
+    checks: List[str] = []
+    caught: List[BaseException] = []
+
+    @step(lease_ttl_ms=1000)  # type: ignore[untyped-decorator]
+    async def charge() -> str:
+        await asyncio.sleep(0.3)
+        lease = current_lease()
+        lease.check()
+        checks.append("held")
+        async with lease.cancel_on_loss():
+            await asyncio.sleep(5)
+        return "charged"  # pragma: no cover
+
+    @step
+    async def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    async def checkout_async() -> str:
+        try:
+            return await charge()  # type: ignore[no-any-return]
+        except AllowanceExceeded as e:
+            caught.append(e)
+            return await notify()  # type: ignore[no-any-return]
+
+    @step(lease_ttl_ms=1000)  # type: ignore[untyped-decorator]
+    def charge_sync() -> str:
+        time.sleep(0.3)
+        current_lease().check()
+        checks.append("held")
+        time.sleep(0.8)
+        current_lease().check()
+        return "charged"  # pragma: no cover
+
+    @step
+    def notify_sync() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    def checkout() -> str:
+        try:
+            return charge_sync()  # type: ignore[no-any-return]
+        except AllowanceExceeded as e:
+            caught.append(e)
+            return notify_sync()  # type: ignore[no-any-return]
+
+    started = time.monotonic()
+    assert await _run(checkout_async if asynchronous else checkout) == "notified"
+    # Cancelled at the deadline, not after the body's 5 s.
+    assert time.monotonic() - started < 3.0
+    assert checks == ["held"]
+    assert len(caught) == 1 and isinstance(caught[0], AllowanceExceeded)
+    assert caught[0].subject == "cellaflow.steps"
+    assert mock_stub.RenewLease.call_count == 1
+    next_step = "notify" if asynchronous else "notify_sync"
+    assert _commits(mock_stub) == [(1, next_step, SUCCESS)]
+    assert mock_stub.ReleaseLease.call_count == 1
+
+
+def test_an_execution_lease_whose_renewal_is_refused_is_lost_at_its_deadline(
+    mock_stub: MagicMock,
+) -> None:
+    """Its deadline is 0.9 s in (a 1 s TTL less half a 0.2 s interval)."""
+    _renewals_refused(mock_stub, interval_ms=200)
+    lost_at: List[float] = []
+    started = time.monotonic()
+    with execution_lease(
+        "task:1",
+        worker_id="w-1",
+        ttl_ms=1000,
+        heartbeat_interval_ms=200,
+        on_lease_lost=lambda: lost_at.append(time.monotonic() - started),
+    ) as lease:
+        _wait_for(lambda: mock_stub.RenewLease.call_count == 1)
+        # Still held: the engine keeps it until its deadline.
+        lease.check()
+        _wait_for(lambda: bool(lost_at))
+        with pytest.raises(LeaseLostError) as lost:
+            lease.check()
+    assert isinstance(lost.value.__cause__, AllowanceExceeded)
+    assert "over its allowance for cellaflow.steps" in str(lost.value)
+    assert 0.8 <= lost_at[0] < 1.5
+    assert mock_stub.RenewLease.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preempt", [False, True])
+async def test_an_async_execution_lease_refused_its_renewal_is_lost_at_its_deadline(
+    mock_stub: MagicMock, preempt: bool
+) -> None:
+    _renewals_refused(mock_stub, interval_ms=200)
+    lost_at: List[float] = []
+    raised: List[BaseException] = []
+    started = time.monotonic()
+
+    async def run() -> None:
+        try:
+            async with async_execution_lease(
+                "task:1",
+                worker_id="w-1",
+                ttl_ms=1000,
+                heartbeat_interval_ms=200,
+                on_lease_lost=lambda: lost_at.append(time.monotonic() - started),
+                preempt=preempt,
+            ) as lease:
+                await asyncio.sleep(0.4)
+                lease.check()
+                if preempt:
+                    await asyncio.sleep(5)
+                await _until(lambda: bool(lost_at))
+                lease.check()
+        except (asyncio.CancelledError, LeaseLostError) as e:
+            raised.append(e)
+
+    await asyncio.wait_for(asyncio.ensure_future(run()), timeout=4.0)
+    assert 0.8 <= lost_at[0] < 1.5
+    assert mock_stub.RenewLease.call_count == 1
+    if preempt:
+        # Cancelled when the deadline passed, not at the refusal.
+        assert isinstance(raised[0], asyncio.CancelledError)
+    else:
+        assert isinstance(raised[0], LeaseLostError)
+        assert isinstance(raised[0].__cause__, AllowanceExceeded)
+
+
+# --- A refused resend, a wrapped refusal, a raw one -----------------------------
+
+
+def test_a_resent_commit_refused_for_the_allowance_raises_the_refusal(
+    mock_stub: MagicMock,
+) -> None:
+    """The first commit gets no answer, and the resend is refused: the call
+    fails with the refusal, not the first attempt's error, and nothing is
+    recorded."""
+    answer = mock_stub.CommitStep.side_effect
+    failures: List[BaseException] = [over_allowance(), mailbox_full()]
+
+    def commit(req: Any, **kwargs: Any) -> Any:
+        if req.step_result.name == "charge_sync" and failures:
+            raise failures.pop()
+        return answer(req, **kwargs)
+
+    mock_stub.CommitStep.side_effect = commit
+    caught: List[BaseException] = []
+
+    @step
+    def charge_sync() -> str:
+        return "charged"
+
+    @step
+    def notify_sync() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    def checkout() -> str:
+        try:
+            return charge_sync()  # type: ignore[no-any-return]
+        except grpc.RpcError as e:
+            caught.append(e)
+            return notify_sync()  # type: ignore[no-any-return]
+
+    assert checkout() == "notified"
+    assert isinstance(caught[0], AllowanceExceeded)
+    assert _commits(mock_stub) == [
+        (1, "charge_sync", SUCCESS),
+        (1, "charge_sync", SUCCESS),
+        (1, "notify_sync", SUCCESS),
+    ]
+
+
+class OrderFailed(Exception):
+    pass
+
+
+def _wrapping(shape: str) -> BaseException:
+    """An error a step body makes from a refusal, in the given shape."""
+    if shape == "cause":
+        try:
+            raise refusal()
+        except AllowanceExceeded as e:
+            try:
+                raise OrderFailed("could not order") from e
+            except OrderFailed as wrapped:
+                return wrapped
+    if shape == "cause of a cause":
+        inner = OrderFailed("inner")
+        inner.__cause__ = refusal()
+        outer = OrderFailed("outer")
+        outer.__cause__ = inner
+        return outer
+    group: Any = getattr(builtins, "ExceptionGroup")
+    if shape == "group":
+        made: BaseException = group("several", [ValueError("x"), refusal()])
+        return made
+    nested = group("inner", [OrderFailed("x"), over_allowance()])
+    made = group("outer", [ValueError("y"), nested])
+    return made
+
+
+GROUPS = sys.version_info >= (3, 11)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "cause",
+        "cause of a cause",
+        pytest.param(
+            "group", marks=pytest.mark.skipif(not GROUPS, reason="needs 3.11")
+        ),
+        pytest.param(
+            "nested group of a raw refusal",
+            marks=pytest.mark.skipif(not GROUPS, reason="needs 3.11"),
+        ),
+    ],
+)
+def test_an_error_made_from_a_refusal_is_raised_as_it_was_but_not_recorded(
+    mock_stub: MagicMock, shape: str
+) -> None:
+    caught: List[BaseException] = []
+
+    @step
+    def charge() -> str:
+        raise _wrapping(shape)
+
+    @step
+    def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    def checkout() -> str:
+        try:
+            return charge()  # type: ignore[no-any-return]
+        except BaseException as e:
+            caught.append(e)
+            return notify()  # type: ignore[no-any-return]
+
+    assert checkout() == "notified"
+    # What the caller sees is the body's own error.
+    assert not isinstance(caught[0], AllowanceExceeded)
+    # Not recorded, and the position went back.
+    assert _commits(mock_stub) == [(1, "notify", SUCCESS)]
+
+
+def test_an_error_raised_while_handling_a_refusal_is_recorded(
+    mock_stub: MagicMock,
+) -> None:
+    """Only an explicit cause counts: an error raised in an `except` without
+    `from` is not made from the refusal."""
+
+    @step
+    def charge() -> str:
+        try:
+            raise refusal()
+        except AllowanceExceeded:
+            raise OrderFailed("something else went wrong")
+
+    @step
+    def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    def checkout() -> str:
+        try:
+            return charge()  # type: ignore[no-any-return]
+        except OrderFailed:
+            return notify()  # type: ignore[no-any-return]
+
+    assert checkout() == "notified"
+    assert _commits(mock_stub) == [(1, "charge", FAILED), (2, "notify", SUCCESS)]
+
+
+def _chain(links: int) -> BaseException:
+    """A refusal `links` explicit causes below the error raised."""
+    error: BaseException = refusal()
+    for i in range(links):
+        wrapper = OrderFailed(str(i))
+        wrapper.__cause__ = error
+        error = wrapper
+    return error
+
+
+def _nested(levels: int) -> BaseException:
+    """A refusal `levels` exception groups down."""
+    group: Any = getattr(builtins, "ExceptionGroup")
+    error: BaseException = refusal()
+    for _ in range(levels):
+        error = group("g", [error])
+    return error
+
+
+def test_a_refusal_eight_causes_down_is_found_and_nine_is_not() -> None:
+    """The bound the TypeScript SDK's `carriesAllowanceRefusal` uses."""
+    assert _carries_refusal(_chain(0))
+    assert _carries_refusal(_chain(8))
+    assert not _carries_refusal(_chain(9))
+
+
+@pytest.mark.skipif(not GROUPS, reason="needs 3.11")
+def test_a_refusal_eight_groups_down_is_found_and_nine_is_not() -> None:
+    assert _carries_refusal(_nested(8))
+    assert not _carries_refusal(_nested(9))
+    # Causes and groups count as one depth between them.
+    wrapper = OrderFailed("wrapper")
+    wrapper.__cause__ = _nested(7)
+    assert _carries_refusal(wrapper)
+    wrapper.__cause__ = _nested(8)
+    assert not _carries_refusal(wrapper)
+
+
+@pytest.mark.skipif(not GROUPS, reason="needs 3.11")
+def test_at_most_64_errors_are_looked_at() -> None:
+    group: Any = getattr(builtins, "ExceptionGroup")
+
+    def wide(before: int) -> BaseException:
+        made: BaseException = group(
+            "wide", [ValueError(str(i)) for i in range(before)] + [refusal()]
+        )
+        return made
+
+    # The group itself, 62 members, and the refusal: 64 errors.
+    assert _carries_refusal(wide(62))
+    assert not _carries_refusal(wide(63))
+    # A group's members beyond its 64th are not looked at, even when the
+    # errors before it are one error repeated, which counts once.
+    same = OrderFailed("the same")
+    assert _carries_refusal(group("many", [same] * 63 + [refusal()]))
+    assert not _carries_refusal(group("many", [same] * 64 + [refusal()]))
+
+
+def test_a_cycle_or_an_attribute_that_raises_ends_the_search() -> None:
+    a, b = OrderFailed("a"), OrderFailed("b")
+    a.__cause__, b.__cause__ = b, a
+    assert not _carries_refusal(a)
+
+    def unreadable(self: BaseException) -> BaseException:
+        raise RuntimeError("cannot read the cause")
+
+    # A class whose `__cause__` raises when read.
+    unreadable_cause = type(
+        "Unreadable", (Exception,), {"__cause__": property(unreadable)}
+    )
+    assert not _carries_refusal(unreadable_cause())
+    if GROUPS:
+        # Only what is behind it is hidden: the search goes on past it.
+        group: Any = getattr(builtins, "ExceptionGroup")
+        assert _carries_refusal(group("g", [unreadable_cause(), refusal()]))
+    context = OrderFailed("context only")
+    context.__context__ = refusal()
+    assert not _carries_refusal(context)
+    assert not _carries_refusal(mailbox_full())
+
+
+def test_a_raw_refusal_is_recognised_wherever_it_comes_from() -> None:
+    raw = over_allowance()
+    assert _is_allowance_refusal(raw)
+    assert _is_allowance_refusal(refusal())
+    assert not _is_allowance_refusal(mailbox_full())
+    assert not _is_allowance_refusal(ValueError("x"))
+    assert not _may_pass(raw)
+    assert not _unanswered(raw)
+    assert _may_pass(mailbox_full())
+
+
+class RawRefusals(WaitClient):
+    """A client of its own that raises the engine's error as it arrives,
+    without making it `AllowanceExceeded`."""
+
+    def renew_lease(self, **kw: Any) -> Any:  # type: ignore[override]
+        self.note(f"renew:{kw['fencing_token']}")
+        raise over_allowance()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_a_raw_refusal_from_another_client_is_final_too(
+    asynchronous: bool,
+) -> None:
+    client = RawRefusals([Answer(None, raises=over_allowance())])
+
+    def charge_card() -> str:
+        return "charged"  # pragma: no cover
+
+    async def charge_card_async() -> str:
+        return charge_card()  # pragma: no cover
+
+    with session(client).bind() as ctx:
+        with pytest.raises(grpc.RpcError) as raised:
+            if asynchronous:
+                await step(charge_card_async)()
+            else:
+                step(charge_card)()
+        assert not ctx.has_pending_failure()
+    assert _is_allowance_refusal(raised.value)
+    assert len(client.acquires) == 1
+
+
+def test_a_raw_refused_renewal_stops_the_heartbeat_with_the_refusal() -> None:
+    client = RawRefusals([])
+    hb = LeaseHeartbeat(
+        client=client,
+        agent_id="a",
+        idempotency_key="k",
+        fencing_token=7,
+        heartbeat_interval_ms=250,
+        lease_ttl_ms=10_000,
+    )
+    hb.confirm_grant()
+    assert client.order == ["renew:7"]
+    assert isinstance(hb.allowance_refusal, AllowanceExceeded)
+
+
+# --- resets_at, as the TypeScript SDK reads and prints it -----------------------
+
+
+@pytest.mark.parametrize(
+    "moment,printed",
+    [
+        (RESET, "2026-12-01T00:00:00Z"),
+        (RESET + timedelta(milliseconds=500), "2026-12-01T00:00:00.500Z"),
+        (RESET + timedelta(microseconds=123_456), "2026-12-01T00:00:00.123Z"),
+        (RESET + timedelta(microseconds=999), "2026-12-01T00:00:00Z"),
+        (datetime(100, 1, 1, tzinfo=timezone.utc), "0100-01-01T00:00:00Z"),
+        (
+            datetime(2026, 12, 1, 1, 0, tzinfo=timezone(timedelta(hours=1))),
+            "2026-12-01T00:00:00Z",
+        ),
+    ],
+)
+def test_the_reset_is_printed_as_the_typescript_sdk_prints_it(
+    moment: datetime, printed: str
+) -> None:
+    refused = AllowanceExceeded(subject="cellaflow.steps", resets_at=moment)
+    assert f"The allowance resets at {printed}." in str(refused)
+    assert _rfc3339(moment) == printed
+    # The datetime keeps its full precision.
+    assert refused.resets_at == moment
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("0099-12-31T23:59:59Z", None),
+        ("0001-01-01T00:00:00Z", None),
+        ("0100-01-01T00:00:00Z", datetime(100, 1, 1, tzinfo=timezone.utc)),
+        (
+            "0100-01-01T00:30:00+01:00",
+            datetime(99, 12, 31, 23, 30, tzinfo=timezone.utc),
+        ),
+    ],
+)
+def test_a_year_below_100_is_refused_as_typescript_refuses_it(
+    text: str, expected: Optional[datetime]
+) -> None:
+    refused = refused_with(
+        status(quota_failure("cellaflow.steps"), error_info(resets_at=text))
+    )
+    assert refused.resets_at == expected
+
+
+# --- The future's wrapper -------------------------------------------------------
+
+
+def test_the_future_wrapper_can_be_copied_and_made_without_a_call() -> None:
+    call = MagicMock()
+    call.code.return_value = grpc.StatusCode.OK
+    copied = copy.copy(_RequestFuture(call))
+    assert copied.code() == grpc.StatusCode.OK
+    bare = _RequestFuture.__new__(_RequestFuture)
+    assert getattr(bare, "code", None) is None
+    assert not hasattr(bare, "__setstate_custom__")

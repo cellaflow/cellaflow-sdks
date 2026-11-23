@@ -22,6 +22,8 @@ modules of `googleapis-common-protos` does not find them defined twice, and the
 package needs nothing beyond protobuf to read them.
 """
 
+import builtins
+import collections
 import functools
 import re
 from datetime import datetime, timedelta, timezone
@@ -151,6 +153,65 @@ def _refusal_from(error: BaseException) -> Optional[AllowanceExceeded]:
         return None
     refusal.__cause__ = error
     return refusal
+
+
+def _is_allowance_refusal(error: BaseException) -> bool:
+    """Whether `error` is the engine refusing a request because the org is over
+    its allowance: `AllowanceExceeded`, or the gRPC error it is made from, as a
+    client other than `CellaflowClient` raises it (a stub of your own, or a test
+    double). Every decision about a refusal asks this, so it holds however the
+    refusal arrived."""
+    return _refusal_from(error) is not None
+
+
+#: How many explicit causes, or levels of exception groups, `_carries_refusal`
+#: follows looking for a refusal.
+_MAX_REFUSAL_DEPTH = 8
+#: How many errors it looks at, at most, and at most how many members of any one
+#: group, so a wide group costs a bounded amount.
+_MAX_REFUSAL_ERRORS = 64
+
+#: Python 3.11's exception groups, or None before them.
+_BaseExceptionGroup: Any = getattr(builtins, "BaseExceptionGroup", None)
+
+
+def _carries_refusal(error: BaseException) -> bool:
+    """Whether `error` is an allowance refusal, or carries one: in its chain of
+    explicit causes (`raise MyError(...) from refusal`), up to
+    `_MAX_REFUSAL_DEPTH` links, or among the members of an exception group, at
+    any level within that depth. Searched breadth first, looking at no more
+    than `_MAX_REFUSAL_ERRORS` errors, with the same bounds as the TypeScript
+    SDK's `carriesAllowanceRefusal`.
+
+    Only `__cause__` is followed, not `__context__`: an exception merely raised
+    while a refusal was being handled is not made from it. A cycle ends the
+    search, and an attribute that raises hides what is behind it. Never
+    raises."""
+    seen: "set[int]" = set()
+    queue: "collections.deque[Tuple[Any, int]]" = collections.deque([(error, 0)])
+    try:
+        while queue and len(seen) < _MAX_REFUSAL_ERRORS:
+            value, depth = queue.popleft()
+            # Every error queued is reachable from `error`, so ids stay unique.
+            if not isinstance(value, BaseException) or id(value) in seen:
+                continue
+            seen.add(id(value))
+            if _is_allowance_refusal(value):
+                return True
+            if depth >= _MAX_REFUSAL_DEPTH:
+                continue
+            try:
+                queue.append((value.__cause__, depth + 1))
+                if _BaseExceptionGroup is not None and isinstance(
+                    value, _BaseExceptionGroup
+                ):
+                    for member in value.exceptions[:_MAX_REFUSAL_ERRORS]:
+                        queue.append((member, depth + 1))
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
 
 
 def _status_bytes(trailer: Tuple[Any, ...]) -> Optional[bytes]:
@@ -315,6 +376,10 @@ def _parse_rfc3339(text: str) -> Optional[datetime]:
     year, month, day, hour, minute, second, fraction, sign, off_h, off_m = (
         match.groups()
     )
+    if int(year) < 100:
+        # Refused, as the TypeScript SDK refuses it: JavaScript's dates read a
+        # year below 100 as 19xx.
+        return None
     offset = timedelta(0)
     if sign is not None:
         if int(off_h) > 23 or int(off_m) > 59:
@@ -339,6 +404,14 @@ def _parse_rfc3339(text: str) -> Optional[datetime]:
 
 
 def _rfc3339(moment: datetime) -> str:
-    """`moment` as RFC 3339 in UTC, the way the engine sends it."""
-    text = moment.astimezone(timezone.utc).isoformat()
-    return text[: -len("+00:00")] + "Z" if text.endswith("+00:00") else text
+    """`moment` in UTC as the TypeScript SDK prints it: `2026-12-01T00:00:00Z`,
+    with milliseconds (`.500Z`) unless it falls on a whole second. Finer
+    precision is left out of the message, as JavaScript's dates cannot hold it,
+    but `resets_at` keeps it."""
+    utc = moment.astimezone(timezone.utc)
+    millis = utc.microsecond // 1000
+    fraction = f".{millis:03d}" if millis else ""
+    return (
+        f"{utc.year:04d}-{utc.month:02d}-{utc.day:02d}T"
+        f"{utc.hour:02d}:{utc.minute:02d}:{utc.second:02d}{fraction}Z"
+    )

@@ -658,4 +658,9 @@ class _RequestFuture(grpc.Future):  # type: ignore[misc]
         self._call.add_done_callback(lambda _: fn(self))
 
     def __getattr__(self, name: str) -> Any:
+        # Only for what this class does not define. A copy or an unpickled one
+        # is made without `__init__`, so `_call` can be missing, and looking it
+        # up here would recurse; nor is a special method the call's to answer.
+        if name == "_call" or name.startswith("__"):
+            raise AttributeError(name)
         return getattr(self._call, name)

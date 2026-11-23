@@ -20,7 +20,7 @@ from typing import (
 
 import grpc
 
-from cellaflow.allowance import AllowanceExceeded
+from cellaflow.allowance import _carries_refusal, _is_allowance_refusal
 from cellaflow.client import CellaflowClient, _check_api_key_argument
 from cellaflow.context import (
     _may_pass,
@@ -417,7 +417,10 @@ def _release_after_failure(
     release or wait for the lapse: the lease still claims the step's position,
     so the engine would refuse the record there. When it lapses is counted from
     the moment the record is held, after the heartbeat has stopped, because a
-    renewal still in flight now can extend it.
+    renewal still in flight now can extend it. A release refused because the
+    org is over its allowance is kept the same way, token and all: the record
+    sends it again, which the engine accepts once the allowance is back, and
+    until then the record's write fails with the refusal rather than wait.
     """
     try:
         resp = ctx.client.release_lease(
@@ -429,7 +432,7 @@ def _release_after_failure(
             # step's event loop, for as long as TCP takes to give up.
             timeout=hb.rpc_timeout_sec,
         )
-    except Exception as exc:
+    except Exception:
         # The lease lapses on its own. Losing the release is not worth
         # replacing the error that caused it.
         logger.warning(
@@ -444,10 +447,7 @@ def _release_after_failure(
         return {
             "agent_id": agent_id,
             "key": ikey,
-            # Refused for the allowance: the record does not send it again, and
-            # waits for the lapse instead, as for a lease whose token it never
-            # knew.
-            "token": 0 if isinstance(exc, AllowanceExceeded) else fencing_token,
+            "token": fencing_token,
             "lapses_in_s": hb.rpc_timeout_sec + hb.lease_ttl_ms / 1000.0 + 1.0,
         }, None
     return None, bool(getattr(resp, "released", True))
@@ -484,13 +484,26 @@ def _note_failure(
     try:
         if isinstance(exc, DivergentStepError):
             return
-        if isinstance(exc, AllowanceExceeded):
+        if _carries_refusal(exc):
             # Says nothing about the step: the org is over its allowance, and
             # once it resets the step can run. Recorded, it would be raised
             # again at this position by every resume, even after that. So it
             # is not recorded, as a process exit is not, and the position is
             # given back: calling the step again after the reset takes it, and
             # a re-run runs the step.
+            #
+            # The same goes for an error the body made from a refusal (`raise
+            # OrderFailed(...) from refusal`) or a group holding one: its own
+            # message is the body's, but what failed was the allowance, and a
+            # resume that raised it again after the reset would take a branch
+            # the allowance no longer forces. The caller still sees the error
+            # as it was raised.
+            #
+            # A lease that an earlier, unanswered request may have been granted
+            # (`unreleased`) goes with it: nothing waits it out. If the
+            # allowance is back within about a TTL, the next call at this
+            # position can be refused with `DivergentStepError` until that
+            # lease lapses, as after a process exit.
             ctx.give_back_position(seq)
             return
         if isinstance(exc, asyncio.CancelledError) and is_async:
@@ -683,15 +696,13 @@ def _hand_back(
             # the connection is most likely bad.
             timeout=hb.rpc_timeout_sec if hb is not None else _HAND_BACK_TIMEOUT_S,
         )
-    except Exception as exc:
+    except Exception:
         logger.info("Could not hand back the lease on %s; it lapses on its own", ikey)
         if hb is None:
             return None
-        held = _held(agent_id, ikey, fencing_token, hb)
-        if isinstance(exc, AllowanceExceeded):
-            # Not sent again; see `_release_after_failure`.
-            held["token"] = 0
-        return held
+        # Token and all, a refusal for the allowance included; see
+        # `_release_after_failure`.
+        return _held(agent_id, ikey, fencing_token, hb)
     return None
 
 
@@ -896,7 +907,10 @@ def _lease_for_body(
     def probe() -> bool:
         return hb is not None and hb.past_deadline()
 
-    handle = LeaseHandle(fencing_token, probe=probe, key=ikey)
+    def refusal() -> Optional[BaseException]:
+        return hb.allowance_refusal if hb is not None else None
+
+    handle = LeaseHandle(fencing_token, probe=probe, key=ikey, refusal=refusal)
     call.handle = handle
     hb = LeaseHeartbeat(
         client=ctx.client,
@@ -1001,6 +1015,11 @@ def _commit(
             if _is_stale_lease(again) or _is_committed_elsewhere(again):
                 call.mark_taken_over()
                 raise _taken_over(name, result) from again
+            if _is_allowance_refusal(again):
+                # An answer, unlike the first attempt's error: the commit did
+                # not land, and the call fails with the refusal, which is not
+                # recorded.
+                raise
             raise exc from None
     except BaseException:
         call.committing = False
@@ -1369,7 +1388,11 @@ def step(
                             )
                             call.handle = None
                             raise
-                    if handle.is_lost:
+                    # A renewal refused for the allowance is refused again
+                    # until it is not, so the body would run under a lease it
+                    # cannot keep: the lease goes back as below, and the call
+                    # fails with the refusal instead of asking again.
+                    if handle.is_lost or hb.allowance_refusal is not None:
                         # Neither the renewal nor the request can show the
                         # lease is still held, so the body must not start under
                         # it: it would act on a lease this side has already
@@ -1467,7 +1490,8 @@ def step(
                     call.lost
                     and call.returned
                     and isinstance(e, Exception)
-                    and not isinstance(e, (LeaseLostError, AllowanceExceeded))
+                    and not isinstance(e, LeaseLostError)
+                    and not _is_allowance_refusal(e)
                 ):
                     if _resend_commit(
                         ctx,
@@ -1480,6 +1504,18 @@ def step(
                     ):
                         return call.result
                 call.apply_held_loss()
+                refused: Optional[BaseException] = (
+                    hb.allowance_refusal if hb is not None else None
+                )
+                if (
+                    refused is not None
+                    and isinstance(e, LeaseLostError)
+                    and e.__cause__ is refused
+                ):
+                    # This lease's own loss, at the deadline after the engine
+                    # refused its renewals for the allowance. The call fails
+                    # with the refusal, which says why and is not recorded.
+                    raise refused
                 raise e
             finally:
                 if handle is not None:
@@ -1673,7 +1709,11 @@ def step(
                     )
                     if late:
                         hb.confirm_grant()
-                    if handle.is_lost:
+                    # A renewal refused for the allowance is refused again
+                    # until it is not, so the body would run under a lease it
+                    # cannot keep: the lease goes back as below, and the call
+                    # fails with the refusal instead of asking again.
+                    if handle.is_lost or hb.allowance_refusal is not None:
                         # Neither the renewal nor the request can show the
                         # lease is still held, so the body must not start under
                         # it: it would act on a lease this side has already
@@ -1757,7 +1797,8 @@ def step(
                     call.lost
                     and call.returned
                     and isinstance(e, Exception)
-                    and not isinstance(e, (LeaseLostError, AllowanceExceeded))
+                    and not isinstance(e, LeaseLostError)
+                    and not _is_allowance_refusal(e)
                 ):
                     if _resend_commit(
                         ctx,
@@ -1770,6 +1811,18 @@ def step(
                     ):
                         return call.result
                 call.apply_held_loss()
+                refused: Optional[BaseException] = (
+                    hb.allowance_refusal if hb is not None else None
+                )
+                if (
+                    refused is not None
+                    and isinstance(e, LeaseLostError)
+                    and e.__cause__ is refused
+                ):
+                    # This lease's own loss, at the deadline after the engine
+                    # refused its renewals for the allowance. The call fails
+                    # with the refusal, which says why and is not recorded.
+                    raise refused
                 raise e
             finally:
                 if handle is not None:

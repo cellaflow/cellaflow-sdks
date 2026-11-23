@@ -18,27 +18,48 @@ All notable changes to the Cellaflow Python SDK.
   what, and when it resets, then the engine's own message. It is a `grpc.RpcError`, so
   `except grpc.RpcError` still catches it: `code()` is RESOURCE_EXHAUSTED, `details()` the
   engine's message and `trailing_metadata()` what the engine sent, and the engine's error is its
-  `__cause__`. It can be pickled. See "When the org is over its allowance" in the README.
+  `__cause__`. It can be pickled. A `resets_at` that is not an RFC 3339 time, or names a year
+  before 100, reads as `None`, and the message prints the reset to the millisecond, both as the
+  TypeScript SDK does. See "When the org is over its allowance" in the README.
+- **`CellaflowClient.check_idempotency_cache_future` returns a wrapper of the call.** It is still a
+  `grpc.Future`, and fails with `AllowanceExceeded` where the call failed with an allowance
+  refusal; everything else is passed through to the call (`code()`, `details()`, `cancel()`, and
+  done callbacks, which receive the wrapper).
 
 ### Behaviour changes
 
-- **An allowance refusal is never sent again.** Every RESOURCE_EXHAUSTED counted as an error that
-  may pass, so an over-allowance `@tool` or `@step` call was asked for twice more and then failed
-  with the engine's error, kept as a lease that might have been granted, and the failure recorded
-  as a workflow returned was retried for up to 45 s. Now the call fails at once, with nothing kept
-  to wait out, and nothing in the SDK resends a request the engine refused this way: not a lease,
-  a commit, a renewal, a release, a history read, or a record of the SDK's own. A renewal refused
-  this way ends the lease as a refused renewal does (`check()` fails, `on_lease_lost` runs, and an
-  `async_execution_lease` caller is cancelled), and a call whose lease was refused its first
-  renewal hands it back and fails with the refusal rather than asking for another. A plain
-  RESOURCE_EXHAUSTED, such as a session's full mailbox, is retried as before.
+- **An allowance refusal is not retried.** Every RESOURCE_EXHAUSTED counted as an error that may
+  pass, so an over-allowance `@tool` or `@step` call was asked for twice more and then failed with
+  the engine's error, kept as a lease that might have been granted, and the failure recorded as a
+  workflow returned was retried for up to 45 s. Now the call fails at once, with nothing kept to
+  wait out, and no lease request, commit, renewal or history read the engine refused this way is
+  sent again; nothing loops or sleeps on the refusal. A commit that got no answer and whose resend
+  is refused fails with the refusal, not with the first attempt's error. A refusal raised by a
+  client other than `CellaflowClient` (a stub of your own, or a test double, raising the engine's
+  error as it arrives) is recognised the same way. A plain RESOURCE_EXHAUSTED, such as a session's
+  full mailbox, is retried as before.
+- **A refused renewal stops the renewals, not the lease.** The engine still holds the lease until
+  its deadline, so a body that finishes in time commits as usual. At the deadline the lease is lost
+  as usual: `on_lease_lost` runs, an `async_execution_lease` caller is cancelled, and `check()` or
+  `cancel_on_loss()` raise `LeaseLostError` saying the org is over its allowance, with the
+  `AllowanceExceeded` as its `__cause__`. A `@tool` or `@step` whose body meets that loss fails with
+  the `AllowanceExceeded` itself. A call whose lease the engine granted after a wait, and refused
+  the renewal that confirms it, hands the lease back and fails with the refusal without running its
+  body, rather than asking for another lease.
+- **A refused release is kept, and sent again later.** A step's lease the engine would not release
+  for the allowance is kept with its token, as one whose release went unanswered is. The next call
+  or failure record sends the release again before writing the record: while the allowance is
+  still exceeded that call fails with the refusal at once, rather than wait for the lease to lapse,
+  and once it is back the release goes through. A lease that has lapsed by then is not sent again.
 - **A step stopped by an allowance refusal is not recorded as failed**, even when the workflow
   catches the refusal, so a resume runs the step again rather than raising the refusal after the
-  allowance has reset. Its position is given back, so the next call takes it. A cache hit's result
-  or a caught failure waiting to be recorded when the next step starts is kept but not retried:
-  that step raises the refusal, and the first call after the reset writes the record. One recorded
-  as a workflow returns is dropped at once with a warning naming the allowance, and a re-run runs
-  that step again.
+  allowance has reset. Its position is given back, so the next call takes it. The same holds for a
+  step whose body raised an error made from a refusal (`raise OrderFailed(...) from refusal`, up to
+  eight causes deep) or an exception group holding one: the caller still gets that error as it was
+  raised, but nothing is recorded. A cache hit's result or a caught failure waiting to be recorded
+  when the next step starts is kept but not retried: that step raises the refusal, and the first
+  call after the reset writes the record. One recorded as a workflow returns is dropped at once
+  with a warning naming the allowance, and a re-run runs that step again.
 - **`CellaflowSaver` raises a session start the engine refuses for the allowance**, where it logged
   any refused start and went on to the commit.
 

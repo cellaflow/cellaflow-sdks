@@ -4,7 +4,7 @@ import threading
 import logging
 import time
 from typing import Callable, List, Optional, Any, Tuple
-from cellaflow.allowance import AllowanceExceeded
+from cellaflow.allowance import AllowanceExceeded, _refusal_from
 from cellaflow.client import CellaflowClient
 
 logger = logging.getLogger(__name__)
@@ -161,7 +161,8 @@ class LeaseHeartbeat:
         # Why it was lost, the first time.
         self.lost_detail: Optional[str] = None
         # The engine's refusal of a renewal because the org is over its
-        # allowance, if that is how it was lost. See `confirm_grant`.
+        # allowance, if it refused one. Renewing stops there, and the loss is
+        # reported at the deadline. See `_refused_for_allowance`.
         self.allowance_refusal: Optional[AllowanceExceeded] = None
         self._lost_lock = threading.Lock()
         # Set once the heartbeat is told to stop: the lease is then being let
@@ -235,10 +236,18 @@ class LeaseHeartbeat:
         mono, wall = self._deadline
         if time.monotonic() < mono and time.time() < wall:
             return False
-        self._notify_lost(
-            "no renewal was confirmed in time: the deadline counted from the "
-            "last one sent has passed"
-        )
+        refusal = self.allowance_refusal
+        if refusal is not None:
+            self._notify_lost(
+                f"no renewal was confirmed in time, because the engine refused "
+                f"them: the org is over its allowance for {refusal.subject}. The "
+                f"lease may already belong to another worker"
+            )
+        else:
+            self._notify_lost(
+                "no renewal was confirmed in time: the deadline counted from the "
+                "last one sent has passed"
+            )
         return True
 
     def _notify_lost(self, detail: str) -> None:
@@ -260,12 +269,32 @@ class LeaseHeartbeat:
             logger.error("on_lease_lost callback raised an error: %s", e)
 
     def _refused_for_allowance(self, refusal: AllowanceExceeded) -> None:
-        """Ends the lease on a renewal refused because the org is over its
-        allowance, as on any refused renewal. Not an error that may pass:
-        renewing again before the allowance resets gets the same answer, and
-        the lease lapses in the meantime."""
+        """Stops renewing after a renewal refused because the org is over its
+        allowance: an answer, which the engine gives every renewal until the
+        allowance is back, so renewing again only gets it again.
+
+        The lease is not lost yet. The engine holds it until its deadline, so a
+        body that finishes before then still commits. The heartbeat goes on
+        watching that deadline and reports the loss when it passes, so
+        `on_lease_lost` and preemption come on time, and `check()` then raises
+        `LeaseLostError` with this refusal as its cause."""
         self.allowance_refusal = refusal
-        self._notify_lost(f"the engine refused to renew it: {refusal}")
+        logger.warning(
+            "Lease %s is not renewed any more: %s It lasts until its deadline.",
+            self.idempotency_key,
+            refusal,
+        )
+
+    def _wait_s(self) -> float:
+        """How long the heartbeat waits before its next turn: a renewal
+        interval, or, once renewals are refused for the allowance, until the
+        lease's deadline, at most an interval so a suspended host that wakes
+        past it is noticed."""
+        if self.allowance_refusal is None:
+            return self.interval_sec
+        mono, wall = self._deadline
+        left = min(mono - time.monotonic(), wall - time.time())
+        return max(0.01, min(self.interval_sec, left))
 
     def _ttl_exhausted(self) -> bool:
         """True once the lease can no longer be assumed held.
@@ -290,10 +319,10 @@ class LeaseHeartbeat:
         few, backing off, while the lease, counted from when the grant arrived,
         could still be live. If none is confirmed, the deadline counted from the
         request still bounds the lease from below, since the grant came after
-        it. A refusal declares the lease lost, and so does an allowance
-        refusal, which is kept in `allowance_refusal` for the call to fail
-        with: every renewal would get the same answer until the allowance
-        resets.
+        it. A refusal declares the lease lost. An allowance refusal is kept in
+        `allowance_refusal` instead and ends the tries: every renewal would get
+        the same answer until the allowance is back, so the call does not start
+        its body under a lease it cannot keep, and fails with the refusal.
         """
         window_end = time.monotonic() + self.lease_ttl_ms / 1000.0 - self.margin_sec
         for attempt in range(3):
@@ -309,10 +338,11 @@ class LeaseHeartbeat:
                     extend_ms=self.extend_ms,
                     timeout=self.rpc_timeout_sec,
                 )
-            except AllowanceExceeded as e:
-                self._refused_for_allowance(e)
-                return
             except Exception as e:
+                refusal = _refusal_from(e)
+                if refusal is not None:
+                    self._refused_for_allowance(refusal)
+                    return
                 logger.info(
                     "Lease %s: renewal after the grant failed: %s",
                     self.idempotency_key,
@@ -367,12 +397,19 @@ class LeaseHeartbeat:
                 )
 
     def _sync_loop(self) -> None:
-        while not self._stop_event_sync.wait(timeout=self.interval_sec):
+        while not self._stop_event_sync.wait(timeout=self._wait_s()):
+            if self.allowance_refusal is not None:
+                # Renewals are refused: only the deadline is watched, and the
+                # loss reported when it passes.
+                if self.past_deadline():
+                    break
+                continue
             # A holder resumed past its deadline reports the loss before asking,
             # and renews anyway: the engine may still hold the lease, and work
             # that went ahead without checking keeps it for as long as the
             # engine agrees, so its result can still be recorded. Renewing
-            # stops when the engine refuses a renewal, or on stop.
+            # stops when the engine refuses a renewal, or refuses one for the
+            # allowance, or on stop.
             self.past_deadline()
             sent = (time.monotonic(), time.time())
             try:
@@ -390,10 +427,11 @@ class LeaseHeartbeat:
                 self._set_deadline(
                     sent, self._renewal_duration(sent[1], resp.new_expires_at_ms)
                 )
-            except AllowanceExceeded as e:
-                self._refused_for_allowance(e)
-                break
             except Exception as e:
+                refusal = _refusal_from(e)
+                if refusal is not None:
+                    self._refused_for_allowance(refusal)
+                    continue
                 logger.error("Lease renewal error for %s: %s", self.idempotency_key, e)
                 if self._ttl_exhausted():
                     self._notify_lost(
@@ -467,11 +505,16 @@ class LeaseHeartbeat:
         while True:
             try:
                 await asyncio.wait_for(
-                    self._stop_event_async.wait(), timeout=self.interval_sec
+                    self._stop_event_async.wait(), timeout=self._wait_s()
                 )
                 # Stop event was set — clean shutdown.
                 break
             except asyncio.TimeoutError:
+                if self.allowance_refusal is not None:
+                    # Only the deadline is watched; see `_sync_loop`.
+                    if self.past_deadline():
+                        break
+                    continue
                 # Interval elapsed: do heartbeat. A holder resumed past its
                 # deadline reports the loss before asking, and renews anyway;
                 # see `_sync_loop`.
@@ -496,10 +539,11 @@ class LeaseHeartbeat:
                     )
                 except asyncio.CancelledError:
                     raise
-                except AllowanceExceeded as e:
-                    self._refused_for_allowance(e)
-                    break
                 except Exception as e:
+                    refusal = _refusal_from(e)
+                    if refusal is not None:
+                        self._refused_for_allowance(refusal)
+                        continue
                     logger.error(
                         "Lease renewal error for %s: %s", self.idempotency_key, e
                     )

@@ -10,7 +10,7 @@ import time
 
 import grpc
 
-from cellaflow.allowance import AllowanceExceeded
+from cellaflow.allowance import _is_allowance_refusal, _refusal_from
 from cellaflow.client import CellaflowClient
 from cellaflow.history import GRAPH_PAGE, latest_session_sequence
 from cellaflow.failures import (
@@ -105,7 +105,7 @@ def _may_pass(exc: BaseException) -> bool:
     is no lost grant to wait out, and asking again gains nothing. Every retry
     decision goes through here, so none sends it again.
     """
-    if isinstance(exc, AllowanceExceeded):
+    if _is_allowance_refusal(exc):
         return False
     return isinstance(exc, grpc.RpcError) and exc.code() in _RETRYABLE_CODES
 
@@ -826,8 +826,9 @@ class WorkflowContext:
                     # naming the allowance: asking again for the rest of the
                     # time would only hold up the return for the same answer.
                     if code is None or not _may_pass(exc):
+                        said = _refusal_from(exc) or exc
                         self._drop_final_record(
-                            pending, f"{type(exc).__name__}: {exc}"
+                            pending, f"{type(said).__name__}: {said}"
                         )
                         return
                     # It may have landed despite the error (a deadline that
@@ -902,7 +903,7 @@ class WorkflowContext:
                 raise
             except Exception as exc:
                 code = exc.code() if isinstance(exc, grpc.RpcError) else None
-                if _may_pass(exc) or isinstance(exc, AllowanceExceeded):
+                if _may_pass(exc) or _is_allowance_refusal(exc):
                     # Kept, so the step that hit this is retried with it. If the
                     # write did land, sending it again finds its completed entry.
                     # An allowance refusal is kept too, but not retried: the step
@@ -997,11 +998,18 @@ class WorkflowContext:
                 )
                 pending["unreleased"] = None
             except Exception as exc:
-                if isinstance(exc, AllowanceExceeded):
-                    # Refused, so not sent again. The lease still claims the
-                    # position until it lapses, which the record waits out, as
-                    # for a lease whose token it never knew.
-                    pending["unreleased"] = dict(unreleased, token=0)
+                if _is_allowance_refusal(exc):
+                    if time.monotonic() < unreleased["lapses_at"]:
+                        # Refused for the allowance. The lease still claims the
+                        # position, so the record would be refused too, and
+                        # waiting for the lapse would hold up the call for as
+                        # long as a TTL. The refusal goes to the caller now,
+                        # with the record and the lease's token kept: the next
+                        # call or record sends the release again, which the
+                        # engine accepts once the allowance is back.
+                        raise
+                    # Lapsed by now: nothing is left to free, or to wait for.
+                    pending["unreleased"] = None
                 elif not _may_pass(exc):
                     # Already released or lapsed: nothing is left to free.
                     pending["unreleased"] = None
