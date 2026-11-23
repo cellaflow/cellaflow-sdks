@@ -114,7 +114,9 @@ class _HistoryKnown:
     """`WorkflowContext.history_known`: what it was last set to, while no
     position is vacated. Setting it to false keeps it false; a vacated position
     only holds it false until it is claimed again or stepped through, as the
-    TypeScript SDK's `historyKnown` does."""
+    TypeScript SDK's `historyKnown` does. So anything that finds it false and
+    drops a record for that reason sets it false itself, or recording would
+    resume over the position the dropped record leaves empty."""
 
     def __get__(self, ctx: Any, owner: Any = None) -> bool:
         if ctx is None:
@@ -157,7 +159,7 @@ class WorkflowContext:
     #
     # Also false while a position is vacated, and true again once every such
     # position is claimed or stepped through, unless something else set it
-    # false: set to false, it stays false. See `give_back_position`.
+    # false: set to false, it stays false. See `give_back_refused_position`.
     history_known: _HistoryKnown = _HistoryKnown()
     # Whether `sequence` is where the session is. False for a resumed
     # `durable_tools` session, which does not replay from the start: its first
@@ -585,8 +587,14 @@ class WorkflowContext:
         failure held above that empty position would be written out of order,
         and the step after it would claim a position the engine then refuses
         after its side effect ran.
+
+        A failure not held because recording waits on a vacated position stops
+        recording for good, as any failure not held does: otherwise recording
+        would resume once the counter steps through the vacated positions, over
+        the empty position this failure leaves.
         """
         if not self.history_known:
+            self.history_known = False
             return False
         if self._in_flight == 1 and self.sequence == sequence:
             return True
@@ -780,10 +788,25 @@ class WorkflowContext:
                 return
 
     def give_back_position(self, sequence: int) -> None:
-        """Returns the position of a step that claimed it and recorded nothing
-        there: one a process exit interrupted, or one an allowance refusal
-        stopped. If the code carries on, its next step takes this position
-        rather than landing one past an empty one.
+        """Returns the position of a step a process exit interrupted.
+
+        A `KeyboardInterrupt` or `SystemExit` is not something a workflow carries
+        on past, so it is not recorded. If the code does carry on anyway, its next
+        step takes this position rather than landing one past an empty one. Only
+        while no later position was claimed meanwhile; if the step did commit
+        before the interruption reached it, the next step's lease at that position
+        is refused before its body runs.
+        """
+        with self._lock:
+            if self._in_flight == 1 and self.sequence == sequence:
+                self.sequence = sequence - 1
+
+    def give_back_refused_position(self, sequence: int) -> None:
+        """Returns the position of a step an allowance refusal stopped, which
+        records nothing there, so the next step takes it rather than landing
+        one past an empty one. Only for refusals: a process exit gives its
+        position back as `give_back_position` does. The TypeScript SDK's
+        `giveBackRefusedPosition`, rule for rule.
 
         Only the top position can be given back, but that one can be even with
         lower calls still in flight (a step that called this one): no later
@@ -794,11 +817,8 @@ class WorkflowContext:
         while any position is vacated the run records nothing, as for a failure
         it cannot hold: a later step would land beyond an empty position. Once
         every vacated position is claimed again or stepped through, recording
-        resumes, unless something else stopped it. As the TypeScript SDK's
-        `giveBackPosition` does.
-
-        If the step did commit before the interruption reached it, the next
-        step's lease at that position is refused before its body runs.
+        resumes, unless something else stopped it meanwhile (a failure that
+        could not be held, say, which stops it for good).
         """
         with self._lock:
             if self.sequence != sequence:
@@ -819,9 +839,9 @@ class WorkflowContext:
             self.history_known = False
 
     def mark_history_unknown(self) -> None:
-        """Stops recording into this session, without giving a position back:
-        a step whose commit got no answer may have landed there, so the run no
-        longer knows what the session holds."""
+        """Stops recording into this session for good: a step's commit may
+        have landed at the position it gave back, so the run no longer knows
+        what the session holds."""
         with self._lock:
             self.history_known = False
 

@@ -243,10 +243,11 @@ class LeaseHeartbeat:
             return False
         refusal = self.allowance_refusal
         if refusal is not None:
+            what = f" for {refusal.subject}" if refusal.subject else ""
             self._notify_lost(
                 f"no renewal was confirmed in time, because the engine refused "
-                f"them: the org is over its allowance for {refusal.subject}. The "
-                f"lease may already belong to another worker",
+                f"them: the org is over its allowance{what}. The lease may "
+                f"already belong to another worker",
                 refusal,
             )
         else:

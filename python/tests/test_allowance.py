@@ -1737,22 +1737,60 @@ async def test_an_async_execution_lease_refused_its_renewal_is_lost_at_its_deadl
 # --- A refused resend, a wrapped refusal, a raw one -----------------------------
 
 
-def test_a_resent_commit_refused_for_the_allowance_raises_the_refusal(
-    mock_stub: MagicMock,
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "release", ["released", "not released", "refused", "unanswered"]
+)
+async def test_a_resent_commit_refused_for_the_allowance_raises_the_refusal(
+    mock_stub: MagicMock, release: str, asynchronous: bool
 ) -> None:
     """The first commit gets no answer, and the resend is refused: the call
-    fails with the refusal, not the first attempt's error, and nothing is
-    recorded."""
+    fails with the refusal, not the first attempt's error, nothing is recorded,
+    and the position is given back. Released, the lease was still the call's,
+    so the first commit did not land, and the run goes on recording. Not
+    released, or the release refused or unanswered, it may have landed: the run stops
+    recording, and the next call at the position is refused its lease before
+    its body runs if it did."""
+    name = "charge" if asynchronous else "charge_sync"
     answer = mock_stub.CommitStep.side_effect
     failures: List[BaseException] = [over_allowance(), mailbox_full()]
 
     def commit(req: Any, **kwargs: Any) -> Any:
-        if req.step_result.name == "charge_sync" and failures:
+        if req.step_result.name == name and failures:
             raise failures.pop()
         return answer(req, **kwargs)
 
     mock_stub.CommitStep.side_effect = commit
+    if release == "not released":
+        mock_stub.ReleaseLease.return_value = idempotency_pb2.ReleaseLeaseResponse(
+            released=False
+        )
+    elif release == "refused":
+        mock_stub.ReleaseLease.side_effect = over_allowance()
+    elif release == "unanswered":
+        mock_stub.ReleaseLease.side_effect = EngineError(
+            grpc.StatusCode.UNAVAILABLE, "unavailable"
+        )
     caught: List[BaseException] = []
+    known: List[bool] = []
+
+    @step
+    async def charge() -> str:
+        return "charged"
+
+    @step
+    async def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    async def checkout_async() -> str:
+        try:
+            return await charge()  # type: ignore[no-any-return]
+        except grpc.RpcError as e:
+            caught.append(e)
+            known.append(get_context().history_known)
+            return await notify()  # type: ignore[no-any-return]
 
     @step
     def charge_sync() -> str:
@@ -1761,8 +1799,6 @@ def test_a_resent_commit_refused_for_the_allowance_raises_the_refusal(
     @step
     def notify_sync() -> str:
         return "notified"
-
-    known: List[bool] = []
 
     @workflow(version="1.0.0")
     def checkout() -> str:
@@ -1773,15 +1809,14 @@ def test_a_resent_commit_refused_for_the_allowance_raises_the_refusal(
             known.append(get_context().history_known)
             return notify_sync()  # type: ignore[no-any-return]
 
-    assert checkout() == "notified"
+    assert await _run(checkout_async if asynchronous else checkout) == "notified"
     assert isinstance(caught[0], AllowanceExceeded)
-    # The first commit may have landed, so its position is kept, and the run
-    # stops recording into the session.
-    assert known == [False]
+    assert known == [release == "released"]
+    next_step = "notify" if asynchronous else "notify_sync"
     assert _commits(mock_stub) == [
-        (1, "charge_sync", SUCCESS),
-        (1, "charge_sync", SUCCESS),
-        (2, "notify_sync", SUCCESS),
+        (1, name, SUCCESS),
+        (1, name, SUCCESS),
+        (1, next_step, SUCCESS),
     ]
 
 
@@ -2265,39 +2300,41 @@ async def test_a_call_refused_below_one_that_commits_leaves_its_position_empty(
     assert not ctx.history_known
 
 
-def test_a_vacated_position_is_cleared_when_a_call_claims_it() -> None:
-    ctx = WorkflowContext(
+def _fresh_context() -> WorkflowContext:
+    return WorkflowContext(
         client=MagicMock(), session_id="s", workflow_version="1", history_known=True
     )
-    ctx.sequence, ctx._in_flight = 3, 3
-    ctx.give_back_position(2)
-    assert ctx._vacated == {2} and ctx.sequence == 3
+
+
+def test_a_vacated_position_is_cleared_when_a_call_claims_it() -> None:
+    """Through the public methods only, as the TypeScript test does: the
+    engine's report moves the counter back below a call still in flight, so
+    that call, refused, vacates a position above the counter, which the next
+    claim then fills, and recording resumes."""
+    ctx = _fresh_context()
+    assert (ctx.begin_call(), ctx.begin_call()) == (1, 2)
+    ctx.record_engine_sequence(0)
+    assert ctx.begin_call() == 1
+    ctx.give_back_refused_position(2)
+    ctx.end_call()
     assert not ctx.history_known
-    # A call claiming 2 again, after the counter moved back to 1 (as a cache
-    # hit's report can move it), fills it.
-    ctx.sequence = 1
-    assert ctx._try_claim() == (2, 0.0)
-    assert ctx._vacated == set()
+    assert ctx.begin_call() == 2
     assert ctx.history_known
 
 
 def test_adopting_the_engines_position_drops_vacated_ones_for_good() -> None:
-    ctx = WorkflowContext(
-        client=MagicMock(), session_id="s", workflow_version="1", history_known=True
-    )
-    ctx.sequence, ctx._in_flight = 3, 3
-    ctx.give_back_position(1)
+    ctx = _fresh_context()
+    assert [ctx.begin_call() for _ in range(3)] == [1, 2, 3]
+    ctx.give_back_refused_position(2)
+    ctx.end_call()
     ctx.record_engine_sequence(5)
-    ctx.reconcile_sequence()
-    assert ctx.sequence == 5 and not ctx._vacated
+    assert ctx.begin_call() == 6
     assert not ctx.history_known
-    # Without a vacated position, adopting keeps the history known.
-    ctx2 = WorkflowContext(
-        client=MagicMock(), session_id="s", workflow_version="1", history_known=True
-    )
-    ctx2.record_engine_sequence(5)
-    ctx2.reconcile_sequence()
-    assert ctx2.sequence == 5 and ctx2.history_known
+    # Nothing vacated: adopting the engine's position keeps the history known.
+    other = _fresh_context()
+    other.record_engine_sequence(5)
+    assert other.begin_call() == 6
+    assert other.history_known
 
 
 # --- A refused resend after a commit with no answer -----------------------------
@@ -2311,7 +2348,7 @@ async def test_a_resend_refused_after_the_lease_was_said_to_be_gone_raises_it(
     """Commit unanswered, resent and unanswered again, the release answered as
     no longer the call's, and the resend that decides it refused for the
     allowance: the caller gets the refusal. The first commit may have landed,
-    so nothing is recorded, the position is kept, and the run stops recording
+    so nothing is recorded, the position is given back, and the run stops recording
     into the session."""
     name = "charge" if asynchronous else "charge_sync"
     answer = mock_stub.CommitStep.side_effect
@@ -2373,18 +2410,18 @@ async def test_a_resend_refused_after_the_lease_was_said_to_be_gone_raises_it(
     commits = _commits(mock_stub)
     assert commits[:3] == [(1, name, SUCCESS)] * 3
     assert all(status != FAILED for _, _, status in commits)
-    assert commits[-1][0] == 2
+    assert commits[-1][0] == 1
     assert mock_stub.ReleaseLease.call_count == 1
 
 
-def test_a_resend_refused_after_the_release_is_refused_keeps_the_position(
+def test_a_resend_refused_after_the_release_is_refused_stops_recording(
     mock_stub: MagicMock,
 ) -> None:
     """The first commit was answered (refused for another reason), but the
     engine would not release the lease: the commit may have landed and
     completed the key all the same, which is what the resend is sent to find
-    out. It is refused for the allowance, so the position is kept, as in the
-    TypeScript SDK, and the run stops recording."""
+    out. It is refused for the allowance, so the position is given back and
+    the run stops recording, as in the TypeScript SDK."""
     answer = mock_stub.CommitStep.side_effect
     failures: List[BaseException] = [
         over_allowance(),
@@ -2423,7 +2460,7 @@ def test_a_resend_refused_after_the_release_is_refused_keeps_the_position(
     assert checkout() == "notified"
     assert isinstance(caught[0], AllowanceExceeded)
     assert known == [False]
-    assert _commits(mock_stub)[-1] == (2, "notify_sync", SUCCESS)
+    assert _commits(mock_stub)[-1] == (1, "notify_sync", SUCCESS)
 
 
 # --- The refusal is the loss's cause only when it is the reason -----------------
@@ -2706,3 +2743,189 @@ def test_the_real_future_is_a_grpc_call(engine: Tuple[str, Engine]) -> None:
     assert remaining is None or remaining >= 0
     assert request.add_callback(lambda: None) is False
     client.close()
+
+
+# --- Recording never resumes over a dropped failure -----------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_failure_dropped_while_a_position_is_vacated_stops_recording_for_good(
+    mock_stub: MagicMock,
+) -> None:
+    """Calls claim 1, 2 and 3. Call 2 is refused below the top, so 2 is vacated
+    and recording waits. Call 1 then fails with an ordinary error, which is not
+    recorded. Call 3 is refused at the top, and the counter steps down through
+    2 to 1. Position 1 is empty, so recording must not resume."""
+    gates = {"second": threading.Event(), "third": threading.Event()}
+    granted = mock_stub.CheckIdempotencyCache.return_value
+
+    def check(req: Any, **kwargs: Any) -> Any:
+        for name, gate in gates.items():
+            if f":{name}:" in req.idempotency_key:
+                assert gate.wait(5.0)
+                raise over_allowance()
+        return granted
+
+    mock_stub.CheckIdempotencyCache.side_effect = check
+    go = asyncio.Event()
+    entered: List[str] = []
+
+    @step
+    async def first() -> str:
+        entered.append("first")
+        await go.wait()
+        raise PaymentDeclined("no funds")
+
+    @step
+    async def second() -> str:
+        return "second"  # pragma: no cover
+
+    @step
+    async def third() -> str:
+        return "third"  # pragma: no cover
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(),
+        session_id="s-dropped",
+        workflow_version="1.0.0",
+        history_known=True,
+    )
+    with ctx.bind():
+        one = asyncio.ensure_future(first())
+        await _until(lambda: entered == ["first"])
+        two = asyncio.ensure_future(second())
+        await _until(lambda: ctx.sequence == 2)
+        three = asyncio.ensure_future(third())
+        await _until(lambda: ctx.sequence == 3)
+        gates["second"].set()
+        with pytest.raises(AllowanceExceeded):
+            await two
+        assert ctx._vacated == {2}
+        go.set()
+        with pytest.raises(PaymentDeclined):
+            await one
+        assert not ctx.has_pending_failure()
+        gates["third"].set()
+        with pytest.raises(AllowanceExceeded):
+            await three
+        assert ctx.sequence == 1 and not ctx._vacated
+        assert not ctx.history_known
+    assert _commits(mock_stub) == []
+
+
+# --- Everything but a refusal gives its position back as before -----------------
+
+
+def _context_with(sequence: int, in_flight: int) -> WorkflowContext:
+    ctx = WorkflowContext(
+        client=MagicMock(), session_id="s", workflow_version="1", history_known=True
+    )
+    ctx.sequence, ctx._in_flight = sequence, in_flight
+    return ctx
+
+
+def _note(ctx: WorkflowContext, seq: int, exc: BaseException) -> None:
+    cellaflow.decorators._note_failure(
+        ctx, seq, "charge", exc, None, "default", "k", 0.0, 0.0, is_async=False
+    )
+
+
+@pytest.mark.parametrize("exit_", [KeyboardInterrupt(), SystemExit(1)])
+def test_a_process_exit_gives_its_position_back_only_when_alone(
+    exit_: BaseException,
+) -> None:
+    """As before the allowance changes: at the top with a lower call in flight,
+    or below the top, the position is neither given back nor vacated, and
+    recording goes on."""
+    for sequence, in_flight, seq in ((2, 2, 2), (2, 2, 1)):
+        ctx = _context_with(sequence, in_flight)
+        _note(ctx, seq, exit_)
+        assert (ctx.sequence, ctx._vacated, ctx.history_known) == (2, set(), True)
+    alone = _context_with(2, 1)
+    _note(alone, 2, exit_)
+    assert alone.sequence == 1 and alone.history_known
+
+
+def test_a_takeover_below_the_top_is_handled_as_before() -> None:
+    """Not given back nor vacated: the failure cannot be held, so its position
+    stays empty and the run stops recording, as it always did."""
+    ctx = _context_with(2, 2)
+    taken = LeaseLostError("lost its lease to another worker", result="charged")
+    _note(ctx, 1, taken)
+    assert ctx.sequence == 2 and not ctx._vacated
+    assert not ctx.history_known and not ctx.has_pending_failure()
+
+
+def test_a_takeover_below_the_top_then_a_refusal_at_the_top() -> None:
+    """The takeover's position is not vacated, so the refusal's hand-back does
+    not step through it, and the history stays unknown."""
+    ctx = _fresh_context()
+    assert (ctx.begin_call(), ctx.begin_call()) == (1, 2)
+    _note(ctx, 1, LeaseLostError("lost its lease to another worker", result="r"))
+    ctx.end_call()
+    _note(ctx, 2, refusal())
+    ctx.end_call()
+    assert ctx.sequence == 1
+    assert not ctx.history_known
+
+
+@pytest.mark.parametrize("exit_", [KeyboardInterrupt(), SystemExit(1)])
+def test_a_process_exit_below_the_top_then_a_refusal_at_the_top(
+    exit_: BaseException,
+) -> None:
+    """A process exit below the top is handled as before: not given back, nor
+    vacated, so the refusal at the top does not step through its position."""
+    ctx = _fresh_context()
+    assert (ctx.begin_call(), ctx.begin_call()) == (1, 2)
+    _note(ctx, 1, exit_)
+    ctx.end_call()
+    _note(ctx, 2, refusal())
+    ctx.end_call()
+    assert ctx.sequence == 1
+
+
+# --- Smaller things -------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_async_execution_lease_lost_before_its_renewal_was_refused_is_plain(
+    mock_stub: MagicMock,
+) -> None:
+    refused = _stalled_then_refused(mock_stub, 200)
+    raised: List[LeaseLostError] = []
+    async with async_execution_lease(
+        "task:1",
+        worker_id="w-1",
+        ttl_ms=1000,
+        heartbeat_interval_ms=200,
+        preempt=False,
+    ) as lease:
+        await asyncio.sleep(0.95)
+        for _ in range(2):
+            try:
+                lease.check()
+            except LeaseLostError as e:
+                raised.append(e)
+            await _until(lambda: bool(refused))
+            await asyncio.sleep(0.05)
+    assert len(raised) == 2
+    for lost in raised:
+        assert lost.__cause__ is None
+        assert "allowance" not in str(lost)
+
+
+def test_a_loss_detail_leaves_out_an_empty_subject() -> None:
+    hb = LeaseHeartbeat(
+        client=MagicMock(),
+        agent_id="a",
+        idempotency_key="k",
+        fencing_token=7,
+        heartbeat_interval_ms=200,
+        acquired_sent_at=(time.monotonic() - 5.0, time.time() - 5.0),
+    )
+    hb.allowance_refusal = AllowanceExceeded()
+    assert hb.past_deadline()
+    assert hb.lost_detail == (
+        "no renewal was confirmed in time, because the engine refused them: the "
+        "org is over its allowance. The lease may already belong to another worker"
+    )

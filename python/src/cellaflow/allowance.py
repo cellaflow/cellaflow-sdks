@@ -50,8 +50,13 @@ class AllowanceExceeded(grpc.RpcError, grpc.Call):  # type: ignore[misc]
     Final: nothing in the SDK loops or waits on it, because the engine gives
     the same answer until the allowance resets. Only a refused release, and the
     lease on a record the SDK keeps pending, are sent again, once, by the next
-    call. A step that raises it is not recorded as failed, so calling the step
-    again once the allowance resets, or running the workflow again, runs it.
+    call. A step that raises it is not recorded as failed. Letting it end the
+    run, or calling the same step again once the allowance resets, keeps the
+    session resumable; a workflow that catches it and calls a different step
+    instead gives that step the refused one's position, and resuming the
+    session after the reset then fails with `ReplayDivergedError`, so start a
+    new session for that work. A refusal that came after a step's body ran
+    means calling the step again runs the body again.
 
     Still a `grpc.RpcError`, so code that catches those catches it too: `code()`
     is RESOURCE_EXHAUSTED, `details()` the engine's message, and

@@ -60,20 +60,28 @@ All notable changes to the Cellaflow Python SDK.
   still exceeded that call fails with the refusal at once, rather than wait for the lease to lapse,
   and once it is back the release goes through. A lease that has lapsed by then is not sent again.
 - **A step stopped by an allowance refusal is not recorded as failed**, even when the workflow
-  catches the refusal, so a resume runs the step again rather than raising the refusal after the
-  allowance has reset. The same holds for a step whose body raised an error made from a refusal
-  (`raise OrderFailed(...) from refusal`, up to eight causes deep) or an exception group holding
-  one: the caller still gets that error as it was raised, but nothing is recorded. As in the
-  TypeScript SDK, the step's position is given back when no later one has been claimed meanwhile,
-  even with lower calls still running (a step that called it, which the refusal then stops too),
-  so the next call takes it. A position below a later one is vacated instead: the counter steps
-  down through it when the later one is given back too, or a call claims it again, and while it
-  stays empty the run records nothing into the session. A step whose commit, sent again, is
-  refused this way keeps its position, in case the first commit landed, and the run stops
-  recording into the session. A cache hit's result or a caught failure waiting to be recorded when the next step
-  starts is kept but not retried: that step raises the refusal, and the first call after the reset
-  writes the record. One recorded as a workflow returns is dropped at once with a warning naming
-  the allowance, and a re-run runs that step again.
+  catches the refusal, so a resume does not raise the refusal again after the allowance has reset.
+  The same holds for a step whose body raised an error made from a refusal (`raise
+  OrderFailed(...) from refusal`, up to eight causes deep) or an exception group holding one: the
+  caller still gets that error as it was raised, but nothing is recorded. If the refusal came
+  after the body ran, when its result was to be recorded, calling the step again runs the body
+  again. A session stays resumable if the refusal ends the run, or the workflow calls the same step
+  again after the reset; one that goes on to a different step gives it the refused step's
+  position, and resuming it after the reset fails with `ReplayDivergedError`, so start a new
+  session for that work.
+- **Where the next step lands after a refusal.** As in the TypeScript SDK, the refused step's
+  position goes to the next call when no later one has been claimed meanwhile, even with lower
+  calls still running (a step that called it, which the refusal then stops too). A position below
+  a later one is vacated instead: the counter steps down through it when the later one is given
+  back too, or a call claims it again, and while it stays empty the run records nothing into the
+  session. A failure left unrecorded meanwhile stops recording for good. A step whose commit got
+  no answer, and whose resend was refused, gives its position back too, but unless the engine then
+  released the lease, which shows the commit did not land, the run also stops recording into the
+  session. Takeovers and process exits give their positions back as before. A cache hit's result
+  or a caught failure waiting to be recorded when the next step starts is kept but not retried:
+  that step raises the refusal, and the first call after the reset writes the record. One recorded
+  as a workflow returns is dropped at once with a warning naming the allowance, and a re-run runs
+  that step again.
 - **`CellaflowSaver` raises a session start the engine refuses for the allowance**, where it logged
   any refused start and went on to the commit.
 

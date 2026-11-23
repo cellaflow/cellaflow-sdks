@@ -486,10 +486,15 @@ def _note_failure(
     """
     try:
         if may_have_landed:
-            # Refused, but the step's commit may have landed at this position.
-            # Giving the position back could put the next step on top of it,
-            # and nothing is recorded in its name, so the run can no longer
-            # tell what the session holds, and stops recording into it.
+            # Refused, but the step's commit may have landed at this position:
+            # the engine would not say the lease was still this call's. The
+            # position is given back all the same, and the run stops recording
+            # into the session, since it can no longer tell what it holds. If
+            # the commit did land, the next call at this position is refused
+            # its lease before its body runs (or, with the same key, answered
+            # from the commit), where a call placed past it would be refused
+            # only at its commit, after its side effect.
+            ctx.give_back_refused_position(seq)
             ctx.mark_history_unknown()
             return
         if isinstance(exc, DivergentStepError):
@@ -499,9 +504,8 @@ def _note_failure(
             # once it resets the step can run. Recorded, it would be raised
             # again at this position by every resume, even after that. So it
             # is not recorded, as a process exit is not, and the position is
-            # given back if it is the top one (see `give_back_position`):
-            # calling the step again after the reset takes it, and a re-run
-            # runs the step.
+            # given back as `give_back_refused_position` says: calling the step
+            # again after the reset takes it, and a re-run runs the step.
             #
             # The same goes for an error the body made from a refusal (`raise
             # OrderFailed(...) from refusal`) or a group holding one: its own
@@ -515,7 +519,7 @@ def _note_failure(
             # allowance is back within about a TTL, the next call at this
             # position can be refused with `DivergentStepError` until that
             # lease lapses, as after a process exit.
-            ctx.give_back_position(seq)
+            ctx.give_back_refused_position(seq)
             return
         if isinstance(exc, asyncio.CancelledError) and is_async:
             ctx.defer_cancellation_record(
@@ -580,8 +584,9 @@ class _CallLease:
         self.lost = False
         self.returned = False
         # Set when the same commit sent again was refused because the org is
-        # over its allowance: the first may still have landed, so the call's
-        # position is not given back. See `_note_failure`.
+        # over its allowance: the first may still have landed. Cleared when the
+        # release shows the lease was still this call's, so it did not. See
+        # `_note_failure`.
         self.may_have_landed = False
         self.result: Any = None
         # The payload committed, taken once from the result.
@@ -1032,8 +1037,8 @@ def _commit(
                 raise _taken_over(name, result) from again
             if _is_allowance_refusal(again):
                 # That answer, not the first attempt's silence, is what the
-                # caller hears. The first attempt may still have landed, so its
-                # position is not given back.
+                # caller hears. The first attempt may still have landed, unless
+                # the release that follows shows otherwise.
                 call.may_have_landed = True
                 raise
             raise exc from None
@@ -1092,8 +1097,8 @@ def _resend_commit(
     except Exception as again:
         if _is_allowance_refusal(again):
             # What the caller hears. The lease would not be released, which
-            # can mean the first commit landed and completed the key, so its
-            # position is not given back, as in the TypeScript SDK.
+            # can mean the first commit landed and completed the key; see
+            # `_note_failure`.
             call.may_have_landed = True
             call.apply_held_loss()
             raise
@@ -1499,6 +1504,9 @@ def step(
                     unreleased, released = _release_after_failure(
                         ctx, agent_id, ikey, fencing_token, actual_tool_name, hb
                     )
+                    if released:
+                        # Still this call's lease, so no commit of it landed.
+                        call.may_have_landed = False
                     if released is False:
                         # For a body that returned, the commit may have landed
                         # and refused the release itself: the resend below
@@ -1807,6 +1815,9 @@ def step(
                     unreleased, released = _release_after_failure(
                         ctx, agent_id, ikey, fencing_token, actual_tool_name, hb
                     )
+                    if released:
+                        # Still this call's lease, so no commit of it landed.
+                        call.may_have_landed = False
                     if released is False:
                         # For a body that returned, the commit may have landed
                         # and refused the release itself: the resend below
