@@ -2,7 +2,7 @@
 
 All notable changes to the Cellaflow Python SDK.
 
-## Unreleased
+## 0.13.0
 
 ### Behaviour changes
 
