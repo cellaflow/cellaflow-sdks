@@ -108,7 +108,7 @@ class LeaseHolderInfo:
         it with. That is what the worker said it was, not an authenticated
         identity. ``None`` when the engine did not record one, or the worker
         sent an empty one.
-    holder_id:
+    engine_holder_id:
         The engine's id for this grant of the lease, kept through its renewals;
         a reclaim is a new grant with a new id. It identifies the grant, not
         the worker (that is ``worker_id``).
@@ -123,7 +123,7 @@ class LeaseHolderInfo:
     """
 
     worker_id: Optional[str]
-    holder_id: str
+    engine_holder_id: str
     acquired_at_ms: Optional[int]
     expires_at_ms: int
     hard_expires_at_ms: Optional[int]
@@ -134,7 +134,7 @@ class LeaseHolderInfo:
         # recorded" for a worker named "" or a lease granted at the epoch.
         return cls(
             worker_id=holder.agent_id or None,
-            holder_id=holder.holder_id,
+            engine_holder_id=holder.engine_holder_id,
             acquired_at_ms=holder.acquired_at_ms or None,
             expires_at_ms=holder.expires_at_ms,
             hard_expires_at_ms=holder.hard_expires_at_ms or None,

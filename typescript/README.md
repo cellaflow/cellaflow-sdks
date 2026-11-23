@@ -200,7 +200,7 @@ await executionLease("task:repo#42", { workerId: "worker-1", ttlMs: 30_000 }, as
 
 **A lock, not a record.** `executionLease` records no result, so the lease alone does not tell the next worker whether the work already happened; check the destination first, or use `tool()`, which leases and records the result. A key that is already committed throws `LeaseNotAcquired`.
 
-**Who holds it.** When the lease is refused because another worker holds it, `LeaseNotAcquired` carries `holder`: the `workerId` that worker acquired it with, the engine's id for that grant of the lease (`holderId`), when it was acquired, when the lease lapses unless renewed, and its ceiling (all times epoch milliseconds on the engine's clock). The `workerId` is what that worker said it was, not an authenticated identity. `holder` is absent for a key that is already committed, and with an engine too old to report it.
+**Who holds it.** When the lease is refused because another worker holds it, `LeaseNotAcquired` carries `holder`: the `workerId` that worker acquired it with, the engine's id for that grant of the lease (`engineHolderId`), when it was acquired, when the lease lapses unless renewed, and its ceiling (all times epoch milliseconds on the engine's clock). The `workerId` is what that worker said it was, not an authenticated identity. `holder` is absent for a key that is already committed, and with an engine too old to report it.
 
 ```typescript
 try {

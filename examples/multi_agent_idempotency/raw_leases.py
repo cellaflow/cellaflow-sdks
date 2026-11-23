@@ -90,7 +90,7 @@ def main() -> int:
         ):
             held_by = (
                 f"held by agent_id={rb.current_holder.agent_id!r} "
-                f"holder_id={rb.current_holder.holder_id}"
+                f"engine_holder_id={rb.current_holder.engine_holder_id}"
             )
         else:
             held_by = "holder not reported by this engine and SDK"

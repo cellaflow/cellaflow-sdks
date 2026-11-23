@@ -28,7 +28,7 @@ export interface LeaseHolderInfo {
    * reclaim is a new grant with a new id. It identifies the grant, not the
    * worker (that is `workerId`).
    */
-  readonly holderId: string;
+  readonly engineHolderId: string;
   /** When the lease was acquired, epoch ms on the engine's clock. Absent when not recorded. */
   readonly acquiredAtMs?: number;
   /**
@@ -81,7 +81,7 @@ function holderInfo(holder: LeaseHolder | undefined): LeaseHolderInfo | undefine
   if (!holder) return undefined;
   return Object.freeze({
     ...(holder.agentId ? { workerId: holder.agentId } : {}),
-    holderId: holder.holderId,
+    engineHolderId: holder.engineHolderId,
     ...(holder.acquiredAtMs ? { acquiredAtMs: Number(holder.acquiredAtMs) } : {}),
     expiresAtMs: Number(holder.expiresAtMs),
     ...(holder.hardExpiresAtMs ? { hardExpiresAtMs: Number(holder.hardExpiresAtMs) } : {}),

@@ -148,7 +148,7 @@ def test_refusal_names_the_worker_holding_the_lease() -> None:
         _in_progress(
             idempotency_pb2.LeaseHolder(
                 agent_id="agent-a",
-                holder_id="holder-1",
+                engine_holder_id="holder-1",
                 acquired_at_ms=1_763_800_000_000,
                 expires_at_ms=1_763_800_030_000,
                 hard_expires_at_ms=1_763_800_600_000,
@@ -157,7 +157,7 @@ def test_refusal_names_the_worker_holding_the_lease() -> None:
     )
     assert err.holder == LeaseHolderInfo(
         worker_id="agent-a",
-        holder_id="holder-1",
+        engine_holder_id="holder-1",
         acquired_at_ms=1_763_800_000_000,
         expires_at_ms=1_763_800_030_000,
         hard_expires_at_ms=1_763_800_600_000,
@@ -176,7 +176,7 @@ async def test_async_refusal_names_the_worker_holding_the_lease() -> None:
     mock_client = MagicMock()
     mock_client.check_idempotency_cache.return_value = _in_progress(
         idempotency_pb2.LeaseHolder(
-            agent_id="agent-a", holder_id="holder-1", expires_at_ms=2
+            agent_id="agent-a", engine_holder_id="holder-1", expires_at_ms=2
         )
     )
     with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
@@ -190,12 +190,12 @@ async def test_async_refusal_names_the_worker_holding_the_lease() -> None:
 def test_refusal_reports_what_was_not_recorded_as_none() -> None:
     err = _refusal(
         _in_progress(
-            idempotency_pb2.LeaseHolder(holder_id="holder-1", expires_at_ms=2)
+            idempotency_pb2.LeaseHolder(engine_holder_id="holder-1", expires_at_ms=2)
         )
     )
     assert err.holder == LeaseHolderInfo(
         worker_id=None,
-        holder_id="holder-1",
+        engine_holder_id="holder-1",
         acquired_at_ms=None,
         expires_at_ms=2,
         hard_expires_at_ms=None,
@@ -241,7 +241,7 @@ def test_a_double_carrying_a_real_holder_message_reports_it() -> None:
     double = MagicMock(status=idempotency_pb2.CACHE_STATUS_IN_PROGRESS)
     double.HasField.return_value = True
     double.current_holder = idempotency_pb2.LeaseHolder(
-        agent_id="agent-a", holder_id="holder-1", expires_at_ms=2
+        agent_id="agent-a", engine_holder_id="holder-1", expires_at_ms=2
     )
     holder = _refusal(double).holder
     assert holder is not None and holder.worker_id == "agent-a"
@@ -251,7 +251,7 @@ def test_completed_key_has_no_holder() -> None:
     # A holder in the answer too, so this fails if a HIT were read for one.
     resp = idempotency_pb2.CheckCacheResponse(status=idempotency_pb2.CACHE_STATUS_HIT)
     resp.current_holder.CopyFrom(
-        idempotency_pb2.LeaseHolder(agent_id="agent-a", holder_id="holder-1")
+        idempotency_pb2.LeaseHolder(agent_id="agent-a", engine_holder_id="holder-1")
     )
     err = _refusal(resp)
     assert "already completed" in str(err)
@@ -276,7 +276,7 @@ def test_task_lease_refusal_names_the_holder() -> None:
     mock_client = MagicMock()
     mock_client.check_idempotency_cache.return_value = _in_progress(
         idempotency_pb2.LeaseHolder(
-            agent_id="agent-a", holder_id="holder-1", expires_at_ms=2
+            agent_id="agent-a", engine_holder_id="holder-1", expires_at_ms=2
         )
     )
     with patch("cellaflow.execution.CellaflowClient", return_value=mock_client):
@@ -297,7 +297,7 @@ def test_a_recorded_refusal_replays_with_its_holder() -> None:
     behaves the same."""
     holder = LeaseHolderInfo(
         worker_id="agent-a",
-        holder_id="holder-1",
+        engine_holder_id="holder-1",
         acquired_at_ms=1,
         expires_at_ms=2,
         hard_expires_at_ms=None,
@@ -337,7 +337,7 @@ def test_a_refusal_recorded_by_this_version_still_replays() -> None:
     recorded["attrs"] = {
         "_holder": {
             "worker_id": "agent-a",
-            "holder_id": "holder-1",
+            "engine_holder_id": "holder-1",
             "acquired_at_ms": 1,
             "expires_at_ms": 2,
             "hard_expires_at_ms": None,
@@ -347,7 +347,7 @@ def test_a_refusal_recorded_by_this_version_still_replays() -> None:
     assert isinstance(replayed, LeaseNotAcquired)
     assert replayed.holder == LeaseHolderInfo(
         worker_id="agent-a",
-        holder_id="holder-1",
+        engine_holder_id="holder-1",
         acquired_at_ms=1,
         expires_at_ms=2,
         hard_expires_at_ms=None,
@@ -358,7 +358,7 @@ def test_holder_can_be_set_after_construction() -> None:
     err = LeaseNotAcquired("busy")
     holder = LeaseHolderInfo(
         worker_id="agent-a",
-        holder_id="holder-1",
+        engine_holder_id="holder-1",
         acquired_at_ms=None,
         expires_at_ms=2,
         hard_expires_at_ms=None,
@@ -373,7 +373,7 @@ def test_lease_not_acquired_pickles_with_its_holder() -> None:
     """A refusal raised in a worker process reaches the parent intact."""
     holder = LeaseHolderInfo(
         worker_id="agent-a",
-        holder_id="holder-1",
+        engine_holder_id="holder-1",
         acquired_at_ms=1,
         expires_at_ms=2,
         hard_expires_at_ms=None,

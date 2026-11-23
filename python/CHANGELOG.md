@@ -8,7 +8,7 @@ All notable changes to the Cellaflow Python SDK.
 
 - **`CheckCacheResponse.current_holder_id` is removed.** It was the engine's opaque id for the
   holder's grant of the lease, which `CellaflowClient.check_idempotency_cache` returned on
-  `IN_PROGRESS`. The same value is now `current_holder.holder_id`, and `current_holder.agent_id` is
+  `IN_PROGRESS`. The same value is now `current_holder.engine_holder_id`, and `current_holder.agent_id` is
   the worker that holds the lease. Code that read `current_holder_id` raises `AttributeError`, and
   `HasField("current_holder_id")` or `CheckCacheResponse(current_holder_id=...)`, in a test double
   for instance, raises `ValueError`.
@@ -24,7 +24,7 @@ All notable changes to the Cellaflow Python SDK.
 - **A refused lease says who holds it.** When `execution_lease`, `async_execution_lease` or
   `@task_lease` is refused because another worker holds the lease, `LeaseNotAcquired` carries
   `holder`, a `LeaseHolderInfo` (exported, a frozen dataclass): `worker_id`, the id that worker
-  acquired the lease with; `holder_id`, the engine's id for that grant of the lease;
+  acquired the lease with; `engine_holder_id`, the engine's id for that grant of the lease;
   `acquired_at_ms`; `expires_at_ms`, when the lease lapses unless renewed; and `hard_expires_at_ms`,
   its ceiling. Times are epoch milliseconds on the engine's clock. The `worker_id` is what that
   worker said it was, not an authenticated identity. `worker_id`, `acquired_at_ms` and

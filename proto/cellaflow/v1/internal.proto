@@ -16,7 +16,7 @@ message CacheRecord {
 // Represents an active lease held by a worker executing a tool.
 message LeaseRecord {
   uint64 fencing_token = 1;   // Global monotonic microsecond epoch timestamp
-  string holder_id = 2;       // The engine's id for this grant, reported as LeaseHolder.holder_id
+  string holder_id = 2;       // The engine's id for this grant, reported as LeaseHolder.engine_holder_id
   uint64 acquired_at_ms = 3;  // When the lease was acquired (epoch ms)
   uint64 expires_at_ms = 4;   // When the lease expires if not renewed (epoch ms)
 

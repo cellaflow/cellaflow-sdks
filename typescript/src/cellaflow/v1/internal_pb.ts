@@ -60,7 +60,7 @@ export type LeaseRecord = Message<"cellaflow.v1.internal.LeaseRecord"> & {
   fencingToken: bigint;
 
   /**
-   * The engine's id for this grant, reported as LeaseHolder.holder_id
+   * The engine's id for this grant, reported as LeaseHolder.engine_holder_id
    *
    * @generated from field: string holder_id = 2;
    */

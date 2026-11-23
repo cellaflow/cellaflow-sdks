@@ -8,7 +8,7 @@ All notable changes to the Cellaflow TypeScript SDK.
 
 - **`CheckCacheResponse.currentHolderId` is removed.** It was the engine's opaque id for the
   holder's grant of the lease, which `CellaflowClient.checkIdempotencyCache` returned on
-  `IN_PROGRESS`. The same value is now `currentHolder.holderId`, and `currentHolder.agentId` is the
+  `IN_PROGRESS`. The same value is now `currentHolder.engineHolderId`, and `currentHolder.agentId` is the
   worker that holds the lease. Code that read `currentHolderId` no longer compiles; in JavaScript it
   reads `undefined`.
 - **A refusal's message names the holder's `workerId`, not the engine's opaque id.** It reads
@@ -27,7 +27,7 @@ All notable changes to the Cellaflow TypeScript SDK.
 
 - **A refused lease says who holds it.** When `executionLease` (or `taskLease`) is refused because
   another worker holds the lease, `LeaseNotAcquired` carries `holder`, a `LeaseHolderInfo`
-  (exported): `workerId`, the id that worker acquired the lease with; `holderId`, the engine's id
+  (exported): `workerId`, the id that worker acquired the lease with; `engineHolderId`, the engine's id
   for that grant of the lease; `acquiredAtMs`; `expiresAtMs`, when the lease lapses unless renewed;
   and `hardExpiresAtMs`, its ceiling. Times are epoch milliseconds on the engine's clock. The
   `workerId` is what that worker said it was, not an authenticated identity. `workerId`,

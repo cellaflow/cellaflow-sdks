@@ -36,7 +36,7 @@ test("a refusal names the worker holding the lease", async () => {
   const err = await refusal(
     inProgress({
       agentId: "agent-a",
-      holderId: "holder-1",
+      engineHolderId: "holder-1",
       acquiredAtMs: 1_763_800_000_000n,
       expiresAtMs: 1_763_800_030_000n,
       hardExpiresAtMs: 1_763_800_600_000n,
@@ -45,7 +45,7 @@ test("a refusal names the worker holding the lease", async () => {
   assert.ok(err instanceof LeaseNotAcquired);
   assert.deepEqual(err.holder, {
     workerId: "agent-a",
-    holderId: "holder-1",
+    engineHolderId: "holder-1",
     acquiredAtMs: 1_763_800_000_000,
     expiresAtMs: 1_763_800_030_000,
     hardExpiresAtMs: 1_763_800_600_000,
@@ -55,7 +55,7 @@ test("a refusal names the worker holding the lease", async () => {
 
 test("the message names the worker holding the lease", async () => {
   const err = await refusal(
-    inProgress({ agentId: "agent-a", holderId: "holder-1", acquiredAtMs: 1n, expiresAtMs: 2n, hardExpiresAtMs: 0n }),
+    inProgress({ agentId: "agent-a", engineHolderId: "holder-1", acquiredAtMs: 1n, expiresAtMs: 2n, hardExpiresAtMs: 0n }),
   );
   assert.equal(
     err.message,
@@ -67,7 +67,7 @@ test("the message names the worker holding the lease", async () => {
 test("the message quotes the worker id, escapes what cannot be seen, and cuts it short", async () => {
   const workerId = "agent-\u202eevil-" + "x".repeat(100);
   const err = await refusal(
-    inProgress({ agentId: workerId, holderId: "holder-1", acquiredAtMs: 1n, expiresAtMs: 2n, hardExpiresAtMs: 0n }),
+    inProgress({ agentId: workerId, engineHolderId: "holder-1", acquiredAtMs: 1n, expiresAtMs: 2n, hardExpiresAtMs: 0n }),
   );
   const shown = `"agent-\\u{202e}evil-${"x".repeat(52)}..."`;  // 64 characters, then ...
   assert.ok(err.message.includes(`(held by ${shown})`), err.message);
@@ -78,9 +78,9 @@ test("the message quotes the worker id, escapes what cannot be seen, and cuts it
 
 test("what the engine did not record is absent, not empty or 0", async () => {
   const err = await refusal(
-    inProgress({ agentId: "", holderId: "holder-1", acquiredAtMs: 0n, expiresAtMs: 2n, hardExpiresAtMs: 0n }),
+    inProgress({ agentId: "", engineHolderId: "holder-1", acquiredAtMs: 0n, expiresAtMs: 2n, hardExpiresAtMs: 0n }),
   );
-  assert.deepEqual(err.holder, { holderId: "holder-1", expiresAtMs: 2 });
+  assert.deepEqual(err.holder, { engineHolderId: "holder-1", expiresAtMs: 2 });
   // No worker to name, so no "(held by ...)", and never the engine's opaque id.
   assert.match(err.message, /^Could not acquire execution lease 'task:4417'\. Another worker/);
   assert.equal("workerId" in err.holder, false);
@@ -100,7 +100,7 @@ test("a committed key has no holder", async () => {
   // A holder in the answer too, so this fails if a HIT were read for one.
   const err = await refusal({
     status: CacheStatus.HIT,
-    currentHolder: { agentId: "agent-a", holderId: "holder-1", acquiredAtMs: 1n, expiresAtMs: 2n, hardExpiresAtMs: 0n },
+    currentHolder: { agentId: "agent-a", engineHolderId: "holder-1", acquiredAtMs: 1n, expiresAtMs: 2n, hardExpiresAtMs: 0n },
   });
   assert.ok(err instanceof LeaseNotAcquired);
   assert.match(err.message, /already committed/);
@@ -110,7 +110,7 @@ test("a committed key has no holder", async () => {
 test("taskLease's refusal carries the holder too", async () => {
   const run = taskLease(async () => assert.fail("the body ran"), { workerId: "agent-b", key: (id) => `task:${id}` });
   const err = await withEngineAnswer(
-    inProgress({ agentId: "agent-a", holderId: "holder-1", acquiredAtMs: 1n, expiresAtMs: 2n, hardExpiresAtMs: 0n }),
+    inProgress({ agentId: "agent-a", engineHolderId: "holder-1", acquiredAtMs: 1n, expiresAtMs: 2n, hardExpiresAtMs: 0n }),
     () => run("4417").then(() => assert.fail("the lease was granted"), (e) => e),
   );
   assert.ok(err instanceof LeaseNotAcquired);

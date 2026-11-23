@@ -26,7 +26,7 @@ test("a refused worker learns who holds the lease", engine, async () => {
   const { holder } = refusal;
   assert.ok(holder, "the refusal names no holder");
   assert.equal(holder.workerId, first);
-  assert.ok(holder.holderId);
+  assert.ok(holder.engineHolderId);
   // Times are on the engine's clock, which need not be this one, so they are
   // checked against each other rather than against Date.now().
   assert.ok(holder.acquiredAtMs > 0, String(holder.acquiredAtMs));

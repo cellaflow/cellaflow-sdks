@@ -21,7 +21,7 @@ def test_a_refused_worker_learns_who_holds_the_lease(target: str) -> None:
     holder = excinfo.value.holder
     assert holder is not None
     assert holder.worker_id == first
-    assert holder.holder_id
+    assert holder.engine_holder_id
     # Times are on the engine's clock, which need not be this one, so they are
     # checked against each other rather than against time.time().
     assert holder.acquired_at_ms is not None
