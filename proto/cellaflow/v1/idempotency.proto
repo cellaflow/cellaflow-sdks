@@ -139,7 +139,8 @@ message CheckCacheResponse {
 message LeaseHolder {
   // The agent that acquired the lease, as it named itself in
   // CheckCacheRequest.agent_id. Not authenticated, and every caller refused the
-  // lease sees it. Empty for a lease recorded by an engine that did not store it.
+  // lease sees it. Empty if the agent sent none, or the lease was recorded by an
+  // engine that did not store it.
   string agent_id = 1;
   // The engine's id for this grant of the lease (LeaseRecord.engine_holder_id),
   // kept through its renewals; a reclaim is a new grant with a new id. It

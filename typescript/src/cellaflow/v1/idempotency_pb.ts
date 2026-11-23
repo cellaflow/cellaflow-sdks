@@ -192,7 +192,8 @@ export type LeaseHolder = Message<"cellaflow.v1.LeaseHolder"> & {
   /**
    * The agent that acquired the lease, as it named itself in
    * CheckCacheRequest.agent_id. Not authenticated, and every caller refused the
-   * lease sees it. Empty for a lease recorded by an engine that did not store it.
+   * lease sees it. Empty if the agent sent none, or the lease was recorded by an
+   * engine that did not store it.
    *
    * @generated from field: string agent_id = 1;
    */

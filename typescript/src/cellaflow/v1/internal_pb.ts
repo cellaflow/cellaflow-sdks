@@ -114,8 +114,8 @@ export type LeaseRecord = Message<"cellaflow.v1.internal.LeaseRecord"> & {
 
   /**
    * The agent that acquired the lease, as it named itself in
-   * CheckCacheRequest.agent_id, reported to callers refused the lease. Empty on
-   * a record written before this field existed.
+   * CheckCacheRequest.agent_id, reported to callers refused the lease. Empty if
+   * the agent sent none, or on a record written before this field existed.
    *
    * @generated from field: string agent_id = 8;
    */
