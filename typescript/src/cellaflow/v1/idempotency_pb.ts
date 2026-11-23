@@ -199,10 +199,10 @@ export type LeaseHolder = Message<"cellaflow.v1.LeaseHolder"> & {
   agentId: string;
 
   /**
-   * The engine's holder_id for this grant of the lease, kept through its
-   * renewals; a reclaim is a new grant with a new id. It identifies the grant,
-   * not the agent (that is agent_id), and tells apart two grants to the same
-   * agent_id.
+   * The engine's id for this grant of the lease (LeaseRecord.engine_holder_id),
+   * kept through its renewals; a reclaim is a new grant with a new id. It
+   * identifies the grant, not the agent (that is agent_id), and tells apart two
+   * grants to the same agent_id.
    *
    * @generated from field: string engine_holder_id = 2;
    */

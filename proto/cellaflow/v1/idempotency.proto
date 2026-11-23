@@ -141,10 +141,10 @@ message LeaseHolder {
   // CheckCacheRequest.agent_id. Not authenticated, and every caller refused the
   // lease sees it. Empty for a lease recorded by an engine that did not store it.
   string agent_id = 1;
-  // The engine's holder_id for this grant of the lease, kept through its
-  // renewals; a reclaim is a new grant with a new id. It identifies the grant,
-  // not the agent (that is agent_id), and tells apart two grants to the same
-  // agent_id.
+  // The engine's id for this grant of the lease (LeaseRecord.engine_holder_id),
+  // kept through its renewals; a reclaim is a new grant with a new id. It
+  // identifies the grant, not the agent (that is agent_id), and tells apart two
+  // grants to the same agent_id.
   string engine_holder_id = 2;
   uint64 acquired_at_ms = 3;     // Epoch ms, engine clock. 0 if not recorded
   uint64 expires_at_ms = 4;      // When the lease lapses unless renewed (epoch ms)

@@ -16,7 +16,9 @@ message CacheRecord {
 // Represents an active lease held by a worker executing a tool.
 message LeaseRecord {
   uint64 fencing_token = 1;   // Global monotonic microsecond epoch timestamp
-  string holder_id = 2;       // The engine's id for this grant, reported as LeaseHolder.engine_holder_id
+  // The engine's id for this grant, reported to refused callers as
+  // LeaseHolder.engine_holder_id.
+  string engine_holder_id = 2;
   uint64 acquired_at_ms = 3;  // When the lease was acquired (epoch ms)
   uint64 expires_at_ms = 4;   // When the lease expires if not renewed (epoch ms)
 
@@ -53,7 +55,9 @@ message LeaseRecord {
 message SequenceClaimRecord {
   string idempotency_key = 1; // Who owns the position
   uint64 fencing_token = 2;   // The lease that created this claim
-  string holder_id = 3;       // The owning lease's holder_id, for diagnostics
+  // The owning lease's engine_holder_id (the grant's id, not its agent_id), for
+  // diagnostics.
+  string engine_holder_id = 3;
   // Advisory: the lease's expiry when this claim was written. Renewal extends the
   // lease without rewriting the claim, so liveness is read from the owning lease
   // record. Kept for diagnostics and for the refusal message.
