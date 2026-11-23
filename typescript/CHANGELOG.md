@@ -2,7 +2,7 @@
 
 All notable changes to the Cellaflow TypeScript SDK.
 
-## Unreleased
+## 0.13.0
 
 ### Behaviour changes
 
@@ -20,6 +20,7 @@ All notable changes to the Cellaflow TypeScript SDK.
 ### Compatibility
 
 - Tested with engine 0.5.0: CI's integration tests run against `ghcr.io/cellaflow/cellaflow:0.5.0`.
+  CI also runs the tests on Node.js 18.14.1, the lowest version supported.
 - `holder` on `LeaseNotAcquired` needs engine 0.5.0 or later; with an older engine it is always
   absent, and everything else works as before. Engine 0.5.0 also refuses a `workerId` (or a tool's
   agent id) longer than 1024 bytes or containing control characters.
