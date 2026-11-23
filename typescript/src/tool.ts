@@ -199,6 +199,15 @@ export function tool<A extends unknown[], R>(
     try {
       return await runAt(ctx, seq, args, callCoordination, coordinationId, leaseTtlMs, known);
     } catch (err) {
+      if (known.mayHaveLanded) {
+        // The commit got no answer, and sent again was refused because the org
+        // is over its allowance, so it may have landed. Its position is not
+        // handed back, where the next call could land on the commit, and
+        // nothing is recorded in its name; the run can no longer tell what the
+        // session holds, so it stops recording.
+        ctx.historyKnown = false;
+        throw err;
+      }
       if (known.lost) {
         // The call's outcome belongs to the lease's new holder, so nothing is
         // recorded here in its name. The position goes back, so calling the
@@ -217,6 +226,13 @@ export function tool<A extends unknown[], R>(
         // with it as the cause, or an AggregateError holding it: the body
         // failed because of the refusal all the same. The caller still gets
         // the body's own error.
+        //
+        // The trade-off: with no failure record, nothing holds on to the
+        // call's own lease if it could not be released (`known.unreleased`),
+        // and no record waits for it to lapse. If the allowance is back
+        // within about a TTL, the next call at this position can be refused
+        // with DivergentStepError while that lease still claims it, as after
+        // a process that exited holding a lease.
         ctx.giveBackPosition(seq);
         throw err;
       }
@@ -290,7 +306,7 @@ export function tool<A extends unknown[], R>(
     // that very commit completed the key. That is not a loss: it is held back,
     // and applied only if the commit fails.
     let committing = false;
-    let lossDuringCommit: string | undefined;
+    let lossDuringCommit: { detail: string; cause?: unknown } | undefined;
     // Once the release is on its way, a renewal refused because of it is not a
     // loss either, and is dropped.
     let releasing = false;
@@ -431,7 +447,7 @@ export function tool<A extends unknown[], R>(
             !late && resp.leaseExpiresAtMs !== undefined ? Number(resp.leaseExpiresAtMs) : undefined,
           onLeaseLost: (detail, cause) => {
             if (releasing) return;
-            if (committing) lossDuringCommit = detail;
+            if (committing) lossDuringCommit = { detail, cause };
             else leaseHandle.markLost(detail, cause);
           },
         });
@@ -562,8 +578,12 @@ export function tool<A extends unknown[], R>(
         if (outcome?.takenOver) throw takenOver(result, outcome.error);
         // The same commit sent again was refused because the org is over its
         // allowance: that answer, not the first one's silence, is what the
-        // caller hears, and like any refusal it is not recorded.
-        if (outcome && isAllowanceRefusal(outcome.error)) throw outcome.error;
+        // caller hears. The first may still have landed, so its position is
+        // not handed back.
+        if (outcome && isAllowanceRefusal(outcome.error)) {
+          known.mayHaveLanded = true;
+          throw outcome.error;
+        }
         throw err;
       }
       return result;
@@ -573,7 +593,7 @@ export function tool<A extends unknown[], R>(
       // fails. Not before: a resend below can still show the commit landed,
       // which is what refused the renewal.
       const applyHeldLoss = () => {
-        if (lossDuringCommit !== undefined) handle?.markLost(lossDuringCommit);
+        if (lossDuringCommit !== undefined) handle?.markLost(lossDuringCommit.detail, lossDuringCommit.cause);
       };
       // Released whatever the body threw and whatever this side's clock says:
       // the engine releases only a lease that is still this call's, so its
@@ -602,9 +622,10 @@ export function tool<A extends unknown[], R>(
             };
           });
       }
-      // A commit refused because the org is over its allowance did not land,
-      // so a lease that would not be released is no longer this call's, and
-      // the same commit sent again would only be refused again.
+      // An allowance refusal here is the commit's own answer, so it did not
+      // land, or the answer to the same commit sent again after the first got
+      // none, which may have landed (see above). Either way the same commit
+      // sent once more would only be refused again.
       if (known.lost && returned && !(err instanceof LeaseLostError) && !isAllowanceRefusal(err)) {
         // The commit failed and the lease would not be released. Either the
         // commit landed and only its answer was lost, which completed the key
@@ -618,9 +639,13 @@ export function tool<A extends unknown[], R>(
         if (outcome.takenOver) throw takenOver(returned.result, outcome.error);
         // Unknown: the call is not treated as taken over, and fails as it
         // would have, unless the commit sent again was refused because the
-        // org is over its allowance, which is then what the caller hears.
+        // org is over its allowance, which is then what the caller hears. The
+        // first may still have landed, so its position is not handed back.
         known.lost = false;
-        if (isAllowanceRefusal(outcome.error)) err = outcome.error;
+        if (isAllowanceRefusal(outcome.error)) {
+          known.mayHaveLanded = true;
+          err = outcome.error;
+        }
       }
       if (known.lost) handle?.markLost("the engine would not release the lease: it is no longer this call's");
       applyHeldLoss();
@@ -654,6 +679,12 @@ interface Known {
   unreleased?: UnreleasedLease;
   /** Set when the call's lease was lost while its body ran. */
   lost?: boolean;
+  /**
+   * Set when the call's commit got no answer and the same commit sent again
+   * was refused over the allowance: the first may have landed, so the
+   * position is neither handed back nor recorded.
+   */
+  mayHaveLanded?: boolean;
 }
 
 /** `step` and `tool` are the same mechanism, kept distinct for readability. */

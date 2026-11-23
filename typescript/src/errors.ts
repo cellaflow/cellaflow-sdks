@@ -86,10 +86,18 @@ export type AllowanceLimit = "new_sessions_blocked" | "writes_blocked" | (string
  * UTC to the second, with milliseconds only when it has them.
  */
 function allowanceMessage(subject: string, resetsAt: Date | undefined, engineMessage: string): string {
-  let text = `The Cellaflow org is over its allowance for ${subject}, so the engine refused this call.`;
+  let text = `The Cellaflow org is over its allowance${forSubject(subject)}, so the engine refused this call.`;
   if (resetsAt) text += ` The allowance resets at ${resetsAt.toISOString().replace(".000Z", "Z")}.`;
   if (engineMessage) text += ` The engine said: ${engineMessage}`;
   return text;
+}
+
+/**
+ * ` for <subject>`, or nothing when the subject is empty: the words both SDKs
+ * use to say what the org is over its allowance of.
+ */
+export function forSubject(subject: string): string {
+  return subject ? ` for ${subject}` : "";
 }
 
 /** A QuotaFailure subject with this prefix is what makes a refusal an allowance refusal. */
@@ -146,7 +154,9 @@ export function allowanceRefusal(err: unknown): AllowanceExceededError | undefin
  * details. Every decision that treats the refusal as final asks this.
  */
 export function isAllowanceRefusal(err: unknown): boolean {
-  return err instanceof AllowanceExceededError || allowanceRefusal(err) !== undefined;
+  // Through allowanceRefusal, whose class check is inside its try: even
+  // `instanceof` can throw, on a Proxy, and this never does.
+  return allowanceRefusal(err) !== undefined;
 }
 
 /** How many `cause` links, or levels of AggregateError, are followed looking for a refusal. */
@@ -172,15 +182,15 @@ export function carriesAllowanceRefusal(err: unknown): boolean {
     const [value, depth] = queue.shift()!;
     if (typeof value !== "object" || value === null || seen.has(value)) continue;
     seen.add(value);
-    if (isAllowanceRefusal(value)) return true;
-    if (depth >= MAX_REFUSAL_DEPTH) continue;
     try {
+      if (isAllowanceRefusal(value)) return true;
+      if (depth >= MAX_REFUSAL_DEPTH) continue;
       if ("cause" in value) queue.push([(value as { cause?: unknown }).cause, depth + 1]);
       if (value instanceof AggregateError && Array.isArray(value.errors)) {
         for (const member of value.errors.slice(0, MAX_REFUSAL_ERRORS)) queue.push([member, depth + 1]);
       }
     } catch {
-      // A getter that throws hides what is behind it.
+      // A getter or a Proxy trap that throws hides what is behind it.
     }
   }
   return false;

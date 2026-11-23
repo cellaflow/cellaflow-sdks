@@ -141,8 +141,27 @@ export class WorkflowContext {
    * replaying by position. Only while it holds can a cache hit be recorded in
    * this session without risking a second record of a step the session already
    * holds. See {@link deferHitRecord}.
+   *
+   * Also false while a position a call handed back below the top is empty, and
+   * true again once every such position is claimed, unless something else made
+   * it false. See {@link giveBackPosition}. Set to false, it stays false.
    */
-  historyKnown: boolean;
+  get historyKnown(): boolean {
+    return this.accounted && this.vacated.size === 0;
+  }
+
+  set historyKnown(known: boolean) {
+    this.accounted = known;
+  }
+
+  /** {@link historyKnown}, apart from vacated positions. */
+  private accounted: boolean;
+
+  /**
+   * Positions below the top that calls handed back empty, not yet claimed
+   * again. See {@link giveBackPosition}.
+   */
+  private readonly vacated = new Set<number>();
 
   private pendingHit?: PendingHit;
 
@@ -177,7 +196,7 @@ export class WorkflowContext {
     this.leaseTtlMs = checkLeaseTtlMs(init.leaseTtlMs, "WorkflowContext", "leaseTtlMs");
     // Opt-in: a context built for a session whose history it never read must not
     // record into it.
-    this.historyKnown = init.historyKnown ?? false;
+    this.accounted = init.historyKnown ?? false;
     this.positionKnown = init.positionKnown ?? true;
   }
 
@@ -286,6 +305,7 @@ export class WorkflowContext {
    */
   claimPosition(): number {
     this.sequence += 1;
+    this.vacated.delete(this.sequence);
     this.inFlight += 1;
     return this.sequence;
   }
@@ -296,21 +316,49 @@ export class WorkflowContext {
   }
 
   /**
-   * Hands back the position a call claimed and left unwritten, so the next call
+   * Hands back the position a call claimed and left unwritten, so a later call
    * claims it instead of landing one past an empty one. For a call another
-   * worker took over: its outcome belongs to that worker, so nothing is recorded
-   * there in its name, and calling the tool again finds that worker's result.
-   * Only while no later position was claimed meanwhile: the call then holds the
-   * top position, so handing it back defers no write, even with lower calls
-   * still in flight. Otherwise the position stays empty and the run stops
-   * recording, for the reason a failure record does.
+   * worker took over, whose outcome belongs to that worker, and for one refused
+   * because the org is over its allowance: nothing is recorded there in its
+   * name.
+   *
+   * The rule, the same in the Python SDK:
+   *
+   * - A call at the top (no later position claimed since) hands its position
+   *   back: the counter steps down one, then on down through every position
+   *   directly below that is vacated, so the next calls claim those, lowest
+   *   first. Handing back the top defers no write, even with lower calls still
+   *   in flight.
+   * - A call below the top cannot hand its position back, since a later one is
+   *   claimed above it. The position is vacated instead: it stays empty, and
+   *   the run stops recording while any position is vacated, for the reason a
+   *   failure record does.
+   * - A vacated position is no longer vacated once the counter steps down
+   *   through it or a call claims it. If the run adopts the engine's position
+   *   instead of its own count, every vacated position is dropped and the run
+   *   stops recording for good.
+   * - Recording resumes once no position is vacated, unless something else
+   *   stopped it.
    */
   giveBackPosition(sequence: number): void {
-    if (this.sequence === sequence) {
-      this.sequence = sequence - 1;
+    if (this.sequence !== sequence) {
+      this.vacated.add(sequence);
       return;
     }
-    this.historyKnown = false;
+    this.sequence = sequence - 1;
+    while (this.vacated.delete(this.sequence)) this.sequence -= 1;
+  }
+
+  /**
+   * Moves the counter to the position the engine reported. Positions vacated
+   * below the old count are dropped unclaimed, so the run stops recording.
+   */
+  private adoptPosition(position: number): void {
+    this.sequence = position;
+    if (this.vacated.size > 0) {
+      this.vacated.clear();
+      this.historyKnown = false;
+    }
   }
 
   /**
@@ -384,7 +432,7 @@ export class WorkflowContext {
       return;
     }
     if (this.reportedSequence !== undefined) {
-      this.sequence = this.reportedSequence;
+      this.adoptPosition(this.reportedSequence);
       this.reportedSequence = undefined;
     }
   }
@@ -430,7 +478,7 @@ export class WorkflowContext {
       // and continues from the session's real position.
       if (this.pendingHit === pending) this.pendingHit = undefined;
       this.historyKnown = false;
-      this.sequence = position;
+      this.adoptPosition(position);
       const reason = isFailedPrecondition(err)
         ? "another writer committed or claimed it first"
         : hasStatusCode(err)

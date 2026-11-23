@@ -1,6 +1,6 @@
 import type { CellaflowClient } from "./client.js";
 import { RenewFailureReason } from "./cellaflow/v1/idempotency_pb.js";
-import { type AllowanceExceededError, allowanceRefusal } from "./errors.js";
+import { type AllowanceExceededError, allowanceRefusal, forSubject } from "./errors.js";
 
 /** Why the engine refused to renew, in words a caller can act on. */
 function renewFailureDetail(reason: RenewFailureReason | undefined): string {
@@ -285,9 +285,11 @@ export class LeaseHeartbeat {
     if (this.stopped) return false;
     if (performance.now() >= this.deadline || Date.now() >= this.wallDeadline) {
       this.notifyLost(
+        // Word for word as in the Python SDK.
         this.allowanceRefusal
-          ? "no renewal was confirmed in time, because the engine refused them: the org is over its " +
-              `allowance for ${this.allowanceRefusal.subject}. The lease may already belong to another worker`
+          ? "the engine refused to renew it because the Cellaflow org is over its allowance" +
+              `${forSubject(this.allowanceRefusal.subject)}, and its deadline passed. The lease may ` +
+              "already belong to another worker."
           : `no renewal was confirmed in time: the lease may already belong to another worker`,
         false,
         this.allowanceRefusal,

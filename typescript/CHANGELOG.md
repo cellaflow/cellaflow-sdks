@@ -15,18 +15,30 @@ All notable changes to the Cellaflow TypeScript SDK.
   `RESOURCE_EXHAUSTED` without those details is asked again as before. A refusal that did not come
   through this copy's client, such as a raw `ConnectError` with those details or one raised by
   another copy of the SDK, is treated as final too.
-- **A refused tool call is not recorded as the tool's failure**, and the next call takes its
-  position. That holds when the refusal comes from a call the body made, and when the body raises
-  its own error with the refusal in its `cause` chain (up to 8 links) or an `AggregateError`
-  holding it, at any depth within that bound; the caller still gets the body's own error. A commit
-  that got no answer and was refused over the allowance when sent again raises the refusal, not
-  the first commit's error.
+- **A refused tool call is not recorded as the tool's failure.** That holds when the refusal comes
+  from a call the body made, and when the body raises its own error with the refusal in its `cause`
+  chain (up to 8 links) or an `AggregateError` holding it, at any depth within that bound and
+  looking at no more than 64 errors in all and 64 members of any one group; the caller still gets
+  the body's own error. A value that cannot even be inspected, such as a Proxy that throws, is not
+  a refusal, and checking it never throws.
+- **A refused call hands its position back when it is the top one**, so the next call takes it.
+  One below a later call leaves its position empty and stops the session's recording, as before,
+  but the position is remembered: when the calls above it hand theirs back too, the counter steps
+  down through every such position, the next calls take them, and recording resumes. The same
+  applies to a call another worker took over. Adopting the engine's position instead, after a
+  cache hit or a refused record, drops them, and recording stays stopped.
+- **A commit that got no answer and was refused over the allowance when sent again** raises the
+  refusal, not the first commit's error. That first commit may have landed, so its position is
+  not handed back: the next call takes the one after it, and the session's recording stops.
 - **A renewal refused over the allowance stops the renewals**, so the lease lasts until its
   deadline. A body that finishes before then is recorded as usual. Past it, `LeaseHandle.check()`
-  throws, and `signal` aborts with, a `LeaseLostError` that names the allowance and has the refusal
-  as its `cause`: `executionLease` rejects with it, and a tool call fails with the refusal itself,
-  recording nothing. A lease granted after a wait whose confirming renewal is refused is released,
-  and its body does not run.
+  throws, and `signal` aborts with, a `LeaseLostError` with the refusal as its `cause`, also when
+  the deadline passes while the result is being committed. Its message reads "Execution lease was
+  lost: the engine refused to renew it because the Cellaflow org is over its allowance for
+  cellaflow.steps, and its deadline passed. The lease may already belong to another worker.", the
+  same in both SDKs. `executionLease` rejects with it, and a tool call fails with the refusal
+  itself, recording nothing. A lease granted after a wait whose confirming renewal is refused is
+  released, and its body does not run.
 - **A record the session owes is kept** for the next call that gets through when its write is
   refused over the allowance. A failed call's lease that could not be released is released again
   first; if that is refused over the allowance, the record waits for the next call while the lease
@@ -48,8 +60,8 @@ All notable changes to the Cellaflow TypeScript SDK.
   `resets_at` (RFC 3339, years from 100 on), and `limit`, typed `AllowanceLimit` (exported):
   `"new_sessions_blocked" | "writes_blocked"`, or any other name a later engine sends. Both are
   absent when the ErrorInfo is missing or they do not parse. The message says the org is over its
-  allowance, of what, and when it resets (in UTC, to the second, with milliseconds only when it has
-  them), followed by the engine's message; `rawMessage` holds the same, and the engine's own text is
+  allowance, of what (left out when the subject is empty), and when it resets (in UTC, to the
+  second, with milliseconds only when it has them), followed by the engine's message; `rawMessage` holds the same, and the engine's own text is
   `cause.rawMessage`, `cause` being the engine's error. It is a `ConnectError` with code
   `Code.ResourceExhausted`, so code that checks either still matches it, and so its `name` is
   `ConnectError`. See "When the org is over its allowance" in the README.

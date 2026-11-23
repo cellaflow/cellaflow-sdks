@@ -9,6 +9,8 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import http2 from "node:http2";
 import { inspect } from "node:util";
+import { once } from "node:events";
+import { Worker } from "node:worker_threads";
 import { create, toBinary } from "@bufbuild/protobuf";
 import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import { Code, ConnectError } from "@connectrpc/connect";
@@ -18,6 +20,7 @@ import {
   AllowanceExceededError,
   CacheStatus,
   CellaflowClient,
+  LeaseHandle,
   LeaseLostError,
   StepStatus,
   WorkflowContext,
@@ -74,6 +77,16 @@ const mailboxFull = () => new ConnectError("session mailbox is full", Code.Resou
 
 /** The engine unavailable: no answer either way. */
 const unavailable = () => new ConnectError("engine unavailable", Code.Unavailable);
+
+/** A refusal over the allowance that arrives `ms` later, for a scripted list. */
+const refusedAfter = (ms) => () => sleep(ms).then(() => {
+  throw overAllowance();
+});
+
+/** A lease lost at its deadline after the engine refused to renew it, in the words both SDKs use. */
+const LOST_TO_ALLOWANCE =
+  "Execution lease was lost: the engine refused to renew it because the Cellaflow org is over its " +
+  "allowance for cellaflow.steps, and its deadline passed. The lease may already belong to another worker.";
 
 /**
  * A refusal as another copy of the SDK, with its own copy of Connect, raises
@@ -370,6 +383,74 @@ test("a refusal is found behind causes and inside AggregateErrors, within bounds
   assert.equal(carriesAllowanceRefusal(new AggregateError([hidden, refusal])), true);
 });
 
+test("a thrown value whose prototype cannot be read is not a refusal, and nothing throws", () => {
+  const hostile = new Proxy(
+    {},
+    {
+      getPrototypeOf() {
+        throw new Error("no prototype for you");
+      },
+    },
+  );
+  // instanceof itself throws on it.
+  assert.throws(() => hostile instanceof Error, /no prototype for you/);
+  assert.equal(isAllowanceRefusal(hostile), false);
+  assert.equal(allowanceRefusal(hostile), undefined);
+  assert.equal(isRetryable(hostile), false);
+  assert.equal(carriesAllowanceRefusal(hostile), false);
+  assert.equal(carriesAllowanceRefusal(new Error("wrapped", { cause: hostile })), false);
+  assert.equal(carriesAllowanceRefusal(new AggregateError([hostile, overAllowance()])), true);
+});
+
+test("at most 64 errors are looked at in all", () => {
+  // Two groups of 40, so neither passes the 64 members a group may show. In
+  // breadth-first order the root, the two groups and the first 61 of their
+  // 80 members are looked at: the second group's 21st is the 64th, and its
+  // 22nd is not looked at.
+  const tree = (at) => {
+    const first = Array.from({ length: 40 }, (_, i) => new Error(`first ${i}`));
+    const second = Array.from({ length: 40 }, (_, i) => (i === at ? overAllowance() : new Error(`second ${i}`)));
+    return new AggregateError([new AggregateError(first), new AggregateError(second)]);
+  };
+  assert.equal(carriesAllowanceRefusal(tree(20)), true);
+  assert.equal(carriesAllowanceRefusal(tree(21)), false);
+});
+
+test("at most 64 members of one group are looked at", () => {
+  // Values that are not objects are skipped without counting towards the 64
+  // in all, so only the bound on one group's members is reached.
+  const group = (at) => new AggregateError([...Array(at).fill("not an error"), overAllowance()]);
+  assert.equal(carriesAllowanceRefusal(group(63)), true);
+  assert.equal(carriesAllowanceRefusal(group(64)), false);
+});
+
+test("an AggregateError that holds itself is looked at once", { timeout: 20_000 }, async () => {
+  // Without remembering what it has seen, the search would queue 64 more
+  // copies for each one it looked at, 8 levels deep. Run in a worker, so a
+  // search that never ends fails this test instead of hanging the file.
+  const errors = new URL("../dist/errors.js", import.meta.url).href;
+  const worker = new Worker(
+    `
+    const { parentPort } = require("node:worker_threads");
+    import(${JSON.stringify(errors)}).then(({ carriesAllowanceRefusal }) => {
+      const group = new AggregateError([], "holds itself");
+      for (let i = 0; i < 64; i++) group.errors.push(group);
+      parentPort.postMessage(carriesAllowanceRefusal(group));
+    });
+    `,
+    { eval: true, resourceLimits: { maxOldGenerationSizeMb: 256 } },
+  );
+  try {
+    const answer = await Promise.race([
+      once(worker, "message").then(([found]) => found),
+      sleep(5000).then(() => "still searching after 5 s"),
+    ]);
+    assert.equal(answer, false);
+  } finally {
+    await worker.terminate();
+  }
+});
+
 // --- Every call site, with a scripted engine -----------------------------
 
 /**
@@ -383,7 +464,10 @@ function scriptedClient(script = {}) {
   const calls = [];
   const answer = (kind, healthy) => {
     const entry = script[kind];
-    const next = typeof entry === "function" ? entry() : entry?.shift();
+    let next = typeof entry === "function" ? entry() : entry?.shift();
+    // A list may hold functions, called when their turn comes: to answer
+    // later, or to do something while the call is on its way.
+    if (typeof next === "function") next = next();
     if (next === undefined) return healthy();
     if (next instanceof Error) throw next;
     return next;
@@ -749,13 +833,16 @@ test("a commit sent again after no answer and refused over the allowance raises 
   const client = scriptedClient({ commit: [unavailable(), overAllowance()] });
   const charge = tool(async () => "charged", { toolName: "charge" });
   const notify = tool(async () => "notified", { toolName: "notify" });
-  await runWithContext(session(client), async () => {
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
     await assert.rejects(charge(), isAllowance);
+    // The first commit may have landed: position 1 is not handed back, and
+    // the run stops recording.
+    assert.equal(ctx.historyKnown, false);
     assert.equal(await notify(), "notified");
   });
-  // Nothing recorded at position 1, which notify takes.
   assert.equal(client.count("recordAcquire"), 0);
-  assert.deepEqual(committed(client), [[1, "charge"], [1, "charge"], [1, "notify"]]);
+  assert.deepEqual(committed(client), [[1, "charge"], [1, "charge"], [2, "notify"]]);
 });
 
 test("a commit sent again after a refused release and refused over the allowance raises the refusal", async () => {
@@ -768,12 +855,14 @@ test("a commit sent again after a refused release and refused over the allowance
   });
   const charge = tool(async () => "charged", { toolName: "charge" });
   const notify = tool(async () => "notified", { toolName: "notify" });
-  await runWithContext(session(client), async () => {
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
     await assert.rejects(charge(), isAllowance);
+    assert.equal(ctx.historyKnown, false);
     assert.equal(await notify(), "notified");
   });
   assert.equal(client.count("recordAcquire"), 0);
-  assert.deepEqual(committed(client), [[1, "charge"], [1, "charge"], [1, "charge"], [1, "notify"]]);
+  assert.deepEqual(committed(client), [[1, "charge"], [1, "charge"], [1, "charge"], [2, "notify"]]);
 });
 
 /** A grant answered at once whose renewals are due every 20 ms. */
@@ -822,7 +911,7 @@ test("a tool body stopped at its deadline after a refused renewal raises the ref
   });
   // The body saw the loss, caused by the refusal.
   assert.ok(seen instanceof LeaseLostError);
-  assert.match(seen.message, /over its allowance for cellaflow\.steps/);
+  assert.equal(seen.message, LOST_TO_ALLOWANCE);
   assert.ok(seen.cause instanceof AllowanceExceededError);
   assert.equal(client.count("renew"), 1);
   assert.deepEqual(client.of("release").map((c) => c.reason), ["TOOL_ERROR"]);
@@ -988,6 +1077,137 @@ test("a call refused while an earlier one runs hands back its position", async (
   });
   assert.deepEqual(client.of("acquire").map((c) => c.sequence), [1, 2, 2]);
   assert.deepEqual(committed(client), [[1, "slow"], [2, "notify"]]);
+});
+
+test("two calls refused together hand back both positions, in either order they settle", async () => {
+  for (const [what, acquire] of [
+    ["the lower settles first", [overAllowance(), refusedAfter(20)]],
+    ["the top settles first", [refusedAfter(20), overAllowance()]],
+  ]) {
+    const client = scriptedClient({ acquire });
+    const charge = tool(async () => "charged", { toolName: "charge" });
+    const refund = tool(async () => "refunded", { toolName: "refund" });
+    const notify = tool(async () => "notified", { toolName: "notify" });
+    const ctx = session(client);
+    await runWithContext(ctx, async () => {
+      const results = await Promise.allSettled([charge(), refund()]);
+      assert.ok(results.every((r) => r.status === "rejected" && isAllowance(r.reason)), what);
+      // No position is left empty, so the run records again.
+      assert.equal(ctx.historyKnown, true, what);
+      assert.equal(await notify(), "notified");
+    });
+    assert.deepEqual(client.of("acquire").map((c) => c.sequence), [1, 2, 1], what);
+    assert.deepEqual(committed(client), [[1, "notify"]], what);
+  }
+});
+
+test("refused calls nested in a refused call hand back every position", async () => {
+  // book holds 1; its body runs charge (2) and refund (3) together. charge is
+  // refused first, below refund, so 2 is vacated; refund, at the top, hands
+  // back 3 and the counter steps down through 2; book then hands back 1.
+  const client = scriptedClient({ acquire: [undefined, overAllowance(), refusedAfter(20)] });
+  const charge = tool(async () => "charged", { toolName: "charge" });
+  const refund = tool(async () => "refunded", { toolName: "refund" });
+  const book = tool(
+    async () => {
+      const results = await Promise.allSettled([charge(), refund()]);
+      throw results[0].reason;
+    },
+    { toolName: "book" },
+  );
+  const notify = tool(async () => "notified", { toolName: "notify" });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    await assert.rejects(book(), isAllowance);
+    assert.equal(ctx.historyKnown, true);
+    assert.equal(await notify(), "notified");
+  });
+  assert.deepEqual(client.of("acquire").map((c) => c.sequence), [1, 2, 3, 1]);
+  assert.equal(client.count("recordAcquire"), 0);
+  assert.deepEqual(committed(client), [[1, "notify"]]);
+});
+
+test("a lease lost at its deadline while the commit is on its way keeps the refusal as its cause", async () => {
+  const invalid = new ConnectError("payload too large", Code.InvalidArgument);
+  const client = scriptedClient({
+    acquire: [quickRenewals()],
+    renew: [overAllowance()],
+    commit: [
+      async () => {
+        // The process stalls past the lease's deadline while the commit is
+        // on its way, which then fails.
+        const restore = jumpClocks(5000);
+        try {
+          await sleep(40);
+        } finally {
+          restore();
+        }
+        throw invalid;
+      },
+    ],
+  });
+  let lease;
+  const charge = tool(
+    async () => {
+      lease = currentLease();
+      await sleep(60);
+      return "charged";
+    },
+    { toolName: "charge", ttlMs: 1000 },
+  );
+  await runWithContext(session(client), () => assert.rejects(charge(), (err) => err === invalid));
+  assert.equal(client.count("renew"), 1);
+  assert.ok(lease.signal.aborted);
+  const reason = lease.signal.reason;
+  assert.ok(reason instanceof LeaseLostError);
+  assert.equal(reason.message, LOST_TO_ALLOWANCE);
+  assert.ok(reason.cause instanceof AllowanceExceededError);
+});
+
+test("without a subject, both messages leave out what the org is over its allowance of", async () => {
+  const refusal = new AllowanceExceededError({ subject: "" });
+  assert.equal(refusal.message, "[resource_exhausted] The Cellaflow org is over its allowance, so the engine refused this call.");
+  const client = scriptedClient({ renew: [refusal] });
+  let lost;
+  const hb = new LeaseHeartbeat({
+    client,
+    agentId: "agent",
+    idempotencyKey: "key",
+    fencingToken: 1,
+    heartbeatIntervalMs: 20,
+    extendMs: 400,
+    leaseTtlMs: 400,
+    onLeaseLost: (detail, cause) => {
+      lost = { detail, cause };
+    },
+  });
+  try {
+    hb.start();
+    await sleep(60);
+    const restore = jumpClocks(5000);
+    try {
+      assert.equal(hb.pastDeadline(), true);
+    } finally {
+      restore();
+    }
+  } finally {
+    await hb.stop();
+  }
+  assert.equal(lost.cause, refusal);
+  const handle = new LeaseHandle(1);
+  handle.markLost(lost.detail, lost.cause);
+  assert.throws(
+    () => handle.check(),
+    (err) => {
+      assert.equal(
+        err.message,
+        "Execution lease was lost: the engine refused to renew it because the Cellaflow org is over its " +
+          "allowance, and its deadline passed. The lease may already belong to another worker.",
+      );
+      assert.equal(err.cause, refusal);
+      return true;
+    },
+  );
 });
 
 // --- Over the real transport ---------------------------------------------
