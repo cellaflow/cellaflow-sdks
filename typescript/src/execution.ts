@@ -64,14 +64,17 @@ export class LeaseNotAcquired extends Error {
 /**
  * A holder's `workerId` as a refusal message shows it. The holder chose that
  * string and it is not authenticated, and a message often reaches a model, so
- * it is quoted, invisible format characters are escaped, and it is cut to 64
- * characters. The full id stays on `holder.workerId`.
+ * it is quoted, cut to 64 characters, and every character that could hide text
+ * or break the line is escaped: control and format characters, line and
+ * paragraph separators, and variation selectors. The full id stays on
+ * `holder.workerId`.
  */
 function shownWorkerId(id: string): string {
   const chars = Array.from(id);
   const cut = chars.length > 64 ? `${chars.slice(0, 64).join("")}...` : id;
+  // After JSON.stringify, \p{Cc} matches only DEL and C1: C0 is already escaped.
   return JSON.stringify(cut).replace(
-    /\p{Cf}/gu,
+    /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u{FE00}-\u{FE0F}\u{E0100}-\u{E01EF}]/gu,
     (c) => `\\u{${(c.codePointAt(0) ?? 0).toString(16)}}`,
   );
 }

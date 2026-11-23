@@ -8,10 +8,10 @@ All notable changes to the Cellaflow Python SDK.
 
 - **`CheckCacheResponse.current_holder_id` is removed.** It was the engine's opaque id for the
   holder's grant of the lease, which `CellaflowClient.check_idempotency_cache` returned on
-  `IN_PROGRESS`. The same value is now `current_holder.engine_holder_id`, and `current_holder.agent_id` is
-  the worker that holds the lease. Code that read `current_holder_id` raises `AttributeError`, and
-  `HasField("current_holder_id")` or `CheckCacheResponse(current_holder_id=...)`, in a test double
-  for instance, raises `ValueError`.
+  `IN_PROGRESS`. The same value is now `current_holder.engine_holder_id`, and
+  `current_holder.agent_id` is the worker that acquired the lease. Code that reads or assigns
+  `current_holder_id` raises `AttributeError`, and `HasField("current_holder_id")` or
+  `CheckCacheResponse(current_holder_id=...)`, in a test double for instance, raises `ValueError`.
 
 ### Compatibility
 

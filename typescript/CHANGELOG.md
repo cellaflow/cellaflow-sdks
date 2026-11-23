@@ -8,13 +8,13 @@ All notable changes to the Cellaflow TypeScript SDK.
 
 - **`CheckCacheResponse.currentHolderId` is removed.** It was the engine's opaque id for the
   holder's grant of the lease, which `CellaflowClient.checkIdempotencyCache` returned on
-  `IN_PROGRESS`. The same value is now `currentHolder.engineHolderId`, and `currentHolder.agentId` is the
-  worker that holds the lease. Code that read `currentHolderId` no longer compiles; in JavaScript it
-  reads `undefined`.
+  `IN_PROGRESS`. The same value is now `currentHolder.engineHolderId`, and `currentHolder.agentId` is
+  the worker that acquired the lease. Code that read `currentHolderId` no longer compiles; in
+  JavaScript it reads `undefined`.
 - **A refusal's message names the holder's `workerId`, not the engine's opaque id.** It reads
-  `(held by "worker-a")`: quoted, with invisible format characters escaped, and cut to 64
-  characters, since the holder chose the id and the message may reach a model. The full id is on
-  `holder.workerId`. When the engine does not report the holder, or reports no `workerId`, the
+  `(held by "worker-a")`: quoted, cut to 64 characters, and with control and format characters,
+  line and paragraph separators, and variation selectors escaped, since the holder chose the id and
+  the message may reach a model. The full id is on `holder.workerId`. When the engine does not report the holder, or reports no `workerId`, the
   message names nobody; 0.12.0 printed the engine's opaque id there.
 
 ### Compatibility
