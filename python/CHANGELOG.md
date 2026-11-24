@@ -83,11 +83,11 @@ All notable changes to the Cellaflow Python SDK.
   back or vacated alike: the next call to claim the position sends it first, so it never lands
   behind a lease that still claims the position. Answered, the call goes on at once; refused for the
   allowance, it fails at once with the refusal; unanswered, the call waits, sending the release
-  again about once a second, until it is answered or the lease lapses (at most the lease's TTL plus
-  a few seconds). An async call can be cancelled while it waits; a sync call waits until then. A
-  call whose lease grant got no answer and whose next request was then refused leaves that lease
-  owed too, though no release can be sent for it: the next call waits until the lease would lapse,
-  looking again about once a second. A step whose commit got no answer, and whose resend was
+  again about once a second, until it is answered or the lease lapses (up to the lease's TTL plus
+  the release's own timeout). An async call can be cancelled while it waits; a sync call waits until
+  then. A call whose lease grant got no answer and whose next request was then refused leaves that
+  lease owed too, though no release can be sent for it: the next call waits until the lease would
+  lapse, looking again about once a second. A step whose commit got no answer, and whose resend was
   refused, gives its position back too, but unless the engine then released the lease, which shows
   the commit did not land, the run also stops recording into the session. A taken-over step that is
   refused is handed back at the top, as a takeover is in the TypeScript SDK, and otherwise leaves

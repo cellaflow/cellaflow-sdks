@@ -279,6 +279,15 @@ class WorkflowContext:
                 # Shielded: one caller being cancelled does not stop the write
                 # the others are waiting on.
                 await asyncio.shield(settling)
+            owing = self._owing
+            if owing is not None and not owing.done() and owing.get_loop() is loop:
+                # A settling in flight holds the session's lock while its
+                # release is sent, on a worker thread: claiming now would block
+                # the event loop on that lock until the engine answers. Wait for
+                # it instead, then look again.
+                await asyncio.wait({owing})
+                owing.result()
+                continue
             # Reconciled first, as a sync claim is: a position the engine
             # reported moves the counter before the owed release is looked up.
             position, wait = self._try_claim(send=False)
@@ -430,12 +439,19 @@ class WorkflowContext:
                         idempotency_key=entry["key"],
                         fencing_token=entry["token"],
                         reason="TOOL_ERROR",
-                        timeout=self._rpc_timeout(),
+                        # No longer than the lease can live: past its lapse
+                        # there is nothing left to release.
+                        timeout=min(self._rpc_timeout(), left),
                     )
                 except Exception as exc:
                     if _is_allowance_refusal(exc):
                         raise
                     if _may_pass(exc):
+                        # Counted again: the release took time. A lease that
+                        # lapsed meanwhile is dropped on the next pass.
+                        left = float(entry["lapses_at"]) - time.monotonic()
+                        if left <= 0:
+                            continue
                         return min(_OWED_POLL_S, left)
                 entries.pop(0)
                 continue

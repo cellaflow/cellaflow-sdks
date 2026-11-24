@@ -3778,16 +3778,22 @@ async def test_an_async_call_owing_a_release_at_the_longest_ttl_does_not_wait_fo
     async def notify() -> str:
         return "notified"
 
+    waited: List[float] = []
+
     @workflow(version="1.0.0")
     async def checkout() -> str:
         try:
             return await charge()  # type: ignore[no-any-return]
         except AllowanceExceeded:
-            return await notify()  # type: ignore[no-any-return]
+            started = time.monotonic()
+            done: str = await notify()
+            waited.append(time.monotonic() - started)
+            return done
 
-    started = time.monotonic()
     assert await asyncio.wait_for(checkout(), 10.0) == "notified"
-    assert time.monotonic() - started < 3.0
+    # A pass of about a second between the unanswered release and the one
+    # answered: waited, not sent again at once.
+    assert 0.9 <= waited[0] < 3.0
     assert len(_releases_for(mock_stub, "charge")) == 3
     assert _commits(mock_stub) == [(1, "notify", SUCCESS)]
 
@@ -3803,10 +3809,11 @@ def test_a_lease_whose_token_is_unknown_is_waited_out_in_passes(
     unknown = {"agent_id": "a", "key": "k", "token": 0, "lapses_in_s": 1.5}
     ctx.give_back_refused_position(1, unknown)
     ctx.end_call()
-    started = time.monotonic()
     assert ctx.begin_call() == 1
-    assert 1.4 <= time.monotonic() - started < 2.5
-    assert len(sleeps.slept) >= 2 and max(sleeps.slept) <= 1.0
+    # A full pass, then one cut to what was left of the lease's 1.5 s.
+    assert len(sleeps.slept) == 2
+    assert sleeps.slept[0] == pytest.approx(1.0, abs=0.01)
+    assert 0.4 < sleeps.slept[1] < 0.55
     client.release_lease.assert_not_called()
 
 
@@ -4067,3 +4074,247 @@ async def test_adopting_the_engines_position_keeps_a_release_owed_below_it(
         assert await d_step() == "d"
     assert engine.committed == 2
     assert [c[:2] for c in _commits(mock_stub)] == [(1, "c_step"), (2, "d_step")]
+
+
+@pytest.mark.asyncio
+async def test_a_call_arriving_mid_release_does_not_block_the_loop() -> None:
+    """The owed release is sent on a worker thread, which holds the session's
+    lock until the engine answers (0.4 s here, the first time without an
+    answer). A second call arriving meanwhile waits on that settling instead of
+    taking the lock on the event loop, so other tasks go on running."""
+
+    class SlowReleases:
+        def __init__(self) -> None:
+            self.releases = 0
+
+        def release_lease(self, **kwargs: Any) -> Any:
+            self.releases += 1
+            time.sleep(0.4)
+            if self.releases == 1:
+                raise EngineError(grpc.StatusCode.DEADLINE_EXCEEDED, "deadline")
+            return idempotency_pb2.ReleaseLeaseResponse(released=True)
+
+    client = SlowReleases()
+    ctx = await _owing_one(client)
+    worst = [0.0]
+
+    async def ticker() -> None:
+        while True:
+            started = time.monotonic()
+            await asyncio.sleep(0.01)
+            worst[0] = max(worst[0], time.monotonic() - started - 0.01)
+
+    tick = asyncio.ensure_future(ticker())
+    first = asyncio.ensure_future(ctx.begin_call_async())
+    await _until(lambda: client.releases == 1)
+    second = asyncio.ensure_future(ctx.begin_call_async())
+    assert list(await asyncio.gather(first, second)) == [1, 2]
+    tick.cancel()
+    assert client.releases == 2
+    assert worst[0] < 0.2
+
+
+def test_an_unanswered_owed_release_is_polled_up_to_the_lapse_and_no_further(
+    sleeps: _Sleeps,
+) -> None:
+    """The release goes unanswered every time. The call polls a full second,
+    then only what is left of the lease's 1.5 s, and each release is given no
+    longer than the lease has left to live."""
+    client = MagicMock()
+    client.release_lease.side_effect = EngineError(
+        grpc.StatusCode.UNAVAILABLE, "unavailable"
+    )
+    ctx = WorkflowContext(
+        client=client, session_id="s", workflow_version="1", history_known=True
+    )
+    assert ctx.begin_call() == 1
+    owed = {"agent_id": "a", "key": "k", "token": 7, "lapses_in_s": 1.5}
+    ctx.give_back_refused_position(1, owed)
+    ctx.end_call()
+    assert ctx.begin_call() == 1
+    assert len(sleeps.slept) == 2
+    assert sleeps.slept[0] == pytest.approx(1.0, abs=0.01)
+    assert 0.4 < sleeps.slept[1] < 0.55
+    timeouts = [c.kwargs["timeout"] for c in client.release_lease.call_args_list]
+    assert len(timeouts) == 2
+    assert 1.4 < timeouts[0] <= 1.5 and 0.4 < timeouts[1] < 0.55
+
+
+def test_a_lease_that_lapses_while_its_release_is_sent_is_dropped_at_once(
+    sleeps: _Sleeps,
+) -> None:
+    """The release takes longer than the lease has left, and gets no answer:
+    the lease has lapsed by then, so it is dropped and the call claims at once,
+    without a wait counted from before the release."""
+
+    class Slow:
+        def __init__(self) -> None:
+            self.releases = 0
+
+        def release_lease(self, **kwargs: Any) -> Any:
+            self.releases += 1
+            time.sleep(0.3)
+            raise EngineError(grpc.StatusCode.DEADLINE_EXCEEDED, "deadline")
+
+    client: Any = Slow()
+    ctx = WorkflowContext(
+        client=client, session_id="s", workflow_version="1", history_known=True
+    )
+    assert ctx.begin_call() == 1
+    owed = {"agent_id": "a", "key": "k", "token": 7, "lapses_in_s": 0.2}
+    ctx.give_back_refused_position(1, owed)
+    ctx.end_call()
+    assert ctx.begin_call() == 1
+    assert client.releases == 1
+    assert sleeps.slept == []
+    assert ctx._owed == {}
+
+
+class TwoOwedEngine(StrictEngine):
+    """`StrictEngine` with releases of several steps failing, each with its
+    own errors in turn."""
+
+    def __init__(
+        self, mock_stub: MagicMock, failures: Dict[str, List[BaseException]]
+    ) -> None:
+        super().__init__(mock_stub, "no-such-step")
+        self.failures = failures
+
+    def release(self, req: Any, **kwargs: Any) -> Any:
+        for name, errors in self.failures.items():
+            if f":{name}:" in req.idempotency_key and errors:
+                raise errors.pop(0)
+        return super().release(req, **kwargs)
+
+
+def _two_owed_failures() -> Dict[str, List[BaseException]]:
+    """Each refused step's release goes unanswered, and so does the first
+    pass of the call that owes it, so that call waits before sending it again."""
+    return {
+        name: [
+            EngineError(grpc.StatusCode.UNAVAILABLE, "unavailable"),
+            EngineError(grpc.StatusCode.UNAVAILABLE, "unavailable"),
+        ]
+        for name in ("first", "second")
+    }
+
+
+@pytest.mark.asyncio
+async def test_two_owed_positions_claimed_together_async(mock_stub: MagicMock) -> None:
+    """`first` (1) and `second` (2) are both refused, their releases unanswered,
+    so releases are owed at 1 and at 2. `third` and `fourth` are then called
+    together: each settles the release owed at the position it is about to
+    claim, so `third` commits at 1 and `fourth` at 2, neither refused as
+    divergent."""
+    engine = TwoOwedEngine(mock_stub, _two_owed_failures())
+    first_goes, second_goes = asyncio.Event(), asyncio.Event()
+    entered: List[str] = []
+
+    @step
+    async def first() -> str:
+        entered.append("first")
+        await first_goes.wait()
+        raise refusal()
+
+    @step
+    async def second() -> str:
+        entered.append("second")
+        await second_goes.wait()
+        raise refusal()
+
+    @step
+    async def third() -> str:
+        return "third"
+
+    @step
+    async def fourth() -> str:
+        return "fourth"
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(),
+        session_id="s-two-owed",
+        workflow_version="1.0.0",
+        history_known=True,
+    )
+    with ctx.bind():
+        one = asyncio.ensure_future(first())
+        await _until(lambda: entered == ["first"])
+        two = asyncio.ensure_future(second())
+        await _until(lambda: entered == ["first", "second"])
+        first_goes.set()
+        with pytest.raises(AllowanceExceeded):
+            await one
+        second_goes.set()
+        with pytest.raises(AllowanceExceeded):
+            await two
+        assert ctx.sequence == 0 and sorted(ctx._owed) == [1, 2]
+        assert list(await asyncio.gather(third(), fourth())) == ["third", "fourth"]
+    assert [c[:2] for c in _commits(mock_stub)] == [(1, "third"), (2, "fourth")]
+    assert engine.committed == 2
+
+
+def test_two_owed_positions_claimed_together_sync(mock_stub: MagicMock) -> None:
+    """As the async test, with the calls on threads: whichever claims first
+    takes 1, after the release owed there, and the other 2."""
+    engine = TwoOwedEngine(mock_stub, _two_owed_failures())
+    goes = {"first": threading.Event(), "second": threading.Event()}
+    entered: List[str] = []
+    outcomes: Dict[str, Any] = {}
+
+    def refused_body(name: str) -> Callable[[], str]:
+        def body() -> str:
+            entered.append(name)
+            assert goes[name].wait(5.0)
+            raise refusal()
+
+        body.__name__ = name
+        return body
+
+    first, second = step(refused_body("first")), step(refused_body("second"))
+
+    @step
+    def third() -> str:
+        return "third"
+
+    @step
+    def fourth() -> str:
+        return "fourth"
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(),
+        session_id="s-two-owed-sync",
+        workflow_version="1.0.0",
+        history_known=True,
+    )
+
+    def run(name: str, call: Callable[[], str]) -> threading.Thread:
+        def target() -> None:
+            with ctx.bind():
+                try:
+                    outcomes[name] = call()
+                except BaseException as e:
+                    outcomes[name] = e
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        return thread
+
+    one = run("first", first)
+    _wait_for(lambda: entered == ["first"])
+    two = run("second", second)
+    _wait_for(lambda: entered == ["first", "second"])
+    goes["first"].set()
+    one.join(5.0)
+    goes["second"].set()
+    two.join(5.0)
+    assert isinstance(outcomes["first"], AllowanceExceeded)
+    assert isinstance(outcomes["second"], AllowanceExceeded)
+    assert ctx.sequence == 0 and sorted(ctx._owed) == [1, 2]
+    threads = [run("third", third), run("fourth", fourth)]
+    for thread in threads:
+        thread.join(10.0)
+    assert (outcomes["third"], outcomes["fourth"]) == ("third", "fourth")
+    committed = sorted(c[:2] for c in _commits(mock_stub))
+    assert [c[0] for c in committed] == [1, 2]
+    assert {c[1] for c in committed} == {"third", "fourth"}
+    assert engine.committed == 2
