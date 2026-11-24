@@ -78,6 +78,21 @@ const mailboxFull = () => new ConnectError("session mailbox is full", Code.Resou
 /** The engine unavailable: no answer either way. */
 const unavailable = () => new ConnectError("engine unavailable", Code.Unavailable);
 
+/**
+ * Waits for `promise` while holding the event loop open. What it waits for
+ * comes from a lease's heartbeat, whose timers do not hold the loop open on
+ * their own; with nothing else holding it, Node 18's test runner cancels a
+ * test whose promise is still pending once the loop is empty.
+ */
+async function held(promise) {
+  const keepAlive = setInterval(() => {}, 1000);
+  try {
+    return await promise;
+  } finally {
+    clearInterval(keepAlive);
+  }
+}
+
 /** A promise to wait for, and the function that settles it. */
 function signal() {
   let fire;
@@ -477,13 +492,18 @@ test("an AggregateError that holds itself is looked at once", { timeout: 20_000 
     `,
     { eval: true, resourceLimits: { maxOldGenerationSizeMb: 256 } },
   );
+  let timer;
   try {
     const answer = await Promise.race([
       once(worker, "message").then(([found]) => found),
-      sleep(5000).then(() => "still searching after 5 s"),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve("still searching after 5 s"), 5000);
+      }),
     ]);
     assert.equal(answer, false);
   } finally {
+    // Not left to run on, holding the loop open for the tests after this one.
+    clearTimeout(timer);
     await worker.terminate();
   }
 });
@@ -802,7 +822,7 @@ test("a renewal refused over the allowance is not sent again, and the lease last
   });
   try {
     hb.start();
-    await refused.fired;
+    await held(refused.fired);
     // Five more renewals would have come due by now.
     await sleep(100);
     assert.equal(client.count("renew"), 1);
@@ -950,7 +970,7 @@ test("a tool body that finishes within its lease after a refused renewal commits
   const client = scriptedClient({ acquire: [quickRenewals()], renew: [renewal.answer] });
   const charge = tool(
     async () => {
-      await renewal.handled();
+      await held(renewal.handled());
       return "charged";
     },
     { toolName: "charge", ttlMs: 1000 },
@@ -969,7 +989,7 @@ test("a tool body stopped at its deadline after a refused renewal raises the ref
     async () => {
       // The renewal is refused; the process then stalls past the lease's
       // deadline, and the body checks before acting.
-      await renewal.handled();
+      await held(renewal.handled());
       const restore = jumpClocks(5000);
       try {
         currentLease().check();
@@ -1232,7 +1252,7 @@ test("a lease lost at its deadline while the commit is on its way keeps the refu
   const charge = tool(
     async () => {
       lease = currentLease();
-      await renewal.handled();
+      await held(renewal.handled());
       return "charged";
     },
     { toolName: "charge", ttlMs: 1000 },
@@ -1269,7 +1289,7 @@ test("without a subject, both messages leave out what the org is over its allowa
   });
   try {
     hb.start();
-    await refused.fired;
+    await held(refused.fired);
     const restore = jumpClocks(5000);
     try {
       assert.equal(hb.pastDeadline(), true);
@@ -2115,7 +2135,7 @@ test("an execution lease whose renewal is refused mid-block is lost at its deadl
       async (lease) => {
         // The renewal is refused, however long it takes over the wire; the
         // block then stalls past the lease's deadline and checks before acting.
-        await refused.fired;
+        await held(refused.fired);
         const restore = jumpClocks(5000);
         try {
           lease.check();
