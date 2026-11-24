@@ -83,7 +83,7 @@ be something you can reproduce rather than something that happened once here:
 
 | | |
 | :--- | :--- |
-| `cellaflow` | 0.11.0 |
+| `cellaflow` | 0.12.0 |
 | `langgraph` | 1.2.22 |
 | `langgraph-checkpoint-postgres` | 3.2.1 |
 | `psycopg[binary]` | 3.3.9 |
