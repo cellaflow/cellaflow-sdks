@@ -548,7 +548,9 @@ export class WorkflowContext {
    * {@link settleRecording}, before claiming a position, so nothing waits
    * while holding a position or a lease other calls need; calls behind it
    * wait in the order they arrived, and settle again. The wait cannot be
-   * cancelled, and lasts at most until the leases lapse.
+   * cancelled. It lasts until the leases lapse, plus whatever a release
+   * already sent then takes to be answered or reach its deadline: at most the
+   * TTL plus a few seconds.
    *
    * It goes in passes of at most {@link OWED_PASS_MS}, each bounded by the
    * soonest lapse, and on each pass, for each release still owed:

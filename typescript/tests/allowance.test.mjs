@@ -1660,9 +1660,31 @@ test("an owed release with no token is waited out to its lapse, a second at a ti
   const started = performance.now();
   const longest = await longestTimer(() => ctx.settleOwedRelease());
   const took = performance.now() - started;
-  assert.ok(took >= 1400, `waited ${took} ms`);
+  // Until the lapse, and not a pass longer: the last pass ends at the lapse.
+  assert.ok(took >= 1400 && took < 1900, `waited ${took} ms`);
   assert.ok(longest <= 1000, `a timer of ${longest} ms`);
   assert.equal(client.count("release"), 0);
+  assert.equal(ctx.releaseOwed, false);
+});
+
+test("a pass ends at the soonest lapse among the releases owed", { timeout: 10_000 }, async () => {
+  // One position owes a lease with no token, lapsing in 300 ms, and one whose
+  // release goes unanswered once. The first pass ends when the first lapses,
+  // and the release sent again then is answered: done well before a full
+  // second's pass.
+  const client = scriptedClient({ release: [unavailable(), { released: true }] });
+  const ctx = session(client);
+  ctx.claimPosition();
+  ctx.endCall();
+  ctx.giveBackRefusedPosition(1, { agentId: "default", key: "lost-grant", token: 0, lapsesInMs: 300 });
+  ctx.claimPosition();
+  ctx.endCall();
+  ctx.giveBackRefusedPosition(1, { agentId: "default", key: "unanswered", token: 7, lapsesInMs: 60_000 });
+  const started = performance.now();
+  await ctx.settleOwedRelease();
+  const took = performance.now() - started;
+  assert.ok(took >= 250 && took < 800, `waited ${took} ms`);
+  assert.equal(client.count("release"), 2);
   assert.equal(ctx.releaseOwed, false);
 });
 
@@ -1678,9 +1700,73 @@ test("releases owed at one position by several refused calls are each settled", 
     ctx.giveBackRefusedPosition(1, { agentId: "default", key: `lease-${token}`, token, lapsesInMs: 60_000 });
   }
   assert.equal(ctx.releaseOwed, true);
+  const started = performance.now();
   await ctx.settleOwedRelease();
+  const took = performance.now() - started;
+  // Both in the first pass, not one a pass later.
+  assert.ok(took < 500, `waited ${took} ms`);
   assert.deepEqual(client.of("release").map((c) => c.fencingToken), [7, 9]);
   assert.equal(ctx.releaseOwed, false);
+});
+
+test("two calls waiting on releases owed at two positions each settle their own", async () => {
+  // a holds 1 and b holds 2; both are refused and neither release is
+  // answered, so releases are owed at 1 and 2. c and d are then called
+  // together: c settles 1 and claims it; d, having waited on that, must also
+  // settle 2 before claiming it, or b's lease refuses it as divergent.
+  const aSettled = signal();
+  let committedUpTo = 0;
+  let nextToken = 0;
+  let releaseFails = 2;
+  const leases = new Map();
+  const claims = new Map();
+  const log = [];
+  const client = {
+    async checkIdempotencyCache(agentId, key, waitTimeoutMs, ttl, sessionId, seq) {
+      const claimer = claims.get(seq);
+      if (claimer && claimer !== key) {
+        log.push(`divergent at ${seq}`);
+        throw failedPrecondition(`Sequence ${seq} is already claimed by a different step identity`);
+      }
+      const token = ++nextToken;
+      leases.set(key, { token, seq });
+      claims.set(seq, key);
+      return { status: CacheStatus.ACQUIRED, fencingToken: BigInt(token), heartbeatIntervalMs: 60_000n };
+    },
+    async commitStep(sessionId, seq, name) {
+      if (seq !== committedUpTo + 1) throw failedPrecondition(`Sequence mismatch: expected sequence ${committedUpTo + 1}`);
+      committedUpTo = seq;
+      log.push(`commit ${seq} ${name}`);
+      return {};
+    },
+    async renewLease(agentId, key, token, extendMs) {
+      return { renewed: true, newExpiresAtMs: BigInt(Date.now() + extendMs) };
+    },
+    async releaseLease(agentId, key, token) {
+      if (releaseFails-- > 0) throw unavailable();
+      const lease = leases.get(key);
+      if (lease?.token !== Number(token)) return { released: false };
+      claims.delete(lease.seq);
+      leases.delete(key);
+      return { released: true };
+    },
+    async getGraph() {
+      return [[], undefined];
+    },
+    close() {},
+  };
+  const a = tool(async () => { throw overAllowance(); }, { toolName: "a" });
+  const b = tool(async () => { await aSettled.fired; throw overAllowance(); }, { toolName: "b" });
+  const c = tool(async () => "c", { toolName: "c" });
+  const d = tool(async () => "d", { toolName: "d" });
+  const ctx = session(client);
+  await runWithContext(ctx, async () => {
+    const refused = await Promise.allSettled([a().finally(aSettled.fire), b()]);
+    assert.ok(refused.every((r) => isAllowance(r.reason)));
+    const results = await Promise.allSettled([c(), d()]);
+    assert.deepEqual(results.map((r) => r.value ?? r.reason), ["c", "d"]);
+  });
+  assert.deepEqual(log, ["commit 1 c", "commit 2 d"]);
 });
 
 test("adopting the engine's position keeps a release owed below it", async () => {
