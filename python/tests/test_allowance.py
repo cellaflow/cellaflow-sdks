@@ -9,6 +9,7 @@ import asyncio
 import builtins
 import collections
 import copy
+import gc
 import itertools
 import pickle
 import sys
@@ -23,9 +24,11 @@ import grpc
 import pytest
 
 import cellaflow
+import cellaflow.context
 import cellaflow.decorators
 import cellaflow.lease
 from cellaflow import (
+    MAX_LEASE_TTL_MS,
     AllowanceExceeded,
     CellaflowClient,
     LeaseHandle,
@@ -3012,28 +3015,73 @@ async def test_a_refused_steps_unanswered_release_is_sent_again_before_its_posit
     assert _commits(mock_stub) == [(1, next_step, SUCCESS)]
 
 
+class GuardFirstEngine:
+    """An engine model whose allowance guard sits at the top of the lease
+    request, before the cache lookup: it refuses even a key a live lease still
+    holds. Leases lapse on the clock, and the session is strictly ordered: a
+    lease at a position another live lease claims is refused as divergent, and
+    a commit anywhere but the next position is refused. The first grant to step
+    `lose_grant_of` is made but its answer lost, and the org goes over its
+    allowance at that moment."""
+
+    def __init__(self, mock_stub: MagicMock, lose_grant_of: str) -> None:
+        self.over = False
+        self.committed = 0
+        self.leases: Dict[str, Tuple[Optional[int], float]] = {}
+        self.divergent: List[int] = []
+        self.lose_grant_of: Optional[str] = lose_grant_of
+        self.tokens = itertools.count(100)
+        mock_stub.CheckIdempotencyCache.side_effect = self.check
+        mock_stub.CommitStep.side_effect = self.commit
+        mock_stub.ReleaseLease.side_effect = self.release
+
+    def check(self, req: Any, **kwargs: Any) -> Any:
+        if self.over:
+            raise over_allowance()
+        now = time.monotonic()
+        self.leases = {k: v for k, v in self.leases.items() if v[1] > now}
+        key = req.idempotency_key
+        position = req.sequence if req.HasField("sequence") else None
+        for holder, (claimed, _) in self.leases.items():
+            if position is not None and claimed == position and holder != key:
+                self.divergent.append(position)
+                raise EngineError(
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    f"position {position} is claimed by another lease",
+                )
+        ttl_s = (req.lease_ttl_ms or 20_000) / 1000.0
+        self.leases[key] = (position, now + ttl_s)
+        if self.lose_grant_of and f":{self.lose_grant_of}:" in key:
+            self.lose_grant_of = None
+            self.over = True
+            raise EngineError(grpc.StatusCode.UNAVAILABLE, "unavailable")
+        return acquired(next(self.tokens), 250)
+
+    def commit(self, req: Any, **kwargs: Any) -> Any:
+        position = req.step_result.sequence
+        if position != self.committed + 1:
+            raise EngineError(grpc.StatusCode.FAILED_PRECONDITION, "Sequence mismatch")
+        self.committed = position
+        self.leases.pop(req.idempotency_key, None)
+        return service_pb2.CommitStepResponse(session_id=req.session_id)
+
+    def release(self, req: Any, **kwargs: Any) -> Any:
+        released = self.leases.pop(req.idempotency_key, None) is not None
+        return idempotency_pb2.ReleaseLeaseResponse(released=released)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("asynchronous", [False, True])
-async def test_a_lease_whose_grant_may_have_been_lost_is_waited_out(
+async def test_a_lost_grant_then_a_refused_retry_leaves_the_session_in_order(
     mock_stub: MagicMock, asynchronous: bool
 ) -> None:
-    """The first request gets no answer (it may have been granted, a lease
-    whose token is unknown), and the retry is refused. The next call cannot
-    release that lease, so it waits for it to lapse (2 s at a 1 s TTL, a
-    second's grace included, from the hand-back), then commits at 1."""
+    """The grant at position 1 is made but its answer lost, and the retry is
+    refused by a guard that does not look the key up first, so the refusal
+    proves nothing about that lease. It is owed at 1, and once the block lifts
+    the next call waits for it to lapse (1 s TTL) rather than be refused as
+    divergent behind it; the session then commits in order."""
     name = "charge" if asynchronous else "charge_sync"
-    granted = mock_stub.CheckIdempotencyCache.return_value
-    answers: List[BaseException] = [
-        EngineError(grpc.StatusCode.UNAVAILABLE, "unavailable"),
-        over_allowance(),
-    ]
-
-    def check(req: Any, **kwargs: Any) -> Any:
-        if f":{name}:" in req.idempotency_key and answers:
-            raise answers.pop(0)
-        return granted
-
-    mock_stub.CheckIdempotencyCache.side_effect = check
+    engine = GuardFirstEngine(mock_stub, name)
     waited: List[float] = []
 
     @step(lease_ttl_ms=1000)  # type: ignore[untyped-decorator]
@@ -3044,15 +3092,20 @@ async def test_a_lease_whose_grant_may_have_been_lost_is_waited_out(
     async def notify() -> str:
         return "notified"
 
+    @step
+    async def audit() -> str:
+        return "audited"
+
     @workflow(version="1.0.0")
     async def checkout_async() -> str:
         try:
-            return await charge()  # type: ignore[no-any-return]
+            await charge()
         except AllowanceExceeded:
-            started = time.monotonic()
-            done: str = await notify()
-            waited.append(time.monotonic() - started)
-            return done
+            engine.over = False
+        started = time.monotonic()
+        await notify()
+        waited.append(time.monotonic() - started)
+        return await audit()  # type: ignore[no-any-return]
 
     @step(lease_ttl_ms=1000)  # type: ignore[untyped-decorator]
     def charge_sync() -> str:
@@ -3062,21 +3115,31 @@ async def test_a_lease_whose_grant_may_have_been_lost_is_waited_out(
     def notify_sync() -> str:
         return "notified"
 
+    @step
+    def audit_sync() -> str:
+        return "audited"
+
     @workflow(version="1.0.0")
     def checkout() -> str:
         try:
-            return charge_sync()  # type: ignore[no-any-return]
+            charge_sync()
         except AllowanceExceeded:
-            started = time.monotonic()
-            done: str = notify_sync()
-            waited.append(time.monotonic() - started)
-            return done
+            engine.over = False
+        started = time.monotonic()
+        notify_sync()
+        waited.append(time.monotonic() - started)
+        return audit_sync()  # type: ignore[no-any-return]
 
-    assert await _run(checkout_async if asynchronous else checkout) == "notified"
-    assert 1.5 <= waited[0] < 2.6
-    assert _releases_for(mock_stub, name) == []
-    next_step = "notify" if asynchronous else "notify_sync"
-    assert _commits(mock_stub) == [(1, next_step, SUCCESS)]
+    assert await _run(checkout_async if asynchronous else checkout) == "audited"
+    assert engine.divergent == []
+    assert engine.committed == 2
+    suffix = "" if asynchronous else "_sync"
+    assert [c[:2] for c in _commits(mock_stub)] == [
+        (1, "notify" + suffix),
+        (2, "audit" + suffix),
+    ]
+    # Waited out in passes, about as long as the lease could still live.
+    assert 1.0 <= waited[0] < 3.0
 
 
 @pytest.mark.asyncio
@@ -3142,12 +3205,12 @@ async def test_an_owed_release_refused_for_the_allowance_fails_the_next_call_at_
     assert _commits(mock_stub) == [(1, next_step, SUCCESS)]
 
 
-def test_an_owed_release_unanswered_again_is_waited_out_then_dropped(
+def test_an_owed_release_unanswered_again_is_sent_again_after_a_second(
     mock_stub: MagicMock,
 ) -> None:
-    """Sent again before the claim and unanswered again: the lease is left to
-    lapse (3 s at a 1 s TTL, a second's grace included, counted from the
-    hand-back), waited out, and dropped, without a third release."""
+    """Sent again before the claim and unanswered again: the call waits a
+    second, sends it once more, and goes on once it is answered, well before
+    the lease would lapse."""
     unavailable = EngineError(grpc.StatusCode.UNAVAILABLE, "unavailable")
     _release_answers(mock_stub, "charge", [unavailable, unavailable])
     waited: List[float] = []
@@ -3171,8 +3234,8 @@ def test_an_owed_release_unanswered_again_is_waited_out_then_dropped(
             return done
 
     assert checkout() == "notified"
-    assert 2.5 <= waited[0] < 3.6
-    assert len(_releases_for(mock_stub, "charge")) == 2
+    assert 0.9 <= waited[0] < 2.0
+    assert len(_releases_for(mock_stub, "charge")) == 3
     assert _commits(mock_stub) == [(1, "notify", SUCCESS)]
 
 
@@ -3412,6 +3475,7 @@ class StrictEngine:
         self.tokens = itertools.count(100)
         self.fail_release_of = fail_release_of
         self.release_failures: List[BaseException] = []
+        self.commit_failures: List[BaseException] = []
         mock_stub.CheckIdempotencyCache.side_effect = self.check
         mock_stub.CommitStep.side_effect = self.commit
         mock_stub.ReleaseLease.side_effect = self.release
@@ -3429,6 +3493,8 @@ class StrictEngine:
         return acquired(next(self.tokens), 10_000)
 
     def commit(self, req: Any, **kwargs: Any) -> Any:
+        if f":{self.fail_release_of}:" in req.idempotency_key and self.commit_failures:
+            raise self.commit_failures.pop(0)
         position = req.step_result.sequence
         if position != self.committed + 1:
             raise EngineError(grpc.StatusCode.FAILED_PRECONDITION, "Sequence mismatch")
@@ -3605,3 +3671,399 @@ def test_a_takeover_at_the_top_steps_down_through_vacated_positions() -> None:
     ctx.end_call()
     assert ctx.begin_call() == 1
     assert ctx.history_known
+
+
+# --- Owed releases are polled, never waited out blind ---------------------------
+
+
+class _Sleeps:
+    """`time` as `cellaflow.context` sees it, with every sleep recorded."""
+
+    def __init__(self) -> None:
+        self.slept: List[float] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        time.sleep(seconds)
+
+
+@pytest.fixture
+def sleeps(monkeypatch: pytest.MonkeyPatch) -> _Sleeps:
+    shim = _Sleeps()
+    monkeypatch.setattr(cellaflow.context, "time", shim)
+    return shim
+
+
+def _refused_then_notify(
+    mock_stub: MagicMock, ttl_ms: Optional[int], unanswered: int
+) -> Tuple[Callable[[], str], List[float]]:
+    """A workflow whose `charge` is refused by its own engine call, with its
+    release unanswered `unanswered` times in a row, then answered; `notify`
+    follows, and how long it waited is recorded."""
+    _release_answers(
+        mock_stub,
+        "charge",
+        [EngineError(grpc.StatusCode.UNAVAILABLE, "unavailable")] * unanswered,
+    )
+    waited: List[float] = []
+
+    def charge_body() -> str:
+        raise refusal()
+
+    charge_body.__name__ = "charge"
+    charge = step(lease_ttl_ms=ttl_ms)(charge_body) if ttl_ms else step(charge_body)
+
+    @step
+    def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    def checkout() -> str:
+        try:
+            return charge()  # type: ignore[no-any-return]
+        except AllowanceExceeded:
+            started = time.monotonic()
+            done: str = notify()
+            waited.append(time.monotonic() - started)
+            return done
+
+    return checkout, waited
+
+
+def test_an_owed_release_is_sent_again_on_every_pass_of_at_most_a_second(
+    mock_stub: MagicMock, sleeps: _Sleeps
+) -> None:
+    """Unanswered on the step's release and on the next call's first two
+    passes, then answered: four releases, each pass at most a second."""
+    checkout, waited = _refused_then_notify(mock_stub, None, unanswered=3)
+    assert checkout() == "notified"
+    assert [r.fencing_token for r in _releases_for(mock_stub, "charge")] == [456] * 4
+    assert sleeps.slept and max(sleeps.slept) <= 1.0
+    assert 1.9 <= waited[0] < 3.0
+    assert _commits(mock_stub) == [(1, "notify", SUCCESS)]
+
+
+@pytest.mark.parametrize("ttl_ms", [300_000, MAX_LEASE_TTL_MS])
+def test_an_answer_mid_wait_ends_it_long_before_the_lease_would_lapse(
+    mock_stub: MagicMock, sleeps: _Sleeps, ttl_ms: int
+) -> None:
+    """At a five-minute TTL the lease would lapse after five minutes; at
+    `MAX_LEASE_TTL_MS` a sleep that long cannot even be asked for (it raised
+    OverflowError). The release is answered on the second pass, a second in."""
+    checkout, waited = _refused_then_notify(mock_stub, ttl_ms, unanswered=2)
+    assert checkout() == "notified"
+    assert 0.9 <= waited[0] < 2.0
+    assert max(sleeps.slept) <= 1.0
+    assert _commits(mock_stub) == [(1, "notify", SUCCESS)]
+
+
+@pytest.mark.asyncio
+async def test_an_async_call_owing_a_release_at_the_longest_ttl_does_not_wait_forever(
+    mock_stub: MagicMock,
+) -> None:
+    _release_answers(
+        mock_stub,
+        "charge",
+        [EngineError(grpc.StatusCode.UNAVAILABLE, "unavailable")] * 2,
+    )
+
+    @step(lease_ttl_ms=MAX_LEASE_TTL_MS)  # type: ignore[untyped-decorator]
+    async def charge() -> str:
+        raise refusal()
+
+    @step
+    async def notify() -> str:
+        return "notified"
+
+    @workflow(version="1.0.0")
+    async def checkout() -> str:
+        try:
+            return await charge()  # type: ignore[no-any-return]
+        except AllowanceExceeded:
+            return await notify()  # type: ignore[no-any-return]
+
+    started = time.monotonic()
+    assert await asyncio.wait_for(checkout(), 10.0) == "notified"
+    assert time.monotonic() - started < 3.0
+    assert len(_releases_for(mock_stub, "charge")) == 3
+    assert _commits(mock_stub) == [(1, "notify", SUCCESS)]
+
+
+def test_a_lease_whose_token_is_unknown_is_waited_out_in_passes(
+    sleeps: _Sleeps,
+) -> None:
+    client = MagicMock()
+    ctx = WorkflowContext(
+        client=client, session_id="s", workflow_version="1", history_known=True
+    )
+    assert ctx.begin_call() == 1
+    unknown = {"agent_id": "a", "key": "k", "token": 0, "lapses_in_s": 1.5}
+    ctx.give_back_refused_position(1, unknown)
+    ctx.end_call()
+    started = time.monotonic()
+    assert ctx.begin_call() == 1
+    assert 1.4 <= time.monotonic() - started < 2.5
+    assert len(sleeps.slept) >= 2 and max(sleeps.slept) <= 1.0
+    client.release_lease.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_a_commit_that_may_have_landed_owes_its_unanswered_release(
+    mock_stub: MagicMock, asynchronous: bool
+) -> None:
+    """The first commit gets no answer (and did not land), the resend is
+    refused for the allowance, and the release gets no answer (and did not
+    happen). Against an engine that orders strictly, the next step must send
+    the release first, then commit at 1, and the one after at 2."""
+    name = "charge" if asynchronous else "charge_sync"
+    engine = StrictEngine(mock_stub, name)
+    engine.commit_failures += [
+        EngineError(grpc.StatusCode.UNAVAILABLE, "unavailable"),
+        over_allowance(),
+    ]
+    engine.release_failures.append(
+        EngineError(grpc.StatusCode.UNAVAILABLE, "unavailable")
+    )
+
+    @step(lease_ttl_ms=5000)  # type: ignore[untyped-decorator]
+    async def charge() -> str:
+        return "charged"
+
+    @step
+    async def notify() -> str:
+        return "notified"
+
+    @step
+    async def audit() -> str:
+        return "audited"
+
+    @workflow(version="1.0.0")
+    async def checkout_async() -> str:
+        try:
+            await charge()
+        except AllowanceExceeded:
+            pass
+        await notify()
+        return await audit()  # type: ignore[no-any-return]
+
+    @step(lease_ttl_ms=5000)  # type: ignore[untyped-decorator]
+    def charge_sync() -> str:
+        return "charged"
+
+    @step
+    def notify_sync() -> str:
+        return "notified"
+
+    @step
+    def audit_sync() -> str:
+        return "audited"
+
+    @workflow(version="1.0.0")
+    def checkout() -> str:
+        try:
+            charge_sync()
+        except AllowanceExceeded:
+            pass
+        notify_sync()
+        return audit_sync()  # type: ignore[no-any-return]
+
+    assert await _run(checkout_async if asynchronous else checkout) == "audited"
+    assert engine.committed == 2
+    suffix = "" if asynchronous else "_sync"
+    assert [c[:2] for c in _commits(mock_stub)][-2:] == [
+        (1, "notify" + suffix),
+        (2, "audit" + suffix),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_async_claim_adopts_the_engines_position_before_an_owed_release() -> (
+    None
+):
+    """As a sync claim does: the position the engine reported moves the counter
+    first, so a release owed below it is not sent, and stays owed."""
+    client = MagicMock()
+    ctx = WorkflowContext(
+        client=client, session_id="s", workflow_version="1", history_known=True
+    )
+    assert await ctx.begin_call_async() == 1
+    owed = {"agent_id": "a", "key": "k", "token": 7, "lapses_in_s": 60.0}
+    ctx.give_back_refused_position(1, owed)
+    ctx.end_call()
+    ctx.record_engine_sequence(5)
+    assert await ctx.begin_call_async() == 6
+    client.release_lease.assert_not_called()
+    assert list(ctx._owed) == [1]
+
+
+class _SlowReleases:
+    """A client whose releases block until `gate` is set, then refuse for the
+    allowance while `refuse` is set."""
+
+    def __init__(self) -> None:
+        self.releases = 0
+        self.refuse = True
+        self.gate = threading.Event()
+
+    def release_lease(self, **kwargs: Any) -> Any:
+        self.releases += 1
+        assert self.gate.wait(5.0)
+        if self.refuse:
+            raise refusal()
+        return idempotency_pb2.ReleaseLeaseResponse(released=True)
+
+
+async def _owing_one(client: Any) -> WorkflowContext:
+    ctx = WorkflowContext(
+        client=client, session_id="s", workflow_version="1", history_known=True
+    )
+    assert await ctx.begin_call_async() == 1
+    owed = {"agent_id": "a", "key": "k", "token": 7, "lapses_in_s": 60.0}
+    ctx.give_back_refused_position(1, owed)
+    ctx.end_call()
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_several_async_calls_share_one_owed_release_and_claim_in_order() -> None:
+    client = _SlowReleases()
+    client.refuse = False
+    ctx = await _owing_one(client)
+    tasks = [asyncio.ensure_future(ctx.begin_call_async()) for _ in range(3)]
+    await _until(lambda: client.releases == 1)
+    await asyncio.sleep(0.05)
+    client.gate.set()
+    assert await asyncio.gather(*tasks) == [1, 2, 3]
+    assert client.releases == 1
+    assert ctx._owed == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", ["one", "all"])
+async def test_a_cancelled_waiter_on_a_refused_owed_release_logs_nothing(
+    cancelled: str,
+) -> None:
+    """Three calls wait on one owed release, which the engine refuses for the
+    allowance; one of them (or all) is cancelled meanwhile. The others fail
+    with the refusal, the release stays owed, and nothing is reported to the
+    loop: `asyncio.shield` reported such a refusal as an error from Python
+    3.13, and a refusal nobody waited for as never retrieved."""
+    errors: List[Any] = []
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(lambda _, context: errors.append(context))
+    try:
+        client = _SlowReleases()
+        ctx = await _owing_one(client)
+        tasks = [asyncio.ensure_future(ctx.begin_call_async()) for _ in range(3)]
+        await _until(lambda: client.releases == 1)
+        for task in tasks if cancelled == "all" else tasks[1:2]:
+            task.cancel()
+        client.gate.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.sleep(0.05)
+        gc.collect()
+        await asyncio.sleep(0.05)
+        expected = (
+            ["CancelledError"] * 3
+            if cancelled == "all"
+            else ["AllowanceExceeded", "CancelledError", "AllowanceExceeded"]
+        )
+        assert [type(r).__name__ for r in results] == expected
+        assert client.releases == 1
+        assert (ctx.sequence, ctx._in_flight, list(ctx._owed)) == (0, 0, [1])
+        assert errors == []
+        # Nor will it be when the settling is collected, which the cancelled
+        # calls' frames put off: its refusal has been read, so asyncio does
+        # not report it as never retrieved.
+        settling = ctx._owing
+        assert settling is not None and settling.done()
+        assert not settling._log_traceback
+        # The allowance is back: the next call releases the lease, then
+        # claims the position.
+        client.refuse = False
+        assert await ctx.begin_call_async() == 1
+        assert client.releases == 2
+        # The failed settling is let go now, replaced by the one that went
+        # through: a refusal nobody was left to see is not reported then either.
+        gc.collect()
+        await asyncio.sleep(0.05)
+        assert errors == []
+    finally:
+        loop.set_exception_handler(None)
+
+
+@pytest.mark.asyncio
+async def test_adopting_the_engines_position_keeps_a_release_owed_below_it(
+    mock_stub: MagicMock,
+) -> None:
+    """A (1) is refused while B (2) runs, and its release gets no answer, so 1
+    is vacated with A's release owed. B is answered from the cache, and the
+    counter adopts the engine's position, 0. C then claims 1: A's release is
+    sent first, so the engine does not refuse C's lease there as divergent, and
+    D lands in order after it."""
+    engine = StrictEngine(mock_stub, "a_step")
+    engine.release_failures.append(
+        EngineError(grpc.StatusCode.UNAVAILABLE, "unavailable")
+    )
+    strict_check = engine.check
+    b_goes = threading.Event()
+
+    def check(req: Any, **kwargs: Any) -> Any:
+        if ":b_step:" in req.idempotency_key:
+            assert b_goes.wait(5.0)
+            return idempotency_pb2.CheckCacheResponse(
+                status=idempotency_pb2.CACHE_STATUS_HIT,
+                cached_result=common_pb2.StepResult(
+                    output_payload=serialize({"result": "from the cache"})
+                ),
+                current_sequence=engine.committed,
+            )
+        return strict_check(req, **kwargs)
+
+    mock_stub.CheckIdempotencyCache.side_effect = check
+    a_goes = asyncio.Event()
+    entered: List[str] = []
+
+    @step
+    async def a_step() -> str:
+        entered.append("a")
+        await a_goes.wait()
+        raise refusal()
+
+    @step
+    async def b_step() -> str:
+        return "b"  # pragma: no cover
+
+    @step
+    async def c_step() -> str:
+        return "c"
+
+    @step
+    async def d_step() -> str:
+        return "d"
+
+    ctx = WorkflowContext(
+        client=CellaflowClient(),
+        session_id="s-adopt",
+        workflow_version="1.0.0",
+        history_known=True,
+    )
+    with ctx.bind():
+        a = asyncio.ensure_future(a_step())
+        await _until(lambda: entered == ["a"])
+        b = asyncio.ensure_future(b_step())
+        await _until(lambda: ctx.sequence == 2)
+        a_goes.set()
+        with pytest.raises(AllowanceExceeded):
+            await a
+        assert ctx._vacated == {1} and list(ctx._owed) == [1]
+        b_goes.set()
+        assert await b == "from the cache"
+        assert await c_step() == "c"
+        assert await d_step() == "d"
+    assert engine.committed == 2
+    assert [c[:2] for c in _commits(mock_stub)] == [(1, "c_step"), (2, "d_step")]

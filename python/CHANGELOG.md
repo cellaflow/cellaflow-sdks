@@ -79,17 +79,21 @@ All notable changes to the Cellaflow Python SDK.
   one is vacated instead: the counter steps down through it when the later one is given back too, or
   a call claims it again, and while it stays empty the run records nothing into the session. A
   failure left unrecorded meanwhile stops recording for good. A refused step whose lease could not
-  be released (its release unanswered or refused, or a lease a lost answer may have granted) leaves
-  that release owed at its position, given back or vacated alike: the next call to claim the
-  position sends it first, or waits out a lease whose token it never knew, and fails at once with
-  the refusal if the release is refused for the allowance, so it never lands behind a lease that
-  still claims the position. A step whose commit got no answer, and whose resend was refused, gives
-  its position back too, but unless the engine then released the lease, which shows the commit did
-  not land, the run also stops recording into the session. A taken-over step that is refused is
-  handed back at the top, as a takeover is in the TypeScript SDK, and otherwise leaves its position
-  empty and stops recording, since the new holder may fill it. A takeover's failure is still
-  recorded at its position, and a process exit gives its position back, as before. A cache hit's
-  result or a caught failure waiting to be recorded when the next step starts is kept but not
+  be released (its release unanswered or refused) leaves that release owed at its position, given
+  back or vacated alike: the next call to claim the position sends it first, so it never lands
+  behind a lease that still claims the position. Answered, the call goes on at once; refused for the
+  allowance, it fails at once with the refusal; unanswered, the call waits, sending the release
+  again about once a second, until it is answered or the lease lapses (at most the lease's TTL plus
+  a few seconds). An async call can be cancelled while it waits; a sync call waits until then. A
+  call whose lease grant got no answer and whose next request was then refused leaves that lease
+  owed too, though no release can be sent for it: the next call waits until the lease would lapse,
+  looking again about once a second. A step whose commit got no answer, and whose resend was
+  refused, gives its position back too, but unless the engine then released the lease, which shows
+  the commit did not land, the run also stops recording into the session. A taken-over step that is
+  refused is handed back at the top, as a takeover is in the TypeScript SDK, and otherwise leaves
+  its position empty and stops recording, since the new holder may fill it. A takeover's failure is
+  still recorded at its position, and a process exit gives its position back, as before. A cache
+  hit's result or a caught failure waiting to be recorded when the next step starts is kept but not
   retried: that step raises the refusal, and the first call after the reset writes the record. One
   recorded as a workflow returns is dropped at once with a warning naming the allowance, and a
   re-run runs that step again.

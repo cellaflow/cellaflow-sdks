@@ -75,6 +75,10 @@ _FINAL_RETRY_S = 0.5
 #: How long after its estimated lapse a failed step's unreleased lease is still
 #: waited for, for clock and renewal skew.
 _LAPSE_GRACE_S = 1.0
+#: The longest one wait on an owed release lasts. A call waiting for one sends
+#: the release again (or looks at the lapse again) after each, so an engine
+#: that answers again ends the wait. See `_settle_owed`.
+_OWED_POLL_S = 1.0
 
 
 #: Failures writing a hit's record that may succeed if sent again. The record is
@@ -275,6 +279,11 @@ class WorkflowContext:
                 # Shielded: one caller being cancelled does not stop the write
                 # the others are waiting on.
                 await asyncio.shield(settling)
+            # Reconciled first, as a sync claim is: a position the engine
+            # reported moves the counter before the owed release is looked up.
+            position, wait = self._try_claim(send=False)
+            if position is not None:
+                return position
             if self._owed.get(self.sequence + 1):
                 # A release owed at the next position is an engine call too,
                 # so it is sent on a worker thread, not the loop. Every call
@@ -283,12 +292,15 @@ class WorkflowContext:
                 owing = self._owing
                 if owing is None or owing.done() or owing.get_loop() is not loop:
                     owing = loop.create_task(self._settle_owed_async())
+                    owing.add_done_callback(_retrieved)
                     self._owing = owing
-                await asyncio.shield(owing)
+                # Waited on rather than shielded: `asyncio.shield` reports the
+                # settling's refusal as an error when its waiter has been
+                # cancelled. `asyncio.wait` leaves the settling running for the
+                # other waiters, and reports nothing.
+                await asyncio.wait({owing})
+                owing.result()
                 continue
-            position, wait = self._try_claim(send=False)
-            if position is not None:
-                return position
             await asyncio.sleep(wait)
 
     def _ensure_position(self) -> None:
@@ -384,29 +396,32 @@ class WorkflowContext:
         once none is left, how long to wait before asking again, or None when
         one must be sent and `send` is false. Under the lock; never sleeps.
 
-        A lease that has lapsed is dropped. One whose token is known is released
-        (reason TOOL_ERROR): released, or answered as no longer the call's, it is
-        dropped. Refused because the org is over its allowance, it stays owed and
-        the refusal is raised, so the call fails at once without claiming the
-        position. An error that may pass leaves it to lapse: it is waited out,
-        then dropped. Any other error drops it, as a failed release always was.
-        A lease whose token was never known (a request whose answer was lost)
-        is waited out the same way. When it lapses was counted from the
-        hand-back, with a second's grace already in it, as in the TypeScript
-        SDK. Unclaimed, it stays owed: below a committed call, say, where it
-        lapses on its own. Without this, the lease
-        would claim the position until it lapsed, the engine would refuse the
-        next call's lease there as divergent, and every call after would land
-        past an empty position.
+        Without this, the lease would claim the position until it lapsed, the
+        engine would refuse the next call's lease there as divergent, and every
+        call after would land past an empty position.
+
+        A lease that has lapsed is dropped unsent. One whose token is known is
+        released (reason TOOL_ERROR): released, or answered as no longer the
+        call's, it is dropped. Refused because the org is over its allowance,
+        it stays owed and the refusal is raised, so the call fails at once
+        without claiming the position. An error that may pass keeps it owed:
+        the call waits at most `_OWED_POLL_S` and sends the release again, as a
+        failure record does, until it is answered or the lease lapses. Any
+        other error drops it, as a failed release always was. A lease whose
+        token was never known is waited out to its lapse, in waits of the same
+        length. When it lapses was counted from the hand-back, with a second's
+        grace already in it, as in the TypeScript SDK. Unclaimed, it stays
+        owed: below a committed call, say, where it lapses on its own.
         """
         entries = self._owed.get(position)
         while entries:
             entry = entries[0]
             now = time.monotonic()
-            if now >= entry["lapses_at"]:
+            left = float(entry["lapses_at"]) - now
+            if left <= 0:
                 entries.pop(0)
                 continue
-            if entry["token"] and not entry.get("waiting"):
+            if entry["token"]:
                 if not send:
                     return None
                 try:
@@ -421,11 +436,10 @@ class WorkflowContext:
                     if _is_allowance_refusal(exc):
                         raise
                     if _may_pass(exc):
-                        entry["waiting"] = True
-                        return float(entry["lapses_at"]) - now
+                        return min(_OWED_POLL_S, left)
                 entries.pop(0)
                 continue
-            return float(entry["lapses_at"]) - now
+            return min(_OWED_POLL_S, left)
         self._owed.pop(position, None)
         return 0.0
 
@@ -1406,6 +1420,13 @@ def set_context(context: WorkflowContext) -> contextvars.Token[WorkflowContext]:
 
 def reset_context(token: contextvars.Token[WorkflowContext]) -> None:
     _current_context.reset(token)
+
+
+def _retrieved(task: "asyncio.Task[None]") -> None:
+    """Reads a finished task's outcome, so a failure that no waiter is left
+    to see (all of them cancelled) is not reported as never retrieved."""
+    if not task.cancelled():
+        task.exception()
 
 
 def _details(exc: grpc.RpcError) -> str:
