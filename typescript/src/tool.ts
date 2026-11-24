@@ -384,13 +384,10 @@ export function tool<A extends unknown[], R>(
             continue;
           }
         }
-        // Refused because the org is over its allowance: no lease holds this
-        // key, whatever an earlier request that went unanswered (or found the
-        // mailbox full) may have been granted. The engine looks the key up
-        // first, answers IN_PROGRESS while its lease is live, and refuses only
-        // where it would grant. So there is nothing left to release or wait
-        // out, and nothing is owed.
-        if (isAllowanceRefusal(err)) known.unreleased = undefined;
+        // A refusal over the allowance does not show that a lease an earlier,
+        // unanswered request may have been granted is gone: an engine can
+        // refuse before it looks the key up. So that lease stays here, owed at
+        // this position, and the next call waits it out.
         throw err;
       }
 

@@ -40,9 +40,9 @@ All notable changes to the Cellaflow TypeScript SDK.
   any other error drops it. No single wait is longer than a second, whatever the TTL. Calls behind
   it wait in order, as behind a record the session owes, and the wait cannot be cancelled. Without
   this, the next call there was refused as divergent and the one after it ran its side effect past
-  the gap. A lease request refused over the allowance after an earlier one went unanswered, or found
-  the mailbox full, owes nothing: the engine refuses a key only where it would grant it, never while
-  a lease holds it, so whatever the earlier request was granted is gone.
+  the gap. A call whose lease request got no answer, or found the mailbox full, and was then refused
+  over the allowance, may still hold a lease it was never told of: the next call waits until that
+  lease would lapse, in passes of at most a second, since a refusal does not show the lease is gone.
 - **A commit that got no answer and was refused over the allowance when sent again** raises the
   refusal, not the first commit's error. If the lease is then released, it was still this call's
   and neither commit landed, so the position is handed back as for any refusal. Otherwise the

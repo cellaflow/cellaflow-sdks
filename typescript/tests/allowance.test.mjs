@@ -1496,28 +1496,85 @@ test("an owed release whose lease has lapsed is dropped without sending it", asy
   assert.deepEqual(committed(client), [[1, "notify"]]);
 });
 
-for (const [what, first] of [
-  ["got no answer", unavailable],
-  ["found the mailbox full", mailboxFull],
+for (const [what, lostGrant] of [
+  ["was granted, its answer lost", true],
+  ["found the mailbox full", false],
 ]) {
-  test(`a request that ${what}, then refused over the allowance when sent again, owes nothing`, { timeout: 10_000 }, async () => {
-    // The first request may have been granted, a lease whose token nobody
-    // here knows. The engine refuses the same key only where it would grant
-    // it, never while a lease holds it, so that lease is gone: the next call
-    // claims position 1 at once, with nothing to release or wait out.
-    const client = scriptedClient({ acquire: [first(), overAllowance()] });
-    const charge = tool(async () => "charged", { toolName: "charge", ttlMs: 60_000 });
-    const notify = tool(async () => "notified", { toolName: "notify" });
-    await runWithContext(session(client), async () => {
-      await assert.rejects(charge(), isAllowance);
+  test(`a lease request that ${what}, then refused, never gets the next call refused as divergent`, { timeout: 10_000 }, async () => {
+    // An engine that refuses over the allowance before it looks the key up,
+    // so its refusal says nothing about a lease the first request may hold.
+    // book's first request at position 2 either is granted with its answer
+    // lost, or finds the mailbox full; asked again, it is refused. Once the
+    // block lifts, notify must not be refused at 2 by a lease still live
+    // there, and the session commits in order.
+    let over = false;
+    let committedUpTo = 0;
+    let nextToken = 0;
+    let firstBookRequest = true;
+    const leases = new Map();
+    const claims = new Map();
+    const log = [];
+    const live = (key) => (leases.get(key)?.expiresAt ?? 0) > Date.now();
+    const client = {
+      async checkIdempotencyCache(agentId, key, waitTimeoutMs, ttl, sessionId, seq) {
+        if (over) throw overAllowance();
+        if (live(key)) return { status: CacheStatus.IN_PROGRESS, retryAfterMs: 50n };
+        const claimer = claims.get(seq);
+        if (claimer && claimer !== key && live(claimer)) {
+          log.push(`divergent at ${seq}`);
+          throw failedPrecondition(`Sequence ${seq} is already claimed by a different step identity`);
+        }
+        if (seq === 2 && firstBookRequest) {
+          // The block starts now, as book's first request is answered:
+          // granted with its answer lost, or a full mailbox.
+          firstBookRequest = false;
+          over = true;
+          if (!lostGrant) throw mailboxFull();
+          const token = ++nextToken;
+          leases.set(key, { token, expiresAt: Date.now() + Number(ttl) });
+          claims.set(seq, key);
+          throw unavailable();
+        }
+        const token = ++nextToken;
+        leases.set(key, { token, expiresAt: Date.now() + Number(ttl ?? 20_000) });
+        claims.set(seq, key);
+        return { status: CacheStatus.ACQUIRED, fencingToken: BigInt(token), heartbeatIntervalMs: 60_000n };
+      },
+      async commitStep(sessionId, seq, name) {
+        if (seq !== committedUpTo + 1) throw failedPrecondition(`Sequence mismatch: expected sequence ${committedUpTo + 1}`);
+        committedUpTo = seq;
+        log.push(`commit ${seq} ${name}`);
+        return {};
+      },
+      async renewLease(agentId, key, token, extendMs) {
+        return { renewed: true, newExpiresAtMs: BigInt(Date.now() + extendMs) };
+      },
+      async releaseLease(agentId, key) {
+        leases.delete(key);
+        return { released: true };
+      },
+      async getGraph() {
+        return [[], undefined];
+      },
+      close() {},
+    };
+    const charge = tool(async () => "charged", { toolName: "charge", ttlMs: 1000 });
+    const book = tool(async () => "booked", { toolName: "book", ttlMs: 1000 });
+    const notify = tool(async () => "notified", { toolName: "notify", ttlMs: 1000 });
+    const audit = tool(async () => "audited", { toolName: "audit", ttlMs: 1000 });
+    const ctx = session(client);
+    await runWithContext(ctx, async () => {
+      assert.equal(await charge(), "charged");
+      await assert.rejects(book(), isAllowance);
+      over = false;
       const started = performance.now();
       assert.equal(await notify(), "notified");
-      const took = performance.now() - started;
-      assert.ok(took < 1000, `waited ${took} ms`);
+      // Waited for the lease the first request may hold to lapse: a TTL and
+      // a second, in passes, whatever that request was in fact granted.
+      assert.ok(performance.now() - started < 4000);
+      assert.equal(await audit(), "audited");
     });
-    assert.equal(client.count("release"), 0);
-    assert.deepEqual(client.of("acquire").map((c) => c.sequence), [1, 1, 1]);
-    assert.deepEqual(committed(client), [[1, "notify"]]);
+    assert.deepEqual(log, ["commit 1 charge", "commit 2 notify", "commit 3 audit"]);
   });
 }
 
@@ -1593,8 +1650,8 @@ test("an owed release on a lease with a huge TTL never sets one long timer", { t
 });
 
 test("an owed release with no token is waited out to its lapse, a second at a time", { timeout: 10_000 }, async () => {
-  // Held back by the context's own method: tool() no longer leaves one,
-  // since a refusal proves the lease a lost answer may have granted is gone.
+  // Driven through the context's own methods, to see its timers. tool() owes
+  // one when a lease request got no answer and its retry was refused.
   const client = scriptedClient();
   const ctx = session(client);
   ctx.claimPosition();
