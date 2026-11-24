@@ -73,6 +73,13 @@ interface OwedRelease {
   lapsesAt: number;
 }
 
+/**
+ * The longest one wait for an owed release sleeps. The wait as a whole lasts
+ * until the lease lapses, which a long TTL makes long, so it is taken in
+ * passes, each sending the release again, as a failure record does.
+ */
+const OWED_PASS_MS = 1000;
+
 /** How many steps to ask the engine for per page of a session's history. */
 const GRAPH_PAGE = 1000;
 
@@ -182,10 +189,11 @@ export class WorkflowContext {
   private readonly vacated = new Set<number>();
 
   /**
-   * Releases refused calls still owe, by the position their lease claims.
-   * See {@link giveBackRefusedPosition} and {@link settleOwedRelease}.
+   * Releases refused calls still owe, by the position their leases claim:
+   * several calls refused one after another at the same position each owe
+   * one. See {@link giveBackRefusedPosition} and {@link settleOwedRelease}.
    */
-  private readonly owed = new Map<number, OwedRelease>();
+  private readonly owed = new Map<number, OwedRelease[]>();
 
   /** The settling of the release owed at the next position, while in flight. */
   private settlingOwed?: Promise<void>;
@@ -416,12 +424,15 @@ export class WorkflowContext {
     if (unreleased) {
       // Counted from now, as for a failure record: the call's heartbeat has
       // stopped, so no renewal can extend the lease past this.
-      this.owed.set(sequence, {
+      const owed = {
         agentId: unreleased.agentId,
         key: unreleased.key,
         token: unreleased.token,
         lapsesAt: Date.now() + unreleased.lapsesInMs,
-      });
+      };
+      const atPosition = this.owed.get(sequence);
+      if (atPosition) atPosition.push(owed);
+      else this.owed.set(sequence, [owed]);
     }
     if (this.sequence !== sequence) {
       this.vacated.add(sequence);
@@ -524,27 +535,35 @@ export class WorkflowContext {
   /**
    * Whether a release is owed at the position the next call claims, or being
    * settled. See {@link settleOwedRelease}.
+   *
+   * @internal
    */
   get releaseOwed(): boolean {
     return this.settlingOwed !== undefined || this.owed.has(this.sequence + 1);
   }
 
   /**
-   * Settles the release owed at the position the next call claims, by this
+   * Settles every release owed at the position the next call claims, by this
    * call or a concurrent one, before anything claims it. Called, like
    * {@link settleRecording}, before claiming a position, so nothing waits
    * while holding a position or a lease other calls need; calls behind it
-   * wait in the order they arrived, and settle again.
+   * wait in the order they arrived, and settle again. The wait cannot be
+   * cancelled, and lasts at most until the leases lapse.
+   *
+   * It goes in passes of at most {@link OWED_PASS_MS}, each bounded by the
+   * soonest lapse, and on each pass, for each release still owed:
    *
    * - Lapsed: it no longer claims the position, so it is dropped.
    * - Token known: the release is sent again. Released, or answered that the
    *   lease is not this call's any more, it is dropped. Refused because the
    *   org is over its allowance, it is kept and the refusal rejects this at
-   *   once, so the call fails having claimed nothing. With no answer, the
-   *   lease is waited out and then dropped. Any other error drops it, as a
-   *   failed release always has been.
+   *   once, so the call fails having claimed nothing. With no answer, it is
+   *   kept for the next pass. Any other error drops it, as a failed release
+   *   always has been.
    * - Token unknown (0, a grant whose answer was lost): it cannot be released,
-   *   only waited out, then dropped.
+   *   only waited for until it lapses.
+   *
+   * @internal
    */
   async settleOwedRelease(): Promise<void> {
     if (!this.settlingOwed) {
@@ -560,28 +579,37 @@ export class WorkflowContext {
   }
 
   private async settleOwed(position: number): Promise<void> {
-    const owed = this.owed.get(position);
-    if (!owed) return;
-    if (Date.now() >= owed.lapsesAt) {
-      this.owed.delete(position);
-      return;
-    }
-    if (owed.token !== 0) {
-      try {
-        await this.client.releaseLease(owed.agentId, owed.key, owed.token, "TOOL_ERROR", RELEASE_DEADLINE_SECS);
-        this.owed.delete(position);
-        return;
-      } catch (err) {
-        if (isAllowanceRefusal(err)) throw err;
-        if (!isRetryable(err)) {
-          this.owed.delete(position);
-          return;
+    for (;;) {
+      // A copy: entries are dropped from the list itself as they settle.
+      for (const owed of [...(this.owed.get(position) ?? [])]) {
+        // Its lapse already counts the grace for the engine's clock.
+        if (Date.now() >= owed.lapsesAt) {
+          this.dropOwed(position, owed);
+          continue;
+        }
+        if (owed.token === 0) continue;
+        try {
+          await this.client.releaseLease(owed.agentId, owed.key, owed.token, "TOOL_ERROR", RELEASE_DEADLINE_SECS);
+          this.dropOwed(position, owed);
+        } catch (err) {
+          if (isAllowanceRefusal(err)) throw err;
+          if (!isRetryable(err)) this.dropOwed(position, owed);
         }
       }
+      const left = this.owed.get(position);
+      if (!left) return;
+      const soonest = Math.min(...left.map((owed) => owed.lapsesAt));
+      await sleep(Math.min(OWED_PASS_MS, Math.max(0, soonest - Date.now())));
     }
-    // Its lapse already counts the grace for the engine's clock.
-    await sleep(Math.max(0, owed.lapsesAt - Date.now()));
-    this.owed.delete(position);
+  }
+
+  /** Drops one settled release from those owed at `position`. */
+  private dropOwed(position: number, owed: OwedRelease): void {
+    const atPosition = this.owed.get(position);
+    if (!atPosition) return;
+    const at = atPosition.indexOf(owed);
+    if (at >= 0) atPosition.splice(at, 1);
+    if (atPosition.length === 0) this.owed.delete(position);
   }
 
   /** Whether a deferred record is being written. */

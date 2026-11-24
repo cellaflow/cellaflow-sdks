@@ -31,14 +31,18 @@ All notable changes to the Cellaflow TypeScript SDK.
   stopped. A call another worker took over is handled as before: below a later call, its position
   stays empty for good; at the top, it hands its position back, and the counter now also steps
   down through positions refused calls vacated directly below it.
-- **A refused call that could not release its own lease owes the release.** Its lease still
-  claims the position it handed back (or vacated), so before a call claims that position the
-  release is settled: sent again with its token and dropped once released, or answered that the
-  lease is not the call's any more; refused over the allowance, it is kept and that call fails at
-  once, having claimed nothing; with no answer, or with no token to send (a grant whose answer was
-  lost), the lease is waited out, a TTL past its last renewal plus a second; any other error drops
-  it. Calls behind it wait in order, as behind a record the session owes. Without this, the next
-  call there was refused as divergent and the one after it ran its side effect past the gap.
+- **A refused call that could not release its own lease owes the release.** Its lease still claims
+  the position it handed back (or vacated), so before a call claims that position every release owed
+  there is settled: sent again with its token and dropped once released, or answered that the lease
+  is not the call's any more; refused over the allowance, it is kept and that call fails at once,
+  having claimed nothing; with no answer, it is sent again about once a second, until it is answered
+  or the lease lapses, which is the lease's TTL plus a second after the position was handed back;
+  any other error drops it. No single wait is longer than a second, whatever the TTL. Calls behind
+  it wait in order, as behind a record the session owes, and the wait cannot be cancelled. Without
+  this, the next call there was refused as divergent and the one after it ran its side effect past
+  the gap. A lease request refused over the allowance after an earlier one went unanswered, or found
+  the mailbox full, owes nothing: the engine refuses a key only where it would grant it, never while
+  a lease holds it, so whatever the earlier request was granted is gone.
 - **A commit that got no answer and was refused over the allowance when sent again** raises the
   refusal, not the first commit's error. If the lease is then released, it was still this call's
   and neither commit landed, so the position is handed back as for any refusal. Otherwise the
