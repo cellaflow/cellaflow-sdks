@@ -36,6 +36,7 @@ from typing import (
 )
 
 import grpc
+from cellaflow.allowance import _is_allowance_refusal
 from cellaflow.client import CellaflowClient, resolve_api_key
 from cellaflow.history import iter_session_steps, latest_session_sequence
 from cellaflow.v1 import common_pb2
@@ -268,6 +269,11 @@ class CellaflowSaver(_BaseSaver):
                     self.version,
                 )
             except grpc.RpcError as rpc_err:
+                if _is_allowance_refusal(rpc_err):
+                    # Raised, not logged and asked again on the next write: the
+                    # engine refuses this thread's session until the allowance
+                    # resets.
+                    raise
                 if rpc_err.code() == grpc.StatusCode.ALREADY_EXISTS:
                     self._session_started.add(session_id)
                     logger.info(
@@ -302,8 +308,11 @@ class CellaflowSaver(_BaseSaver):
         """
         try:
             latest = self._latest_sequence(session_id)
-        except Exception:  # pragma: no cover - engine unreachable
-            return self._next_sequence.get(session_id, 1)
+        except Exception as exc:
+            if _is_allowance_refusal(exc):
+                # Final, where an unreachable engine is worth another commit.
+                raise
+            return self._next_sequence.get(session_id, 1)  # pragma: no cover
 
         self._next_sequence[session_id] = latest + 1
         return latest + 1

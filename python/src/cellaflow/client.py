@@ -4,10 +4,11 @@ import logging
 import os
 import threading
 from collections import namedtuple
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 import grpc
 
+from cellaflow.allowance import _refusal_from
 from cellaflow.v1 import service_pb2, service_pb2_grpc
 from cellaflow.v1 import common_pb2, idempotency_pb2
 from cellaflow.serialization import serialize, deserialize
@@ -291,6 +292,11 @@ class CellaflowClient:
     tool that records a traceback's local variables (loguru's `diagnose`,
     Sentry's frame variables, `pytest -l`) can show it. Turn that off wherever
     the key matters.
+
+    A request the engine refuses because the organization is over its allowance
+    raises `AllowanceExceeded`, a `grpc.RpcError` whose code is
+    RESOURCE_EXHAUSTED, rather than the plain error, which shares that code with
+    errors that pass. Nothing in the SDK sends it again.
     """
 
     def __init__(
@@ -340,7 +346,9 @@ class CellaflowClient:
         if coordination_id:
             req.coordination_id = coordination_id
 
-        return cast(service_pb2.StartSessionResponse, self.stub.StartSession(req))
+        return cast(
+            service_pb2.StartSessionResponse, _send(self.stub.StartSession, req)
+        )
 
     def commit_step(
         self,
@@ -385,7 +393,8 @@ class CellaflowClient:
             req.idempotency_fencing_token = idempotency_fencing_token
 
         return cast(
-            service_pb2.CommitStepResponse, self.stub.CommitStep(req, timeout=timeout)
+            service_pb2.CommitStepResponse,
+            _send(self.stub.CommitStep, req, timeout=timeout),
         )
 
     def get_graph(
@@ -407,7 +416,9 @@ class CellaflowClient:
         if cursor is not None:
             req.cursor = cursor
 
-        resp: service_pb2.GetGraphResponse = self.stub.GetGraph(req, timeout=timeout)
+        resp: service_pb2.GetGraphResponse = _send(
+            self.stub.GetGraph, req, timeout=timeout
+        )
 
         results = []
         for step in resp.steps:
@@ -467,7 +478,7 @@ class CellaflowClient:
         )
         return cast(
             idempotency_pb2.CheckCacheResponse,
-            self.stub.CheckIdempotencyCache(req, timeout=timeout),
+            _send(self.stub.CheckIdempotencyCache, req, timeout=timeout),
         )
 
     def check_idempotency_cache_future(
@@ -482,7 +493,8 @@ class CellaflowClient:
     ) -> "grpc.Future":
         """As `check_idempotency_cache`, without blocking: returns the call as a
         `grpc.Future`, which can be cancelled. Lets a caller wait while the engine
-        holds the request without holding a thread for it."""
+        holds the request without holding a thread for it. An allowance refusal
+        fails it with `AllowanceExceeded`, as it does the blocking request."""
         req = _check_request(
             agent_id,
             idempotency_key,
@@ -491,7 +503,12 @@ class CellaflowClient:
             session_id,
             sequence,
         )
-        return self.stub.CheckIdempotencyCache.future(req, timeout=timeout)
+        call = self.stub.CheckIdempotencyCache.future(req, timeout=timeout)
+        if isinstance(call, grpc.Future):
+            return _RequestFuture(call)
+        # A stub that is not gRPC's own (a test double): left as it is, so the
+        # caller can tell it is not a future.
+        return call
 
     def renew_lease(
         self,
@@ -516,7 +533,7 @@ class CellaflowClient:
 
         return cast(
             idempotency_pb2.RenewLeaseResponse,
-            self.stub.RenewLease(req, timeout=timeout),
+            _send(self.stub.RenewLease, req, timeout=timeout),
         )
 
     def release_lease(
@@ -538,7 +555,7 @@ class CellaflowClient:
 
         return cast(
             idempotency_pb2.ReleaseLeaseResponse,
-            self.stub.ReleaseLease(req, timeout=timeout),
+            _send(self.stub.ReleaseLease, req, timeout=timeout),
         )
 
     def close(self) -> None:
@@ -568,3 +585,106 @@ def _check_request(
     if sequence is not None:
         req.sequence = sequence
     return req
+
+
+def _send(request: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Sends a request through the stub, raising an allowance refusal as
+    `AllowanceExceeded`.
+
+    The engine refuses an organization over its allowance with
+    RESOURCE_EXHAUSTED, a code it also uses for errors that pass, such as a full
+    session mailbox. Every request goes through here, so every layer above sees
+    the refusal as itself, and none mistakes it for one worth asking again.
+    """
+    try:
+        return request(*args, **kwargs)
+    except grpc.RpcError as exc:
+        refusal = _refusal_from(exc)
+        if refusal is None or refusal is exc:
+            raise
+        raise refusal from exc
+
+
+class _RequestFuture(grpc.Call, grpc.Future):  # type: ignore[misc]
+    """A request's `grpc.Future` that fails with `AllowanceExceeded` where the
+    call failed with an allowance refusal, as `_send` raises it. It is a
+    `grpc.Call` too, as the call it wraps is, and everything else is passed
+    through to that call: `code()`, `details()`, metadata, `is_active()`,
+    `time_remaining()`, `add_callback()` and the rest."""
+
+    def __init__(self, call: Any) -> None:
+        self._call = call
+        # The error as this future reports it, worked out once, so `result()`
+        # and `exception()` hand out the same one.
+        self._error: Optional[Tuple[Optional[BaseException]]] = None
+        self._lock = threading.Lock()
+
+    def _as_reported(self, error: Optional[BaseException]) -> Optional[BaseException]:
+        if error is None:
+            return None
+        with self._lock:
+            if self._error is None:
+                self._error = (_refusal_from(error) or error,)
+            return self._error[0]
+
+    def cancel(self) -> bool:
+        return bool(self._call.cancel())
+
+    def cancelled(self) -> bool:
+        return bool(self._call.cancelled())
+
+    def running(self) -> bool:
+        return bool(self._call.running())
+
+    def done(self) -> bool:
+        return bool(self._call.done())
+
+    def result(self, timeout: Optional[float] = None) -> Any:
+        try:
+            return self._call.result(timeout)
+        except grpc.RpcError as exc:
+            reported = self._as_reported(exc)
+            if reported is exc:
+                raise
+            raise cast(BaseException, reported) from exc
+
+    def exception(self, timeout: Optional[float] = None) -> Optional[BaseException]:
+        return self._as_reported(self._call.exception(timeout))
+
+    def traceback(self, timeout: Optional[float] = None) -> Any:
+        return self._call.traceback(timeout)
+
+    def add_done_callback(self, fn: Callable[[Any], None]) -> None:
+        # Called with this future, not the call, so the callback reads the
+        # error as this future reports it.
+        self._call.add_done_callback(lambda _: fn(self))
+
+    def initial_metadata(self) -> Any:
+        return self._call.initial_metadata()
+
+    def trailing_metadata(self) -> Any:
+        return self._call.trailing_metadata()
+
+    def code(self) -> Any:
+        return self._call.code()
+
+    def details(self) -> Any:
+        return self._call.details()
+
+    def is_active(self) -> bool:
+        return bool(self._call.is_active())
+
+    def time_remaining(self) -> Optional[float]:
+        remaining: Optional[float] = self._call.time_remaining()
+        return remaining
+
+    def add_callback(self, callback: Callable[[], None]) -> bool:
+        return bool(self._call.add_callback(callback))
+
+    def __getattr__(self, name: str) -> Any:
+        # Only for what this class does not define. A copy or an unpickled one
+        # is made without `__init__`, so `_call` can be missing, and looking it
+        # up here would recurse; nor is a special method the call's to answer.
+        if name == "_call" or name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(self._call, name)

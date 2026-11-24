@@ -227,6 +227,10 @@ class LeaseHandle:
     Loss is judged on the clock whenever it is asked about, when the handle has
     a `probe`: a holder resumed past its lease's deadline (a stopped process, a
     suspended host) finds it lost before any renewal has to answer.
+
+    `refusal` returns the engine's refusal of the lease's renewals, if it
+    refused them because the org is over its allowance: a loss that follows is
+    raised as `LeaseLostError` saying so, with the refusal as its cause.
     """
 
     def __init__(
@@ -234,6 +238,7 @@ class LeaseHandle:
         fencing_token: int,
         probe: Optional[Callable[[], bool]] = None,
         key: str = "",
+        refusal: Optional[Callable[[], Optional[BaseException]]] = None,
     ) -> None:
         self.fencing_token = fencing_token
         self._key = key
@@ -241,6 +246,7 @@ class LeaseHandle:
         self._released = False
         self._checked_after_loss = False
         self._probe = probe
+        self._refusal = refusal
         self._listeners: List[Callable[[], None]] = []
         self._lock = threading.Lock()
 
@@ -417,7 +423,25 @@ class LeaseHandle:
                 raise LeaseLostError(
                     "Execution lease was released when its call or block ended"
                 )
-            raise LeaseLostError("Execution lease was lost")
+            raise self._lost_error("Execution lease was lost")
+
+    def _lost_error(self, message: str) -> LeaseLostError:
+        """The `LeaseLostError` for a loss. A loss that came about because the
+        engine refused the lease's renewals for the allowance says so, in the
+        words the TypeScript SDK uses, and has the refusal as its cause, so a
+        handler can tell the two apart and see when the allowance resets."""
+        refusal = self._refusal() if self._refusal is not None else None
+        if refusal is None:
+            return LeaseLostError(message)
+        subject = getattr(refusal, "subject", "")
+        what = f" for {subject}" if subject else ""
+        error = LeaseLostError(
+            f"Execution lease was lost: the engine refused to renew it because "
+            f"the Cellaflow org is over its allowance{what}, and its deadline "
+            f"passed. The lease may already belong to another worker."
+        )
+        error.__cause__ = refusal
+        return error
 
     @contextlib.asynccontextmanager
     async def cancel_on_loss(self) -> AsyncIterator[None]:
@@ -481,7 +505,7 @@ class LeaseHandle:
             # awaited yet, so raise rather than cancel.
             if self._lost:
                 self._checked_after_loss = True
-                raise LeaseLostError("Execution lease was lost")
+                raise self._lost_error("Execution lease was lost")
             timer[0] = loop.call_later(_CANCEL_POLL_S, tick)
             yield
         except asyncio.CancelledError:
@@ -494,17 +518,20 @@ class LeaseHandle:
                     "Execution lease was released when its call or block ended; "
                     "the awaits inside cancel_on_loss() were cancelled"
                 ) from None
-            raise LeaseLostError(
+            lost = self._lost_error(
                 "Execution lease was lost; the awaits inside cancel_on_loss() "
                 "were cancelled"
-            ) from None
+            )
+            if lost.__cause__ is None:
+                raise lost from None
+            raise lost
         else:
             if state["fired"]:
                 # Something inside swallowed the cancellation. The lease is
                 # still lost, and the block must not end as if it were not.
                 self._consume_cancel(task, entry_count)
                 self._checked_after_loss = True
-                raise LeaseLostError(
+                raise self._lost_error(
                     "Execution lease was lost while cancel_on_loss() was open"
                 )
         finally:
@@ -678,7 +705,12 @@ def execution_lease(
         resp = _acquire(client, key, worker_id, ttl_ms)
         token = resp.fencing_token
         interval_ms = _resolve_interval(resp, heartbeat_interval_ms)
-        handle = LeaseHandle(token, probe=lambda: hb.past_deadline(), key=key)
+        handle = LeaseHandle(
+            token,
+            probe=lambda: hb.past_deadline(),
+            key=key,
+            refusal=lambda: hb.loss_refusal,
+        )
 
         def _on_lost() -> None:
             # Reported after the block ended: the lease was let go, not lost.
@@ -798,7 +830,12 @@ async def async_execution_lease(
 
     token = resp.fencing_token
     interval_ms = _resolve_interval(resp, heartbeat_interval_ms)
-    handle = LeaseHandle(token, probe=lambda: hb.past_deadline(), key=key)
+    handle = LeaseHandle(
+        token,
+        probe=lambda: hb.past_deadline(),
+        key=key,
+        refusal=lambda: hb.loss_refusal,
+    )
     caller_task = asyncio.current_task()
     caller_loop = asyncio.get_running_loop()
 

@@ -2,6 +2,93 @@
 
 All notable changes to the Cellaflow TypeScript SDK.
 
+## Unreleased
+
+### Behaviour changes
+
+- **A refusal because the org is over its allowance is final.** Every `RESOURCE_EXHAUSTED` used to
+  be taken for a full session mailbox, which passes, and asked again, so an agent over its allowance
+  retried each call until it gave up and then failed without saying why. A `RESOURCE_EXHAUSTED`
+  whose details say the org is over its allowance (below) is now raised at once as
+  `AllowanceExceededError`, and nothing in the SDK asks it again or waits for it: tool calls, their
+  commits, the records a session owes, session starts, `executionLease`, and lease renewals. A
+  `RESOURCE_EXHAUSTED` without those details is asked again as before. A refusal that did not come
+  through this copy's client, such as a raw `ConnectError` with those details or one raised by
+  another copy of the SDK, is treated as final too.
+- **A refused tool call is not recorded as the tool's failure.** That holds when the refusal comes
+  from a call the body made, and when the body raises its own error with the refusal in its `cause`
+  chain (up to 8 links) or an `AggregateError` holding it, at any depth within that bound and
+  looking at no more than 64 errors in all and 64 members of any one group; the caller still gets
+  the body's own error. A value that cannot even be inspected, such as a Proxy that throws, is not
+  a refusal, and checking it never throws.
+- **A refused call hands its position back when it is the top one**, so the next call takes it.
+  One below a later call leaves its position empty and stops the session's recording, as before,
+  but the position is remembered: when the calls above it are refused too and hand theirs back,
+  the counter steps down through every such position, so the next calls take them, and recording
+  resumes at once, unless a failure was left unrecorded meanwhile, which stops it for good.
+  `WorkflowContext.historyKnown` reads false while any position is vacated. Adopting the engine's
+  position instead, after a cache hit or a refused record, drops them, and recording stays
+  stopped. A call another worker took over is handled as before: below a later call, its position
+  stays empty for good; at the top, it hands its position back, and the counter now also steps
+  down through positions refused calls vacated directly below it.
+- **A refused call that could not release its own lease owes the release.** Its lease still claims
+  the position it handed back (or vacated), so before a call claims that position every release owed
+  there is settled: sent again with its token and dropped once released, or answered that the lease
+  is not the call's any more; refused over the allowance, it is kept and that call fails at once,
+  having claimed nothing; with no answer, it is sent again about once a second, until it is answered
+  or the lease lapses, which is the lease's TTL plus a second after the position was handed back;
+  any other error drops it. No single wait is longer than a second, whatever the TTL. Calls behind
+  it wait in order, as behind a record the session owes, and the wait cannot be cancelled. Without
+  this, the next call there was refused as divergent and the one after it ran its side effect past
+  the gap. A call whose lease request got no answer, or found the mailbox full, and was then refused
+  over the allowance, may still hold a lease it was never told of: the next call waits until that
+  lease would lapse, in passes of at most a second, since a refusal does not show the lease is gone.
+- **A commit that got no answer and was refused over the allowance when sent again** raises the
+  refusal, not the first commit's error. If the lease is then released, it was still this call's
+  and neither commit landed, so the position is handed back as for any refusal. Otherwise the
+  first may have landed: the position is handed back all the same, since the engine refuses the
+  next call's lease there before its body runs if the commit is there, and the session's recording
+  stops. A first commit that failed for certain keeps its own error, the step's real failure,
+  recorded as before.
+- **A renewal refused over the allowance stops the renewals**, so the lease lasts until its
+  deadline. A body that finishes before then is recorded as usual. Past it, `LeaseHandle.check()`
+  throws, and `signal` aborts with, a `LeaseLostError` with the refusal as its `cause`, also when
+  the deadline passes while the result is being committed. Its message reads "Execution lease was
+  lost: the engine refused to renew it because the Cellaflow org is over its allowance for
+  cellaflow.steps, and its deadline passed. The lease may already belong to another worker.", the
+  same in both SDKs. `executionLease` rejects with it, and a tool call fails with the refusal
+  itself, recording nothing. A lease granted after a wait whose confirming renewal is refused is
+  released, and its body does not run.
+- **A record the session owes is kept** for the next call that gets through when its write is
+  refused over the allowance. A failed call's lease that could not be released is released again
+  first; if that is refused over the allowance, the record waits for the next call while the lease
+  is live, and goes on without it once it has lapsed.
+
+### Compatibility
+
+- Nothing changes with an engine that does not send these details. No new dependencies: the two
+  `google.rpc` messages are generated from a vendored subset of `error_details.proto`, which the
+  package does not export.
+
+### Added
+
+- **`AllowanceExceededError` (exported)**, raised by every `CellaflowClient` call, and so by
+  everything built on it, when the engine refuses it with `RESOURCE_EXHAUSTED` and status details
+  holding a `google.rpc.QuotaFailure` with a violation whose subject starts with `cellaflow.`.
+  `subject` is the first such subject, such as `cellaflow.steps`. A `google.rpc.ErrorInfo` from
+  domain `cellaflow.com` with reason `ALLOWANCE_EXCEEDED` gives `resetsAt`, a `Date` read from its
+  `resets_at` (RFC 3339, years from 100 on, and no later than 9999 in UTC), and `limit`, typed
+  `AllowanceLimit` (exported): `"new_sessions_blocked" | "writes_blocked"`, or any other name a
+  later engine sends. Both are absent when the ErrorInfo is missing or they do not parse. The
+  message says the org is over its allowance, of what (left out when the subject is empty), and when
+  it resets (in UTC, to the second, with milliseconds only when it has them), followed by the
+  engine's message; `rawMessage` holds the same, and the engine's own text is `cause.rawMessage`,
+  `cause` being the engine's error. It is a `ConnectError` with code `Code.ResourceExhausted`, so
+  code that checks either still matches it, and so its `name` is `ConnectError`. See "When the org
+  is over its allowance" in the README.
+- **`LeaseLostError` has a `cause`** when the lease was lost because its renewals were refused over
+  the allowance: the `AllowanceExceededError`.
+
 ## 0.13.0
 
 ### Behaviour changes

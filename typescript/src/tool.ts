@@ -1,4 +1,12 @@
-import { hasStatusCode, isCommittedElsewhere, isFailedPrecondition, isRetryable, isStaleLease } from "./errors.js";
+import {
+  carriesAllowanceRefusal,
+  hasStatusCode,
+  isAllowanceRefusal,
+  isCommittedElsewhere,
+  isFailedPrecondition,
+  isRetryable,
+  isStaleLease,
+} from "./errors.js";
 import { CacheStatus } from "./cellaflow/v1/idempotency_pb.js";
 import { StepStatus } from "./cellaflow/v1/common_pb.js";
 import { getContext, type UnreleasedLease, type WorkflowContext } from "./context.js";
@@ -180,22 +188,71 @@ export function tool<A extends unknown[], R>(
     // order they arrived, so positions are still claimed in call order, and each
     // settles again in case anything changed while it waited. With nothing being
     // written there is no await, and the claim stays synchronous as before.
+    //
+    // The same for a release a refused call still owes at the position this
+    // call would claim: its lease claims that position until it is released
+    // or lapses, so it is settled first, the same way.
     if (!ctx.positionKnown) await ctx.ensurePosition();
     for (;;) {
       ctx.reconcileSequence();
-      if (!ctx.recordingInFlight) break;
-      await ctx.settleRecording();
+      if (ctx.recordingInFlight) {
+        await ctx.settleRecording();
+        continue;
+      }
+      if (!ctx.releaseOwed) break;
+      await ctx.settleOwedRelease();
     }
     const seq = ctx.claimPosition();
     const known: Known = {};
     try {
       return await runAt(ctx, seq, args, callCoordination, coordinationId, leaseTtlMs, known);
     } catch (err) {
+      // What happens to the position. A refused call's position is handed back
+      // with the history known only when nothing can have landed there, so the
+      // doubt about a commit is settled first, whatever else is true of the
+      // call. Then a takeover, which hands its position back with the history
+      // known, as it always has. Then a refusal.
+      if (known.mayHaveLanded) {
+        // The commit got no answer, the same commit sent again was refused
+        // because the org is over its allowance, and the release did not show
+        // the lease was still this call's: the first may have landed. Nothing
+        // is recorded in its name, and the position goes back all the same,
+        // with the run no longer recording. If the commit did land, the engine
+        // refuses the next call's lease at this position before its body
+        // runs, or answers a hit for the same key; keeping the position would
+        // instead put the next call past a possible gap, refused only at its
+        // commit, after its side effect. A lease it could not release is owed,
+        // as for any refusal below.
+        ctx.giveBackRefusedPosition(seq, known.unreleased);
+        ctx.historyKnown = false;
+        throw err;
+      }
       if (known.lost) {
         // The call's outcome belongs to the lease's new holder, so nothing is
         // recorded here in its name. The position goes back, so calling the
         // tool again claims it and finds that holder's result.
         ctx.giveBackPosition(seq);
+        throw err;
+      }
+      if (carriesAllowanceRefusal(err)) {
+        // Refused because the org is over its allowance, by this call's own
+        // request or by one its body made. That says nothing about the step,
+        // so it is not recorded as its failure: a resume that replays the
+        // record would raise it again after the allowance is back. Nothing is
+        // recorded and the position goes back, as for a takeover, so calling
+        // the tool again once the allowance allows claims it and runs the call.
+        // The same for a body that caught the refusal and raised its own error
+        // with it as the cause, or an AggregateError holding it: the body
+        // failed because of the refusal all the same. The caller still gets
+        // the body's own error.
+        //
+        // With no failure record to hold on to the call's own lease when it
+        // could not be released (`known.unreleased`), the context keeps it as
+        // a release owed at this position, settled before the next call
+        // claims it: sent again, or waited out. Otherwise the next call here
+        // would be refused with DivergentStepError while that lease still
+        // claims the position, and the one after it would land past the gap.
+        ctx.giveBackRefusedPosition(seq, known.unreleased);
         throw err;
       }
       // A failed call leaves its position empty; record the failure there so the
@@ -268,7 +325,7 @@ export function tool<A extends unknown[], R>(
     // that very commit completed the key. That is not a loss: it is held back,
     // and applied only if the commit fails.
     let committing = false;
-    let lossDuringCommit: string | undefined;
+    let lossDuringCommit: { detail: string; cause?: unknown } | undefined;
     // Once the release is on its way, a renewal refused because of it is not a
     // loss either, and is dropped.
     let releasing = false;
@@ -327,6 +384,10 @@ export function tool<A extends unknown[], R>(
             continue;
           }
         }
+        // A refusal over the allowance does not show that a lease an earlier,
+        // unanswered request may have been granted is gone: an engine can
+        // refuse before it looks the key up. So that lease stays here, owed at
+        // this position, and the next call waits it out.
         throw err;
       }
 
@@ -407,14 +468,19 @@ export function tool<A extends unknown[], R>(
           // answered at once.
           acquiredExpiresAtMs:
             !late && resp.leaseExpiresAtMs !== undefined ? Number(resp.leaseExpiresAtMs) : undefined,
-          onLeaseLost: (detail) => {
+          onLeaseLost: (detail, cause) => {
             if (releasing) return;
-            if (committing) lossDuringCommit = detail;
-            else leaseHandle.markLost(detail);
+            if (committing) lossDuringCommit = { detail, cause };
+            else leaseHandle.markLost(detail, cause);
           },
         });
         if (late) await hb.confirmGrant();
-        if (leaseHandle.isLost) {
+        // A renewal refused because the org is over its allowance is refused
+        // again until it is not, so the body would run under a lease that
+        // cannot be kept. The lease goes back as below, and the call fails
+        // with the refusal instead of asking again.
+        const refusal = hb.allowanceRefusal;
+        if (leaseHandle.isLost || refusal) {
           // Neither the renewal nor the request can show the lease is still
           // held, so the body must not start under it: it would act on a lease
           // this side has already given up. Nothing has run, so hand the lease
@@ -433,6 +499,7 @@ export function tool<A extends unknown[], R>(
           hb = undefined;
           handle = undefined;
           fencingToken = 0;
+          if (refusal) throw refusal;
           handedBack += 1;
           if (handedBack >= MAX_HAND_BACKS) {
             // Every grant comes too late to count on and no renewal confirms
@@ -532,6 +599,14 @@ export function tool<A extends unknown[], R>(
         committing = false;
         if (isStaleLease(err) || isCommittedElsewhere(err)) throw takenOver(result, err);
         if (outcome?.takenOver) throw takenOver(result, outcome.error);
+        // The same commit sent again was refused because the org is over its
+        // allowance: that answer, not the first one's silence, is what the
+        // caller hears. The first may still have landed, unless the release
+        // below shows the lease was still this call's.
+        if (outcome && isAllowanceRefusal(outcome.error)) {
+          known.mayHaveLanded = true;
+          throw outcome.error;
+        }
         throw err;
       }
       return result;
@@ -541,7 +616,7 @@ export function tool<A extends unknown[], R>(
       // fails. Not before: a resend below can still show the commit landed,
       // which is what refused the renewal.
       const applyHeldLoss = () => {
-        if (lossDuringCommit !== undefined) handle?.markLost(lossDuringCommit);
+        if (lossDuringCommit !== undefined) handle?.markLost(lossDuringCommit.detail, lossDuringCommit.cause);
       };
       // Released whatever the body threw and whatever this side's clock says:
       // the engine releases only a lease that is still this call's, so its
@@ -554,6 +629,9 @@ export function tool<A extends unknown[], R>(
           .then((released) => {
             // Not released: the lease was no longer this call's to release.
             if (!released.released) known.lost = true;
+            // Released: it was still this call's, so no commit under it
+            // landed, whatever the commits' answers were.
+            else known.mayHaveLanded = false;
           })
           .catch(() => {
             // The lease expires on its own. Losing the release is not worth
@@ -570,7 +648,11 @@ export function tool<A extends unknown[], R>(
             };
           });
       }
-      if (known.lost && returned && !(err instanceof LeaseLostError)) {
+      // An allowance refusal here is the commit's own answer, so it did not
+      // land, or the answer to the same commit sent again after the first got
+      // none, which may have landed (see above). Either way the same commit
+      // sent once more would only be refused again.
+      if (known.lost && returned && !(err instanceof LeaseLostError) && !isAllowanceRefusal(err)) {
         // The commit failed and the lease would not be released. Either the
         // commit landed and only its answer was lost, which completed the key
         // under this call's own token, or another worker holds the call. The
@@ -582,11 +664,25 @@ export function tool<A extends unknown[], R>(
         }
         if (outcome.takenOver) throw takenOver(returned.result, outcome.error);
         // Unknown: the call is not treated as taken over, and fails as it
-        // would have.
+        // would have. Unless the first commit got no answer and the one sent
+        // again was refused because the org is over its allowance: that is
+        // then what the caller hears, and the first may still have landed,
+        // since the lease was not released. A first commit that failed for
+        // certain keeps its own error, the step's real failure.
         known.lost = false;
+        if (isAllowanceRefusal(outcome.error) && isUnanswered(err)) {
+          known.mayHaveLanded = true;
+          err = outcome.error;
+        }
       }
       if (known.lost) handle?.markLost("the engine would not release the lease: it is no longer this call's");
       applyHeldLoss();
+      // The lease was lost at its deadline because the engine refused to renew
+      // it, the org being over its allowance, and the body stopped on that
+      // loss: the refusal is what stopped the call, so the caller hears it,
+      // and like any refusal it is not recorded.
+      const refusal = hb?.allowanceRefusal;
+      if (refusal && err instanceof LeaseLostError && err.cause === refusal) throw refusal;
       throw err;
     } finally {
       // Already marked on every path that ran the body; this covers the rest.
@@ -611,6 +707,13 @@ interface Known {
   unreleased?: UnreleasedLease;
   /** Set when the call's lease was lost while its body ran. */
   lost?: boolean;
+  /**
+   * Set when the call's commit got no answer and the same commit sent again
+   * was refused over the allowance, and cleared if the lease is then
+   * released: while set, the first may have landed, so the position is
+   * handed back only with the history marked unknown, and nothing recorded.
+   */
+  mayHaveLanded?: boolean;
 }
 
 /** `step` and `tool` are the same mechanism, kept distinct for readability. */

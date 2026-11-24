@@ -20,9 +20,10 @@ from typing import (
 
 import grpc
 
+from cellaflow.allowance import _carries_refusal, _is_allowance_refusal
 from cellaflow.client import CellaflowClient, _check_api_key_argument
 from cellaflow.context import (
-    _RETRYABLE_CODES,
+    _may_pass,
     WorkflowContext,
     set_context,
     reset_context,
@@ -416,7 +417,10 @@ def _release_after_failure(
     release or wait for the lapse: the lease still claims the step's position,
     so the engine would refuse the record there. When it lapses is counted from
     the moment the record is held, after the heartbeat has stopped, because a
-    renewal still in flight now can extend it.
+    renewal still in flight now can extend it. A release refused because the
+    org is over its allowance is kept the same way, token and all: the record
+    sends it again, which the engine accepts once the allowance is back, and
+    until then the record's write fails with the refusal rather than wait.
     """
     try:
         resp = ctx.client.release_lease(
@@ -462,6 +466,8 @@ def _note_failure(
     unreleased: Optional[Dict[str, Any]] = None,
     is_async: bool = True,
     lease_ttl_ms: Optional[int] = None,
+    may_have_landed: bool = False,
+    taken_over: bool = False,
 ) -> None:
     """Holds a live step's failure or cancellation to be recorded at its position.
 
@@ -476,9 +482,55 @@ def _note_failure(
     exception (an `asyncio.run` inside it, say), recorded and replayed like any
     other. A process exit (`KeyboardInterrupt`, `SystemExit`) is not something a
     workflow carries on past, so the step gives its position back instead.
+    `may_have_landed` is whether the step's commit, sent again, was refused
+    for the allowance when the first may have landed, and `taken_over` whether
+    the engine showed another worker holds the call.
     """
     try:
+        if may_have_landed:
+            # Refused, but the step's commit may have landed at this position:
+            # the engine would not say the lease was still this call's. The
+            # position is given back all the same, and the run stops recording
+            # into the session, since it can no longer tell what it holds. If
+            # the commit did land, the next call at this position is refused
+            # its lease before its body runs (or, with the same key, answered
+            # from the commit), where a call placed past it would be refused
+            # only at its commit, after its side effect.
+            ctx.give_back_refused_position(seq, unreleased)
+            ctx.mark_history_unknown()
+            return
         if isinstance(exc, DivergentStepError):
+            return
+        if _carries_refusal(exc):
+            # Says nothing about the step: the org is over its allowance, and
+            # once it resets the step can run. Recorded, it would be raised
+            # again at this position by every resume, even after that. So it
+            # is not recorded, as a process exit is not, and the position is
+            # given back as `give_back_refused_position` says: calling the step
+            # again after the reset takes it, and a re-run runs the step.
+            #
+            # The same goes for an error the body made from a refusal (`raise
+            # OrderFailed(...) from refusal`) or a group holding one: its own
+            # message is the body's, but what failed was the allowance, and a
+            # resume that raised it again after the reset would take a branch
+            # the allowance no longer forces. The caller still sees the error
+            # as it was raised.
+            #
+            # The step's own lease, if it could not be released (`unreleased`,
+            # or one an unanswered request may have been granted), still claims
+            # this position. Its release is owed there, and settled before a
+            # call claims the position again: otherwise the engine would refuse
+            # that call's lease as divergent, which records nothing and hands
+            # nothing back, and every call after would land past an empty
+            # position, to be refused only at its commit.
+            #
+            # A call another worker took over is handed back as the TypeScript
+            # SDK hands back a takeover: its new holder may yet fill the
+            # position, so it is not vacated.
+            if taken_over:
+                ctx.give_back_taken_over_position(seq)
+            else:
+                ctx.give_back_refused_position(seq, unreleased)
             return
         if isinstance(exc, asyncio.CancelledError) and is_async:
             ctx.defer_cancellation_record(
@@ -542,6 +594,13 @@ class _CallLease:
         # Set when the engine showed the lease is no longer this call's.
         self.lost = False
         self.returned = False
+        # Set when a commit got no answer, so it may have landed.
+        self.commit_unanswered = False
+        # Set when the same commit sent again was refused because the org is
+        # over its allowance: the first may still have landed. Cleared when the
+        # release shows the lease was still this call's, so it did not. See
+        # `_note_failure`.
+        self.may_have_landed = False
         self.result: Any = None
         # The payload committed, taken once from the result.
         self.payload: Dict[str, Any] = {}
@@ -674,6 +733,8 @@ def _hand_back(
         logger.info("Could not hand back the lease on %s; it lapses on its own", ikey)
         if hb is None:
             return None
+        # Token and all, a refusal for the allowance included; see
+        # `_release_after_failure`.
         return _held(agent_id, ikey, fencing_token, hb)
     return None
 
@@ -879,7 +940,10 @@ def _lease_for_body(
     def probe() -> bool:
         return hb is not None and hb.past_deadline()
 
-    handle = LeaseHandle(fencing_token, probe=probe, key=ikey)
+    def refusal() -> Optional[BaseException]:
+        return hb.loss_refusal if hb is not None else None
+
+    handle = LeaseHandle(fencing_token, probe=probe, key=ikey, refusal=refusal)
     call.handle = handle
     hb = LeaseHeartbeat(
         client=ctx.client,
@@ -909,10 +973,10 @@ def _is_stale_lease(exc: BaseException) -> bool:
 
 def _unanswered(exc: BaseException) -> bool:
     """Whether a call got no answer either way: a transport error, or one that
-    may pass, rather than a refusal."""
+    may pass, rather than a refusal. An allowance refusal is an answer."""
     if not isinstance(exc, grpc.RpcError):
         return True
-    return exc.code() in _RETRYABLE_CODES
+    return _may_pass(exc)
 
 
 def _is_committed_elsewhere(exc: BaseException) -> bool:
@@ -974,6 +1038,7 @@ def _commit(
         if not _unanswered(exc):
             call.committing = False
             raise
+        call.commit_unanswered = True
         try:
             _send_commit(
                 ctx, call, seq, name, ikey, fencing_token, call_coordination
@@ -984,6 +1049,12 @@ def _commit(
             if _is_stale_lease(again) or _is_committed_elsewhere(again):
                 call.mark_taken_over()
                 raise _taken_over(name, result) from again
+            if _is_allowance_refusal(again):
+                # That answer, not the first attempt's silence, is what the
+                # caller hears. The first attempt may still have landed, unless
+                # the release that follows shows otherwise.
+                call.may_have_landed = True
+                raise
             raise exc from None
     except BaseException:
         call.committing = False
@@ -1031,11 +1102,22 @@ def _resend_commit(
     `LeaseLostError` when the refusal is about the key (a stale token, or the
     key recorded at another position), so another worker holds the call; False
     for anything else (no answer, or the position already filled, which can
-    also mean the commit landed), so the call fails as it would have.
+    also mean the commit landed), so the call fails as it would have. A resend
+    refused because the org is over its allowance is raised, when the first
+    attempt got no answer: it is the answer the call fails with. When the first
+    attempt failed with a definite error, that error is the step's failure, and
+    the call fails with it as before.
     """
     try:
         _send_commit(ctx, call, seq, name, ikey, fencing_token, call_coordination)
     except Exception as again:
+        if _is_allowance_refusal(again) and call.commit_unanswered:
+            # What the caller hears. The lease would not be released, which
+            # can mean the first commit landed and completed the key; see
+            # `_note_failure`.
+            call.may_have_landed = True
+            call.apply_held_loss()
+            raise
         if not _is_stale_lease(again) and not _is_committed_elsewhere(again):
             return False
         call.apply_held_loss()
@@ -1281,7 +1363,11 @@ def step(
                             f"Step '{actual_tool_name}' at sequence {seq} was refused: "
                             f"{exc.details()}"
                         ) from exc
-                    if exc.code() in _RETRYABLE_CODES:
+                    # An allowance refusal is not one of these: it is an
+                    # answer. Nothing was granted, so nothing is kept to wait
+                    # out, and asking again gets the same answer until the
+                    # allowance resets.
+                    if _may_pass(exc):
                         # Kept until an answer, so a failure or cancellation
                         # before one leaves the record waiting it out.
                         unreleased = _lost_answer(agent_id, ikey, ttl_ms, unreleased)
@@ -1348,7 +1434,11 @@ def step(
                             )
                             call.handle = None
                             raise
-                    if handle.is_lost:
+                    # A renewal refused for the allowance is refused again
+                    # until it is not, so the body would run under a lease it
+                    # cannot keep: the lease goes back as below, and the call
+                    # fails with the refusal instead of asking again.
+                    if handle.is_lost or hb.allowance_refusal is not None:
                         # Neither the renewal nor the request can show the
                         # lease is still held, so the body must not start under
                         # it: it would act on a lease this side has already
@@ -1370,8 +1460,14 @@ def step(
                         )
                         handed_back += 1
                         unconfirmed = _unconfirmed(actual_tool_name, handed_back, hb)
+                        refusal = hb.allowance_refusal
                         call.handle = None
                         handle, hb, fencing_token = None, None, 0
+                        if refusal is not None:
+                            # The engine refused the renewal for the allowance,
+                            # and would refuse the next lease's the same way, so
+                            # the call fails with it now instead of asking again.
+                            raise refusal
                         if handed_back >= _MAX_HAND_BACKS:
                             raise unconfirmed
                         continue
@@ -1424,6 +1520,9 @@ def step(
                     unreleased, released = _release_after_failure(
                         ctx, agent_id, ikey, fencing_token, actual_tool_name, hb
                     )
+                    if released:
+                        # Still this call's lease, so no commit of it landed.
+                        call.may_have_landed = False
                     if released is False:
                         # For a body that returned, the commit may have landed
                         # and refused the release itself: the resend below
@@ -1434,11 +1533,14 @@ def step(
                             call.mark_taken_over()
                 # Only for an error: an interrupt (Ctrl-C, SystemExit) is on its
                 # way out and must not be swallowed by a resend that succeeds.
+                # Nor for an allowance refusal of the commit, which did not
+                # land: sending it again only gets the same answer.
                 if (
                     call.lost
                     and call.returned
                     and isinstance(e, Exception)
                     and not isinstance(e, LeaseLostError)
+                    and not _is_allowance_refusal(e)
                 ):
                     if _resend_commit(
                         ctx,
@@ -1451,6 +1553,18 @@ def step(
                     ):
                         return call.result
                 call.apply_held_loss()
+                refused: Optional[BaseException] = (
+                    hb.loss_refusal if hb is not None else None
+                )
+                if (
+                    refused is not None
+                    and isinstance(e, LeaseLostError)
+                    and e.__cause__ is refused
+                ):
+                    # This lease's own loss, at the deadline after the engine
+                    # refused its renewals for the allowance. The call fails
+                    # with the refusal, which says why and is not recorded.
+                    raise refused
                 raise e
             finally:
                 if handle is not None:
@@ -1479,6 +1593,8 @@ def step(
                     failed_at or time.monotonic(),
                     unreleased,
                     lease_ttl_ms=_ttl_for(ctx),
+                    may_have_landed=call.may_have_landed,
+                    taken_over=call.lost,
                 )
             raise
         finally:
@@ -1586,7 +1702,9 @@ def step(
                             f"Step '{actual_tool_name}' at sequence {seq} was refused: "
                             f"{exc.details()}"
                         ) from exc
-                    if exc.code() in _RETRYABLE_CODES:
+                    # An allowance refusal is not one of these; see the
+                    # async wrapper.
+                    if _may_pass(exc):
                         # Kept until an answer, so a failure before one leaves
                         # the record waiting it out.
                         unreleased = _lost_answer(agent_id, ikey, ttl_ms, unreleased)
@@ -1642,7 +1760,11 @@ def step(
                     )
                     if late:
                         hb.confirm_grant()
-                    if handle.is_lost:
+                    # A renewal refused for the allowance is refused again
+                    # until it is not, so the body would run under a lease it
+                    # cannot keep: the lease goes back as below, and the call
+                    # fails with the refusal instead of asking again.
+                    if handle.is_lost or hb.allowance_refusal is not None:
                         # Neither the renewal nor the request can show the
                         # lease is still held, so the body must not start under
                         # it: it would act on a lease this side has already
@@ -1654,8 +1776,12 @@ def step(
                         )
                         handed_back += 1
                         unconfirmed = _unconfirmed(actual_tool_name, handed_back, hb)
+                        refusal = hb.allowance_refusal
                         call.handle = None
                         handle, hb, fencing_token = None, None, 0
+                        if refusal is not None:
+                            # See the async wrapper.
+                            raise refusal
                         if handed_back >= _MAX_HAND_BACKS:
                             raise unconfirmed
                         continue
@@ -1706,6 +1832,9 @@ def step(
                     unreleased, released = _release_after_failure(
                         ctx, agent_id, ikey, fencing_token, actual_tool_name, hb
                     )
+                    if released:
+                        # Still this call's lease, so no commit of it landed.
+                        call.may_have_landed = False
                     if released is False:
                         # For a body that returned, the commit may have landed
                         # and refused the release itself: the resend below
@@ -1716,11 +1845,14 @@ def step(
                             call.mark_taken_over()
                 # Only for an error: an interrupt (Ctrl-C, SystemExit) is on its
                 # way out and must not be swallowed by a resend that succeeds.
+                # Nor for an allowance refusal of the commit, which did not
+                # land: sending it again only gets the same answer.
                 if (
                     call.lost
                     and call.returned
                     and isinstance(e, Exception)
                     and not isinstance(e, LeaseLostError)
+                    and not _is_allowance_refusal(e)
                 ):
                     if _resend_commit(
                         ctx,
@@ -1733,6 +1865,18 @@ def step(
                     ):
                         return call.result
                 call.apply_held_loss()
+                refused: Optional[BaseException] = (
+                    hb.loss_refusal if hb is not None else None
+                )
+                if (
+                    refused is not None
+                    and isinstance(e, LeaseLostError)
+                    and e.__cause__ is refused
+                ):
+                    # This lease's own loss, at the deadline after the engine
+                    # refused its renewals for the allowance. The call fails
+                    # with the refusal, which says why and is not recorded.
+                    raise refused
                 raise e
             finally:
                 if handle is not None:
@@ -1760,6 +1904,8 @@ def step(
                     unreleased,
                     is_async=False,
                     lease_ttl_ms=_ttl_for(ctx),
+                    may_have_landed=call.may_have_landed,
+                    taken_over=call.lost,
                 )
             raise
         finally:

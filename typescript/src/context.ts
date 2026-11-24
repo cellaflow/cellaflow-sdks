@@ -14,6 +14,7 @@ import {
 import {
   errorCode,
   hasStatusCode,
+  isAllowanceRefusal,
   isFailedPrecondition,
   isNotFound,
   isPositionCommitted,
@@ -54,6 +55,30 @@ export interface UnreleasedLease {
   /** When it lapses; set when the record is held. */
   lapsesAt?: number;
 }
+
+/**
+ * A release a refused call still owes for its own lease, which claims the
+ * position the call handed back. See {@link WorkflowContext.giveBackRefusedPosition}.
+ */
+interface OwedRelease {
+  agentId: string;
+  key: string;
+  /** 0 when the lease's token is unknown: a grant whose answer was lost. */
+  token: number;
+  /**
+   * When the lease lapses on the engine's clock at the latest: its
+   * `lapsesInMs`, which already counts a second of grace for the engine's
+   * clock, from when the position was handed back.
+   */
+  lapsesAt: number;
+}
+
+/**
+ * The longest one wait for an owed release sleeps. The wait as a whole lasts
+ * until the lease lapses, which a long TTL makes long, so it is taken in
+ * passes, each sending the release again, as a failure record does.
+ */
+const OWED_PASS_MS = 1000;
 
 /** How many steps to ask the engine for per page of a session's history. */
 const GRAPH_PAGE = 1000;
@@ -140,8 +165,38 @@ export class WorkflowContext {
    * replaying by position. Only while it holds can a cache hit be recorded in
    * this session without risking a second record of a step the session already
    * holds. See {@link deferHitRecord}.
+   *
+   * Also false while a position is vacated (left empty below the top by a
+   * refused call), and true again once no position is vacated, unless
+   * something else made it false. See {@link giveBackRefusedPosition}. Set to
+   * false, it stays false.
    */
-  historyKnown: boolean;
+  get historyKnown(): boolean {
+    return this.accounted && this.vacated.size === 0;
+  }
+
+  set historyKnown(known: boolean) {
+    this.accounted = known;
+  }
+
+  /** {@link historyKnown}, apart from vacated positions. */
+  private accounted: boolean;
+
+  /**
+   * Positions below the top that refused calls left empty, not yet claimed
+   * again. See {@link giveBackRefusedPosition}.
+   */
+  private readonly vacated = new Set<number>();
+
+  /**
+   * Releases refused calls still owe, by the position their leases claim:
+   * several calls refused one after another at the same position each owe
+   * one. See {@link giveBackRefusedPosition} and {@link settleOwedRelease}.
+   */
+  private readonly owed = new Map<number, OwedRelease[]>();
+
+  /** The settling of the release owed at the next position, while in flight. */
+  private settlingOwed?: Promise<void>;
 
   private pendingHit?: PendingHit;
 
@@ -176,7 +231,7 @@ export class WorkflowContext {
     this.leaseTtlMs = checkLeaseTtlMs(init.leaseTtlMs, "WorkflowContext", "leaseTtlMs");
     // Opt-in: a context built for a session whose history it never read must not
     // record into it.
-    this.historyKnown = init.historyKnown ?? false;
+    this.accounted = init.historyKnown ?? false;
     this.positionKnown = init.positionKnown ?? true;
   }
 
@@ -251,7 +306,13 @@ export class WorkflowContext {
   ): void {
     // As for a hit: a run that does not know everything the session holds (a
     // resumed `durableTools` session) would record at a position already filled.
-    if (!this.historyKnown) return;
+    if (!this.historyKnown) {
+      // Not recorded, so this position stays empty for good. While positions
+      // are vacated, history is unknown only until they are reclaimed; this
+      // gap is not one of them, so recording must not resume past it.
+      this.historyKnown = false;
+      return;
+    }
     if (!(this.inFlight === 1 && this.sequence === sequence)) {
       // It overlapped another call, so its position stays empty, and the run
       // stops recording, as for a hit: a later failure held above that empty
@@ -285,6 +346,12 @@ export class WorkflowContext {
    */
   claimPosition(): number {
     this.sequence += 1;
+    // A vacated position is below the counter, so no claim lands on one, unless
+    // the counter was moved below a call still in flight (by adopting the
+    // engine's position) and that call was then refused. Recording has stopped
+    // for good by then; this only keeps a later step-down from passing through
+    // a position a call has claimed since.
+    this.vacated.delete(this.sequence);
     this.inFlight += 1;
     return this.sequence;
   }
@@ -303,13 +370,90 @@ export class WorkflowContext {
    * top position, so handing it back defers no write, even with lower calls
    * still in flight. Otherwise the position stays empty and the run stops
    * recording, for the reason a failure record does.
+   *
+   * Handing back the top also steps the counter down through positions that
+   * refused calls vacated directly below it, as
+   * {@link giveBackRefusedPosition} does. Without refusals none are vacated,
+   * and this is what it always was.
+   *
+   * @internal
    */
   giveBackPosition(sequence: number): void {
     if (this.sequence === sequence) {
       this.sequence = sequence - 1;
+      while (this.vacated.delete(this.sequence)) this.sequence -= 1;
       return;
     }
     this.historyKnown = false;
+  }
+
+  /**
+   * Hands back the position of a call refused because the org is over its
+   * allowance, which says nothing about the call, so nothing is recorded there
+   * in its name. Refused calls often come together, all at once, so unlike
+   * {@link giveBackPosition} this keeps track of the positions it cannot hand
+   * back yet.
+   *
+   * The rule, the same in the Python SDK:
+   *
+   * - A call at the top (no later position claimed since) hands its position
+   *   back: the counter steps down one, then on down through every position
+   *   directly below that is vacated, so the next calls claim those, lowest
+   *   first. Handing back the top defers no write, even with lower calls still
+   *   in flight.
+   * - A call below the top cannot hand its position back, since a later one is
+   *   claimed above it. The position is vacated instead: it stays empty, and
+   *   the run stops recording while any position is vacated, for the reason a
+   *   failure record does.
+   * - A position is no longer vacated once the counter steps down through it
+   *   or a call claims it. If the run adopts the engine's position instead of
+   *   its own count, every vacated position is dropped and the run stops
+   *   recording for good.
+   * - Recording resumes as soon as no position is vacated, unless something
+   *   else stopped it, such as a failure left unrecorded meanwhile.
+   * - A call that could not release its own lease (`unreleased`, its token 0
+   *   when the grant's answer was lost) still claims the position through it,
+   *   so the release is owed there, at the top or vacated alike, and settled
+   *   before a call claims that position. See {@link settleOwedRelease}.
+   *   Adopting the engine's position leaves owed releases alone: they are
+   *   about leases, not positions.
+   *
+   * @internal
+   */
+  giveBackRefusedPosition(sequence: number, unreleased?: UnreleasedLease): void {
+    if (unreleased) {
+      // Counted from now, as for a failure record: the call's heartbeat has
+      // stopped, so no renewal can extend the lease past this.
+      const owed = {
+        agentId: unreleased.agentId,
+        key: unreleased.key,
+        token: unreleased.token,
+        lapsesAt: Date.now() + unreleased.lapsesInMs,
+      };
+      const atPosition = this.owed.get(sequence);
+      if (atPosition) atPosition.push(owed);
+      else this.owed.set(sequence, [owed]);
+    }
+    if (this.sequence !== sequence) {
+      this.vacated.add(sequence);
+      return;
+    }
+    this.sequence = sequence - 1;
+    while (this.vacated.delete(this.sequence)) this.sequence -= 1;
+  }
+
+  /**
+   * Moves the counter to the position the engine reported. Positions vacated
+   * below the old count are dropped unclaimed, so the run stops recording.
+   * Both callers have stopped it already, except a caller of the public
+   * {@link recordEngineSequence}, whose position is adopted here too.
+   */
+  private adoptPosition(position: number): void {
+    this.sequence = position;
+    if (this.vacated.size > 0) {
+      this.vacated.clear();
+      this.historyKnown = false;
+    }
   }
 
   /**
@@ -383,9 +527,91 @@ export class WorkflowContext {
       return;
     }
     if (this.reportedSequence !== undefined) {
-      this.sequence = this.reportedSequence;
+      this.adoptPosition(this.reportedSequence);
       this.reportedSequence = undefined;
     }
+  }
+
+  /**
+   * Whether a release is owed at the position the next call claims, or being
+   * settled. See {@link settleOwedRelease}.
+   *
+   * @internal
+   */
+  get releaseOwed(): boolean {
+    return this.settlingOwed !== undefined || this.owed.has(this.sequence + 1);
+  }
+
+  /**
+   * Settles every release owed at the position the next call claims, by this
+   * call or a concurrent one, before anything claims it. Called, like
+   * {@link settleRecording}, before claiming a position, so nothing waits
+   * while holding a position or a lease other calls need; calls behind it
+   * wait in the order they arrived, and settle again. The wait cannot be
+   * cancelled. It lasts until the leases lapse, plus whatever a release
+   * already sent then takes to be answered or reach its deadline: at most the
+   * TTL plus a few seconds.
+   *
+   * It goes in passes of at most {@link OWED_PASS_MS}, each bounded by the
+   * soonest lapse, and on each pass, for each release still owed:
+   *
+   * - Lapsed: it no longer claims the position, so it is dropped.
+   * - Token known: the release is sent again. Released, or answered that the
+   *   lease is not this call's any more, it is dropped. Refused because the
+   *   org is over its allowance, it is kept and the refusal rejects this at
+   *   once, so the call fails having claimed nothing. With no answer, it is
+   *   kept for the next pass. Any other error drops it, as a failed release
+   *   always has been.
+   * - Token unknown (0, a grant whose answer was lost): it cannot be released,
+   *   only waited for until it lapses.
+   *
+   * @internal
+   */
+  async settleOwedRelease(): Promise<void> {
+    if (!this.settlingOwed) {
+      const settling = this.settleOwed(this.sequence + 1);
+      const done = () => {
+        if (this.settlingOwed === settling) this.settlingOwed = undefined;
+      };
+      this.settlingOwed = settling;
+      // Registered before any caller awaits, so the next look finds it done.
+      settling.then(done, done);
+    }
+    await this.settlingOwed;
+  }
+
+  private async settleOwed(position: number): Promise<void> {
+    for (;;) {
+      // A copy: entries are dropped from the list itself as they settle.
+      for (const owed of [...(this.owed.get(position) ?? [])]) {
+        // Its lapse already counts the grace for the engine's clock.
+        if (Date.now() >= owed.lapsesAt) {
+          this.dropOwed(position, owed);
+          continue;
+        }
+        if (owed.token === 0) continue;
+        try {
+          await this.client.releaseLease(owed.agentId, owed.key, owed.token, "TOOL_ERROR", RELEASE_DEADLINE_SECS);
+          this.dropOwed(position, owed);
+        } catch (err) {
+          if (isAllowanceRefusal(err)) throw err;
+          if (!isRetryable(err)) this.dropOwed(position, owed);
+        }
+      }
+      const left = this.owed.get(position);
+      if (!left) return;
+      const soonest = Math.min(...left.map((owed) => owed.lapsesAt));
+      await sleep(Math.min(OWED_PASS_MS, Math.max(0, soonest - Date.now())));
+    }
+  }
+
+  /** Drops one settled release from those owed at `position`. */
+  private dropOwed(position: number, owed: OwedRelease): void {
+    const atPosition = this.owed.get(position);
+    if (!atPosition) return;
+    const at = atPosition.indexOf(owed);
+    if (at >= 0) atPosition.splice(at, 1);
+    if (atPosition.length === 0) this.owed.delete(position);
   }
 
   /** Whether a deferred record is being written. */
@@ -411,6 +637,11 @@ export class WorkflowContext {
       // Kept, so the next call sends it again. If the write did land, sending it
       // again finds its completed entry.
       if (isRetryable(err)) throw err;
+      // Kept too when refused because the org is over its allowance: the record
+      // is still owed, and a caller that catches the refusal and carries on once
+      // the allowance is back writes it then. Nothing here asks again or waits
+      // for that.
+      if (isAllowanceRefusal(err)) throw err;
       // The record will not be accepted: another writer in this session took the
       // position first, the engine refused the write itself, or it failed before
       // reaching the engine and would fail the same way on every retry. Read where
@@ -424,7 +655,7 @@ export class WorkflowContext {
       // and continues from the session's real position.
       if (this.pendingHit === pending) this.pendingHit = undefined;
       this.historyKnown = false;
-      this.sequence = position;
+      this.adoptPosition(position);
       const reason = isFailedPrecondition(err)
         ? "another writer committed or claimed it first"
         : hasStatusCode(err)
@@ -558,6 +789,19 @@ export class WorkflowContext {
       );
       pending.unreleased = undefined;
     } catch (err) {
+      if (isAllowanceRefusal(err)) {
+        // Refused because the org is over its allowance. A lease past its
+        // lapse no longer claims the position, so the record goes on to its
+        // own lease without it. One still live is there, and so is the
+        // record's need to wait for it; leasing the record now would be
+        // refused for the same reason or for that lease, so the write fails
+        // at once, keeping both, rather than wait.
+        if ((unreleased.lapsesAt ?? 0) <= Date.now()) {
+          pending.unreleased = undefined;
+          return;
+        }
+        throw err;
+      }
       // Already released or lapsed: nothing is left to free.
       if (!isRetryable(err)) pending.unreleased = undefined;
     }
@@ -678,7 +922,7 @@ export function getContext(): WorkflowContext {
 
   if (openSessions.size === 0) {
     throw new Error(
-      "No CellaFlow session is active. A leased tool must be called inside " +
+      "No Cellaflow session is active. A leased tool must be called inside " +
         "durableTools(...), which is what binds it to a session. Without one " +
         "there is no idempotency key to derive and nothing to lease.",
     );
